@@ -60,9 +60,11 @@ Durable state, append-only audit, Git safety primitives (repo/worktree identity)
 ## Core Agent
 
 **Status: in progress.** Phase 2 supplies durable task-state semantics;
-Phase 3 supplies repository inspection and immutable rule/baseline discovery.
-The remaining tool, policy, lease, checkpoint and agent-loop capabilities
-below are still deferred.
+Phase 3 supplies repository inspection and immutable rule/baseline discovery;
+Phase 4 supplies a closed tool-capability registry, risk-classified policy
+decisions, and a controlled, journaled, crash-aware executor (see
+[`docs/TOOLS_AND_POLICY.md`](TOOLS_AND_POLICY.md)). The worktree lease
+(with fencing), checkpoint mechanism, and agent loop remain deferred.
 
 The state-machine engine (task phases, legal transitions, guards), the tool abstraction with risk classification, the policy engine, the worktree lease (with fencing), the checkpoint mechanism (Git plumbing), and resume-from-crash. This is where a "task" becomes a real, resumable thing rather than a row that exists.
 

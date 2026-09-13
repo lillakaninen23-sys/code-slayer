@@ -9,7 +9,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
-## Status: Phase 3 — repository inspection and baseline discovery
+## Status: Phase 4 — controlled tools and policy
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:
 
@@ -31,6 +31,15 @@ Phase 3 adds read-only repository inspection, pre-existing path protection,
 scoped document discovery and immutable baseline evidence, integrated with
 the state machine. See [`docs/REPOSITORY_BASELINES.md`](docs/REPOSITORY_BASELINES.md)
 for capture, scope, evidence and target-preservation contracts.
+
+Phase 4 adds a closed capability registry (`read_file`, `create_file`,
+`write_file`, `apply_patch`, one read-only `run_command` Git profile), a
+pure policy engine deciding ALLOW/DENY/REQUIRE_APPROVAL over explicit
+scope/baseline/ownership facts, and a controlled executor that journals
+every effect before it runs and records ownership, evidence, and audit
+atomically with its result. See
+[`docs/TOOLS_AND_POLICY.md`](docs/TOOLS_AND_POLICY.md) for the capability,
+policy, journal, crash, and evidence contracts.
 
 There is **no** agent loop, model integration, checkpoint Git-plumbing,
 lease manager, scheduler, or daemon yet. See the ADRs and the Foundation
@@ -62,5 +71,7 @@ src/code_slayer/
 │              #   task persistence, content-addressed blobs, the operation journal
 ├── audit/     # append-only audit event log, canonical hashing, chain verification
 ├── repo/      # safe Git reads, identity, inspection, rule discovery, baseline service
+├── tools/     # closed capability registry, file/command primitives, controlled executor
+├── policy/    # pure ALLOW/DENY/REQUIRE_APPROVAL decisions over explicit facts
 └── cli/       # minimal CLI wiring (`codeslayer inspect`)
 ```

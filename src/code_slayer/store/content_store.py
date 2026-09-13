@@ -55,6 +55,7 @@ class ContentStore:
         media_type: str,
         source_kind: str,
         exportable: bool = False,
+        truncated: bool = False,
     ) -> ContentBlob:
         """Store `data`, deduplicating by content hash.
 
@@ -84,7 +85,7 @@ class ContentStore:
             "INSERT INTO content_blobs "
             "(content_hash, media_type, source_kind, byte_size, truncated, "
             " exportable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (content_hash, media_type, source_kind, len(data), 0,
+            (content_hash, media_type, source_kind, len(data), int(truncated),
              1 if exportable else 0, created_at),
         )
         meta = self.get_meta(content_hash)

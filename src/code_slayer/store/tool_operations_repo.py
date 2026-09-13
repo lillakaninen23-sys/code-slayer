@@ -52,7 +52,12 @@ class ToolOperationsRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def start(
+    def start(self, **kwargs) -> ToolOperation:
+        """Durably record STARTED before any external side effect."""
+        with transaction(self._conn):
+            return self.start_in_transaction(**kwargs)
+
+    def start_in_transaction(
         self,
         *,
         task_id: str,
@@ -70,19 +75,20 @@ class ToolOperationsRepo:
         """Durably record STARTED *before* the actual side effect runs."""
         operation_id = operation_id or str(uuid.uuid4())
         started_at = utcnow_iso()
-        with transaction(self._conn):
-            self._conn.execute(
-                "INSERT INTO tool_operations "
-                "(operation_id, task_id, worktree_id, worker_id, worker_session_id, "
-                " lease_generation, tool_name, risk_class, request_hash, "
-                " target_resource, started_at, status, before_evidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    operation_id, task_id, worktree_id, worker_id, worker_session_id,
-                    lease_generation, tool_name, risk_class, request_hash,
-                    target_resource, started_at, OperationStatus.STARTED, before_evidence,
-                ),
-            )
+        if not self._conn.in_transaction:
+            raise RuntimeError("operation start requires an open write transaction")
+        self._conn.execute(
+            "INSERT INTO tool_operations "
+            "(operation_id, task_id, worktree_id, worker_id, worker_session_id, "
+            " lease_generation, tool_name, risk_class, request_hash, "
+            " target_resource, started_at, status, before_evidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation_id, task_id, worktree_id, worker_id, worker_session_id,
+                lease_generation, tool_name, risk_class, request_hash,
+                target_resource, started_at, OperationStatus.STARTED, before_evidence,
+            ),
+        )
         return self.get(operation_id)
 
     def record_child_pid(self, operation_id: str, pid: int, pid_started_at: str) -> ToolOperation:
@@ -96,7 +102,12 @@ class ToolOperationsRepo:
             )
         return self.get(operation_id)
 
-    def finish(
+    def finish(self, operation_id: str, **kwargs) -> ToolOperation:
+        """Resolve the journal entry in its own transaction."""
+        with transaction(self._conn):
+            return self.finish_in_transaction(operation_id, **kwargs)
+
+    def finish_in_transaction(
         self,
         operation_id: str,
         *,
@@ -108,16 +119,17 @@ class ToolOperationsRepo:
         if status not in OperationStatus.ALL:
             raise ValueError(f"unknown status: {status!r}")
         finished_at = utcnow_iso()
-        with transaction(self._conn):
-            self._conn.execute(
-                "UPDATE tool_operations SET status = ?, finished_at = ?, "
-                "after_evidence = ?, result_json = ? WHERE operation_id = ?",
-                (
-                    status, finished_at, after_evidence,
-                    json.dumps(result) if result is not None else None,
-                    operation_id,
-                ),
-            )
+        if not self._conn.in_transaction:
+            raise RuntimeError("operation finish requires an open write transaction")
+        self._conn.execute(
+            "UPDATE tool_operations SET status = ?, finished_at = ?, "
+            "after_evidence = ?, result_json = ? WHERE operation_id = ?",
+            (
+                status, finished_at, after_evidence,
+                json.dumps(result) if result is not None else None,
+                operation_id,
+            ),
+        )
         return self.get(operation_id)
 
     def mark_unknown(self, operation_id: str) -> ToolOperation:
