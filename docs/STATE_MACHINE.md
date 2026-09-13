@@ -111,6 +111,12 @@ or commit transactions. SQLite's write lock remains held through commit.
 The returned task is read inside that lock and represents this transition,
 even if another writer subsequently advances the task.
 
+Phase 3 adds `transition_in_transaction(task_id, request=...)` for explicit
+composition of a baseline and its state transition. It applies the same
+validation and guards, requires a caller-owned `BEGIN IMMEDIATE` transaction,
+and never begins or commits one itself. The caller must roll back the whole
+transaction on failure. `transition()` uses this same validation path.
+
 Two writers that observed `PLANNED` and request incompatible targets cannot
 both win against that original state. The second writer checks its
 expectation after acquiring the lock and raises `StaleTaskState`; it does

@@ -9,7 +9,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
-## Status: Phase 2 — durable task state machine
+## Status: Phase 3 — repository inspection and baseline discovery
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:
 
@@ -26,6 +26,11 @@ Phase 2 adds the typed task-state graph, guarded transitions, durable
 resume/reconciliation origins, and atomic state/audit persistence. See
 [`docs/STATE_MACHINE.md`](docs/STATE_MACHINE.md) for the exact API,
 transition, concurrency, and recovery contracts.
+
+Phase 3 adds read-only repository inspection, pre-existing path protection,
+scoped document discovery and immutable baseline evidence, integrated with
+the state machine. See [`docs/REPOSITORY_BASELINES.md`](docs/REPOSITORY_BASELINES.md)
+for capture, scope, evidence and target-preservation contracts.
 
 There is **no** agent loop, model integration, checkpoint Git-plumbing,
 lease manager, scheduler, or daemon yet. See the ADRs and the Foundation
@@ -56,6 +61,6 @@ src/code_slayer/
 ├── store/     # SQLite schema, migrations, connection/transaction handling,
 │              #   task persistence, content-addressed blobs, the operation journal
 ├── audit/     # append-only audit event log, canonical hashing, chain verification
-├── repo/      # thin `git` subprocess wrapper + repo/worktree identity
+├── repo/      # safe Git reads, identity, inspection, rule discovery, baseline service
 └── cli/       # minimal CLI wiring (`codeslayer inspect`)
 ```

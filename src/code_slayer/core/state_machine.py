@@ -49,17 +49,30 @@ class TaskStateMachine:
             completion_decision, failure_decision, reconciled_target,
         )
         with transaction(self._conn):
-            current = self._repo.get(task_id)
-            effect = validate_transition(current, request)
-            for guard in self._guards:
-                guard(current, request)
-            updated = self._repo._record_transition_in_transaction(
-                task_id,
-                to_state=to_state.value,
-                to_phase=effect.phase_after,
-                reason=reason,
-                actor_type=actor_type,
-                actor_id=actor_id,
-                resume_origin=effect.resume_origin,
+            updated = self.transition_in_transaction(
+                task_id, request=request, actor_type=actor_type, actor_id=actor_id,
             )
         return updated
+
+    def transition_in_transaction(
+        self, task_id: str, *, request: TransitionRequest,
+        actor_type: str = "system", actor_id: str | None = None,
+    ) -> Task:
+        """Compose a validated transition with related durable evidence.
+
+        Caller owns a BEGIN IMMEDIATE transaction via store.db.transaction;
+        it must roll back the whole transaction on any failure. This method
+        applies exactly the same authority and guards as transition(), and
+        never starts, commits, or nests a transaction itself.
+        """
+        if not self._conn.in_transaction:
+            raise RuntimeError("state-machine composition requires an open write transaction")
+        current = self._repo.get(task_id)
+        effect = validate_transition(current, request)
+        for guard in self._guards:
+            guard(current, request)
+        return self._repo._record_transition_in_transaction(
+            task_id, to_state=request.to_state.value, to_phase=effect.phase_after,
+            reason=request.reason, actor_type=actor_type, actor_id=actor_id,
+            resume_origin=effect.resume_origin,
+        )
