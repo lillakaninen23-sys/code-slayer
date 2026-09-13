@@ -3,9 +3,10 @@
 This module gives repository primitives only: create, read, and one
 low-level `record_transition` that persists a new (state, phase) plus its
 `STATE_TRANSITION` audit event atomically. It does not itself decide which
-transitions are legal — the state-machine engine (Phase 2) will call this
-primitive rather than reaching into the schema directly. Calling
-`record_transition` here never validates FSM legality.
+transitions are legal. Production callers must use core.TaskStateMachine,
+which calls the transaction-scoped primitive after validating under the
+same write lock. `record_transition` remains a low-level persistence API
+for foundation tests; it never validates FSM legality.
 """
 
 from __future__ import annotations
@@ -118,30 +119,63 @@ class TaskRepo:
     ) -> Task:
         """Persist a new (state, phase) and its `STATE_TRANSITION` audit
         event atomically. Does not validate that `to_state` is a legal
-        transition from the current state — that is the future
-        state-machine engine's job; this is the primitive it will call."""
+        transition from the current state. Production changes must use
+        TaskStateMachine instead of this low-level API."""
         with transaction(self._conn):
-            current = self.get(task_id)
-            now = utcnow_iso()
-            self._conn.execute(
-                "UPDATE tasks SET state = ?, current_phase = ?, updated_at = ? "
-                "WHERE task_id = ?",
-                (to_state, to_phase, now, task_id),
+            updated = self._record_transition_in_transaction(
+                task_id, to_state=to_state, to_phase=to_phase, reason=reason,
+                actor_type=actor_type, actor_id=actor_id,
             )
-            self._audit.append(
-                task_id=task_id,
-                event_type=EventType.STATE_TRANSITION,
-                actor_type=actor_type,
-                actor_id=actor_id,
-                payload={
-                    "from_state": current.state,
-                    "to_state": to_state,
-                    "from_phase": current.current_phase,
-                    "to_phase": to_phase,
-                    "reason": reason,
-                },
-                occurred_at=now,
-            )
+        return updated
+
+    def _record_transition_in_transaction(
+        self,
+        task_id: str,
+        *,
+        to_state: str,
+        to_phase: str | None,
+        reason: str,
+        actor_type: str = "system",
+        actor_id: str | None = None,
+        resume_origin: str | None = None,
+    ) -> Task:
+        """Internal composition point; caller owns the write transaction.
+
+        TaskStateMachine loads and validates inside BEGIN IMMEDIATE before
+        calling this. No other writer can change that state until commit.
+        This method never opens, commits, or nests a transaction.
+        """
+        if not self._conn.in_transaction:
+            raise RuntimeError("transition persistence requires an open write transaction")
+        current = self.get(task_id)
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE tasks SET state = ?, current_phase = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            (to_state, to_phase, now, task_id),
+        )
+        payload = {
+            "from_state": current.state,
+            "to_state": to_state,
+            # Retain the Phase 1 keys for existing audit consumers.
+            "from_phase": current.current_phase,
+            "to_phase": to_phase,
+            "phase_before": current.current_phase,
+            "phase_after": to_phase,
+            "reason": reason,
+        }
+        if resume_origin is not None:
+            payload["resume_origin"] = resume_origin
+        self._audit.append(
+            task_id=task_id,
+            event_type=EventType.STATE_TRANSITION,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            payload=payload,
+            occurred_at=now,
+        )
+        # Read before releasing the lock so the returned task describes
+        # this transition even if another writer immediately follows it.
         return self.get(task_id)
 
 
