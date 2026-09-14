@@ -103,27 +103,55 @@ Two different questions get two different checks, deliberately:
 A bare PID is never proof of identity: after a process exits, the OS is
 free to reuse that same integer for something unrelated. `lease.liveness`
 answers exactly one question, conservatively: *can we prove* the process
-that last held a lease (or a still-tracked child subprocess) is gone?
+that last held a lease (or a still-tracked child subprocess) is gone? And
+it makes a strict distinction, everywhere, between two outcomes that are
+easy to conflate but must never be treated the same:
 
-- `process_start_time(pid)` reads `/proc/<pid>/stat` and `/proc/stat`
-  (`btime`) to compute the process's actual start time, in epoch seconds,
-  converted to an ISO-8601 UTC string — never from our own wall clock,
-  which cannot reconstruct the OS's own allocation of a pid to a specific
-  process. Every recorded pid — a worker's own (`worker_pid`) and any
-  subprocess it spawned and journaled (`tool_operations.child_pid`) alike
-  — is paired with this start time at the moment it is recorded.
-- `check_process_liveness(pid, recorded_start_iso)` returns `Liveness.ALIVE`,
-  `GONE`, or `UNKNOWN`:
-  - pid does not exist right now → `GONE`.
-  - pid exists, and its *current* start time matches the *recorded* one
-    (within a small tolerance for `/proc`'s tick-granularity rounding) →
-    `ALIVE`, genuinely the same process.
-  - pid exists, but its current start time does **not** match the recorded
-    one → the pid has been reused by a later, unrelated process; the
-    *recorded* process is still `GONE`.
-  - anything that cannot be determined (no `/proc` on this platform,
-    permission denied, unparseable data, or no recorded start time to
-    compare against at all) → `UNKNOWN`, never guessed at either way.
+- **`GONE`** — positive, reliable evidence: `/proc/<pid>` itself is
+  absent right now (`ENOENT`/`ESRCH`), or the pid exists but under a
+  *different*, exactly-established identity than the one recorded (pid
+  reuse — see below).
+- **`UNKNOWN`** — liveness could not be safely established at all: no
+  `/proc` on this platform, a permission or read failure, an incomplete
+  or malformed `/proc/<pid>/stat`, a system boot time or clock-tick rate
+  that could not be read or parsed, or no recorded identity to compare
+  against. Failing to *prove* liveness is never treated as proof of
+  death — this module never silently collapses an evidence-reading or
+  -parsing failure into `GONE`.
+
+`process_start_time(pid)` returns the *exact* `/proc`-derived process-start
+identity for `pid`, or `None` if it could not be positively established.
+This is deliberately **not** a formatted wall-clock timestamp: it encodes
+the raw `(boot_time, starttime_ticks, clock_ticks_per_second)` triple
+exactly as `/proc/stat`'s `btime` line and `/proc/<pid>/stat`'s `starttime`
+field (field 22) report them, with no floating-point conversion or lossy
+string round-trip involved. Every recorded pid — a worker's own
+(`worker_pid`) and any subprocess it spawned and journaled
+(`tool_operations.child_pid`) alike — is paired with this exact identity
+at the moment it is recorded.
+
+`check_process_liveness(pid, recorded_identity)` returns `Liveness.ALIVE`,
+`GONE`, or `UNKNOWN`:
+
+- pid does not exist right now (positive evidence) → `GONE`.
+- pid exists, and its *current* exact identity matches the *recorded* one
+  **exactly** → `ALIVE`, genuinely the same process. There is no time
+  tolerance anywhere in this comparison — an earlier revision of this
+  check accepted a start-time match within roughly two seconds to absorb
+  `/proc`'s tick-granularity rounding, which was itself unsafe (two
+  processes that started within that window would be indistinguishable);
+  the fix compares the raw integers `/proc` reports directly, so
+  rounding never enters the comparison and no tolerance is needed.
+- pid exists, but its current exact identity does **not** match the
+  recorded one, by any amount → the pid has been reused by a later,
+  unrelated process; the *recorded* process is still `GONE`.
+- anything that cannot be positively established either way (no `/proc`
+  on this platform, permission denied, an unreadable/malformed
+  `/proc/<pid>/stat`, an unreadable boot time or clock-tick rate, no
+  recorded identity to compare against, or a recorded identity that does
+  not even parse) → `UNKNOWN`, never guessed at either way — including
+  when the pid is *definitely present* but its own identity could not be
+  established (present is not the same as identified).
 - Only Linux's `/proc` is used; anywhere else every query conservatively
   reports `UNKNOWN` rather than fabricate an answer. `LeaseManager` treats
   `UNKNOWN` exactly like `ALIVE` for the purpose of denying a takeover

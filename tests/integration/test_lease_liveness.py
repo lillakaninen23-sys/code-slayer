@@ -63,15 +63,30 @@ def test_check_process_liveness_gone_once_a_real_subprocess_has_exited():
 
 
 def test_check_process_liveness_detects_simulated_pid_reuse():
-    """A currently-alive pid whose *recorded* start time does not match
-    its *current* one must never be reported ALIVE — this is exactly
-    what defeats pid reuse: a bare pid number the OS may have reassigned
-    means nothing without also matching its start time."""
+    """A currently-alive pid whose *recorded* exact start identity does
+    not match its *current* one must never be reported ALIVE — this is
+    exactly what defeats pid reuse: a bare pid number the OS may have
+    reassigned means nothing without also matching its exact start
+    identity. No tolerance: even a one-tick difference in the recorded
+    identity is a different process, not "close enough"."""
     pid = os.getpid()
     real_start = process_start_time(pid)
     assert real_start is not None
-    fabricated_earlier_start = "2000-01-01T00:00:00.000000Z"  # a different, older "process"
-    assert check_process_liveness(pid, fabricated_earlier_start) == Liveness.GONE
+    boot, ticks, hz = real_start.split(":")
+    fabricated = f"{boot}:{int(ticks) - 1}:{hz}"  # one tick earlier: a different "process"
+    assert fabricated != real_start
+    assert check_process_liveness(pid, fabricated) == Liveness.GONE
+
+
+def test_check_process_liveness_malformed_recorded_identity_is_unknown():
+    """A recorded identity that cannot even be parsed (e.g. a stray
+    string, or the old, now-removed ISO-timestamp format) must be
+    `UNKNOWN` — never fall through to `GONE` or `ALIVE` by accident."""
+    pid = os.getpid()
+    assert check_process_liveness(pid, "not-a-valid-identity") == Liveness.UNKNOWN
+    assert check_process_liveness(pid, "2000-01-01T00:00:00.000000Z") == Liveness.UNKNOWN
+    assert check_process_liveness(pid, "1:2") == Liveness.UNKNOWN  # too few fields
+    assert check_process_liveness(pid, "1:2:3:4") == Liveness.UNKNOWN  # too many fields
 
 
 # --- LeaseManager against a real, separate, now-exited OS process -----
