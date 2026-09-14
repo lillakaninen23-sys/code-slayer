@@ -56,3 +56,23 @@ class ContentBlob:
     truncated: bool
     exportable: bool
     created_at: str
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    checkpoint_id: str
+    task_id: str
+    seq: int
+    parent_checkpoint: str | None
+    created_at: str
+    phase: str
+    status: str
+    safe_to_resume: bool
+    git_ref: str
+    git_branch: str | None
+    worker_id: str | None
+    completed_json: str
+    pending_json: str
+    verified_json: str
+    changed_files_json: str
+    next_action: str | None

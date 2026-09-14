@@ -9,7 +9,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
-## Status: Phase 4 — controlled tools and policy
+## Status: Phase 5 — durable Git checkpoints
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:
 
@@ -41,9 +41,18 @@ atomically with its result. See
 [`docs/TOOLS_AND_POLICY.md`](docs/TOOLS_AND_POLICY.md) for the capability,
 policy, journal, crash, and evidence contracts.
 
-There is **no** agent loop, model integration, checkpoint Git-plumbing,
-lease manager, scheduler, or daemon yet. See the ADRs and the Foundation
-Plan for what comes after Phase 1.
+Phase 5 adds durable Git checkpoints: a task's `READY_FOR_CHECKPOINT`
+state can produce one immutable commit representing exactly the content
+it owns (Phase 4), revalidated against its baseline (Phase 3) and current
+repository reality, under a dedicated ref namespace the user's branch,
+HEAD, and index are never touched by — journaled and crash-recoverable
+across the Git/SQLite durability boundary. See
+[`docs/CHECKPOINTS.md`](docs/CHECKPOINTS.md) for the trust boundary,
+ownership, Git/index strategy, and crash/recovery contracts.
+
+There is **no** agent loop, model integration, lease manager, scheduler,
+or daemon yet. See the ADRs and the Foundation Plan for what comes after
+Phase 1.
 
 ## Development
 
@@ -68,9 +77,11 @@ non-temporary Git repository.
 src/code_slayer/
 ├── core/      # task states, transition graph/guards, durable state-machine API
 ├── store/     # SQLite schema, migrations, connection/transaction handling,
-│              #   task persistence, content-addressed blobs, the operation journal
+│              #   task persistence, content-addressed blobs, the operation
+│              #   journal, durable checkpoint records
 ├── audit/     # append-only audit event log, canonical hashing, chain verification
-├── repo/      # safe Git reads, identity, inspection, rule discovery, baseline service
+├── repo/      # safe Git reads, identity, inspection, rule discovery, baseline
+│              #   service, checkpoint Git plumbing and manager
 ├── tools/     # closed capability registry, file/command primitives, controlled executor
 ├── policy/    # pure ALLOW/DENY/REQUIRE_APPROVAL decisions over explicit facts
 └── cli/       # minimal CLI wiring (`codeslayer inspect`)

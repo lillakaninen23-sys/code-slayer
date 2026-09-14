@@ -19,4 +19,10 @@ CAPABILITIES = MappingProxyType({c.name: c for c in (
     Capability("write_file", RiskClass.WRITE_OWNED, True),
     Capability("apply_patch", RiskClass.WRITE_OWNED, True),
     Capability("run_command", RiskClass.GIT_READ),
+    # Phase 5: durable Git checkpoint creation. Decided by its own narrow
+    # policy function (`policy.engine.evaluate_checkpoint`), not the
+    # path-shaped `PolicyEngine.evaluate()` above — see that function's
+    # docstring. Registered here so the set of capabilities Code Slayer can
+    # ever be asked to execute stays centrally enumerable and closed.
+    Capability("checkpoint_create", RiskClass.GIT_MUTATION, True),
 )})

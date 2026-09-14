@@ -97,3 +97,62 @@ class PolicyEngine:
         elif facts.risk != capability.risk:
             return deny("unsupported_risk")
         return PolicyResult(Decision.ALLOW, "allowed")
+
+
+@dataclass(frozen=True)
+class CheckpointPolicyInput:
+    """Facts for the one checkpoint-creation decision (Phase 5).
+
+    Deliberately separate from `PolicyInput`: a checkpoint has no single
+    `resource` path, no per-path ownership/pre-existing distinction, and
+    is legal from exactly one task state — reusing the path-shaped
+    `PolicyInput`/`evaluate()` for it would either misuse those fields or
+    force `evaluate()` to branch heavily on tool identity. A narrow,
+    dedicated decision function keeps both auditable independently.
+    """
+
+    task_id: str
+    repo_id: str
+    worktree_id: str
+    state: TaskState
+    network: bool
+    identity_valid: bool
+    baseline_valid: bool
+    owned_paths_valid: bool
+    protected_conflict: bool
+    unresolved: bool
+
+
+def evaluate_checkpoint(facts: CheckpointPolicyInput) -> PolicyResult:
+    """ALLOW/DENY a checkpoint-creation request. Never REQUIRE_APPROVAL:
+    a checkpoint either safely represents what Code Slayer owns right now
+    or it does not — there is no partial/approvable middle ground here."""
+    if not isinstance(facts, CheckpointPolicyInput):
+        return deny("malformed_policy_input")
+    if not isinstance(facts.state, TaskState):
+        return deny("malformed_policy_input")
+    flags = (
+        facts.network, facts.identity_valid, facts.baseline_valid,
+        facts.owned_paths_valid, facts.protected_conflict, facts.unresolved,
+    )
+    if any(type(flag) is not bool for flag in flags):
+        return deny("malformed_policy_input")
+    if not all(isinstance(v, str) and v for v in (
+        facts.task_id, facts.repo_id, facts.worktree_id,
+    )):
+        return deny("malformed_policy_input")
+    if facts.network:
+        return deny("network_denied")
+    if not facts.identity_valid:
+        return deny("identity_mismatch")
+    if facts.state != TaskState.READY_FOR_CHECKPOINT:
+        return deny("wrong_task_state")
+    if facts.unresolved:
+        return deny("reconciliation_required")
+    if facts.protected_conflict:
+        return deny("protected_baseline_path")
+    if not facts.baseline_valid:
+        return deny("baseline_drift_detected")
+    if not facts.owned_paths_valid:
+        return deny("owned_content_changed")
+    return PolicyResult(Decision.ALLOW, "allowed")

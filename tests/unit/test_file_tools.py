@@ -20,10 +20,20 @@ from code_slayer.tools.models import PatchHunk, ToolError
 @pytest.mark.parametrize("value", [
     "", "\0abc", "a\\b", "../escape", "a/../b", "./a", "a/./b", "a/",
     ".git", "a/.GIT/x", "a/.Git", "/abs", "a//b",
+    "a\tb.txt", "a\nb.txt", "a\rb.txt",
 ])
 def test_relative_path_rejects_unsafe_values(value):
     with pytest.raises(ToolError):
         files.relative_path(value)
+
+
+def test_relative_path_rejects_embedded_control_characters():
+    """A path with an embedded tab/newline must never validate: it could
+    otherwise corrupt a later line-oriented consumer such as the Phase 5
+    checkpoint tree builder's `git update-index --index-info` format."""
+    for control in ("\t", "\n", "\r", "\x00", "\x1f"):
+        with pytest.raises(ToolError, match="invalid_path"):
+            files.relative_path(f"a{control}b.txt")
 
 
 def test_relative_path_root_requires_allow_root():

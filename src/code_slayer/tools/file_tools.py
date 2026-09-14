@@ -14,7 +14,15 @@ MAX_FILE_BYTES = 1024 * 1024
 def relative_path(value: str, *, allow_root: bool = False) -> str:
     if allow_root and value == ".":
         return value
-    if not isinstance(value, str) or not value or "\0" in value or "\\" in value:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ToolError("invalid_path")
+    # No ASCII control character, "\0" included: beyond being meaningless
+    # as a real filename, an embedded tab/newline could corrupt a later
+    # line-oriented consumer of a validated path — e.g. the checkpoint
+    # tree builder's `git update-index --index-info` text format (Phase 5)
+    # — so this is rejected here, once, at the root of every path a
+    # capability ever accepts.
+    if any(ord(char) < 0x20 for char in value):
         raise ToolError("invalid_path")
     try:
         value.encode("utf-8")
