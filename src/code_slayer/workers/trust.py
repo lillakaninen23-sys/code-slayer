@@ -99,6 +99,17 @@ class WorkerTrustManager:
     def history(self, worker_id: str, role: str, capability: str | None = None):
         return self._trust.history_for_scope(worker_id, role, capability)
 
+    def latest_event(self, worker_id: str, role: str, capability: str | None = None):
+        """The single most recent trust event for this exact scope, or
+        `None` if this scope has no history at all. Used by
+        `workers.promotion` to determine evidence freshness: since
+        `current_trust()` is derived from exactly this same row, a
+        non-`None` result here — at the moment a `LOCKED` scope is being
+        considered for promotion — is necessarily the event that most
+        recently brought it *to* `LOCKED` (a downgrade, or an initial
+        state with nothing to be stale relative to when `None`)."""
+        return self._trust.latest_for_scope(worker_id, role, capability)
+
     # -- the one public upward transition -----------------------------------
 
     def promote_to_guarded(

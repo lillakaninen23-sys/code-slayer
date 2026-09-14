@@ -43,6 +43,19 @@ gate that actually earns the right to call it.
    mutation (`docs/CODE_SLAYER_VISION.md` §37 isolation doesn't exist
    yet), so a mutating scope is refused outright, never granted merely
    because a read-only suite happened to pass
+10. **the run is not stale relative to this exact scope's trust
+    history**: if `(worker_id, role, capability)` has *any* prior trust
+    event at all, the run must have *begun* (`started_at`) strictly
+    after that event's `occurred_at` — an equal or earlier timestamp
+    fails closed as stale, never treated as "close enough." This is what
+    stops an old `PASSED` run — the exact one already used, or a
+    different one that merely finished before a later downgrade — from
+    re-promoting a worker that was downgraded back to `LOCKED` after it:
+    a fresh conformance run is required post-downgrade, always. Ordering
+    is decided by direct string comparison of the two canonical
+    `store.db.utcnow_iso()`-format timestamps, which is exact for that
+    fixed-width ISO-8601 UTC format — never a parsed/derived comparison
+    that could disagree with what was actually durably recorded.
 
 Only once every check above holds does this call the Phase 7.2
 primitive at all.
@@ -108,7 +121,17 @@ def promote_from_conformance(
     if not REQUIRED_CASES.issubset(passed_cases):
         return _deny("required_conformance_cases_missing_or_failed")
 
-    return WorkerTrustManager(conn).promote_to_guarded(
+    manager = WorkerTrustManager(conn)
+    latest_event = manager.latest_event(worker_id, role, capability)
+    if latest_event is not None and run.started_at <= latest_event.occurred_at:
+        # Strict `>` required: an equal or earlier run.started_at means
+        # this run cannot prove anything about the worker's behavior
+        # *after* the most recent trust change for this exact scope —
+        # including, critically, after a downgrade back to LOCKED. Fails
+        # closed on ties, never treats "same instant" as fresh enough.
+        return _deny("run_stale_relative_to_latest_trust_event")
+
+    return manager.promote_to_guarded(
         worker_id=worker_id, role=role, capability=capability,
         reason=reason, evidence_ref=run_id,
     )

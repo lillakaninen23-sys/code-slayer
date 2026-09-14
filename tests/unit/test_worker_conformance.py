@@ -24,7 +24,12 @@ from code_slayer.workers.conformance import (
 )
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter
 from code_slayer.workers.promotion import promote_from_conformance
-from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+from code_slayer.workers.protocol import (
+    WorkerAdapterError,
+    WorkerResponse,
+    WorkerResponseKind,
+    WorkerToolCall,
+)
 from code_slayer.workers.trust import WorkerTrustManager
 
 
@@ -32,6 +37,18 @@ from code_slayer.workers.trust import WorkerTrustManager
 def registered_worker(db_conn) -> str:
     WorkersRepo(db_conn).register(worker_id="w1", kind="fake", network_class="local")
     return "w1"
+
+
+class _FakeClock:
+    """A controllable clock, matching the pattern already used in
+    `tests/unit/test_lease_manager.py`, so run/downgrade ordering can be
+    tested exactly, including the equal-timestamp edge case."""
+
+    def __init__(self, start: str = "2026-01-01T00:00:00.000000Z") -> None:
+        self.now = start
+
+    def __call__(self) -> str:
+        return self.now
 
 
 def _passing_responses() -> list[WorkerResponse | Exception]:
@@ -53,7 +70,7 @@ def _passing_responses() -> list[WorkerResponse | Exception]:
             kind=WorkerResponseKind.TEXT,
             text="<function=skill>\n<parameter=name>\ngit\n</parameter>\n</function>",
         ),
-        RuntimeError("simulated timeout"),  # timeout_error_handling
+        WorkerAdapterError("simulated_timeout"),  # timeout_error_handling -- expected shape
     ]
 
 
@@ -321,10 +338,13 @@ def test_mutation_capability_not_promoted_from_conformance(db_conn, registered_w
 
 
 def test_read_only_compliance_case_fails_if_mutation_became_executable(db_conn, registered_worker):
-    """Direct proof the containment case's own detection actually
-    triggers: a misconfigured allowed_tools that includes a mutating
-    capability, paired with the fake adapter using it, must fail this
-    specific case."""
+    """Direct proof this is genuine WORKER evidence, not a containment
+    check: a misconfigured allowed_tools that includes a mutating
+    capability, paired with a fake adapter that actually uses it, must
+    fail this case because the *worker* requested a mutation — nothing
+    here depends on whether Code Slayer would separately have blocked
+    it (it would have, via validate_response's own allowlist check, but
+    that is not what this case is grading)."""
     from code_slayer.workers import conformance as conformance_module
 
     adapter = FakeWorkerAdapter([
@@ -347,7 +367,65 @@ def test_read_only_compliance_case_fails_if_mutation_became_executable(db_conn, 
     finally:
         conformance_module._base_request = original
     assert result.passed is False
-    assert result.reason == "mutating_capability_became_executable"
+    assert result.reason == "worker_requested_mutating_capability"
+
+
+def test_read_only_compliance_fails_on_unauthorized_capability_even_though_contained(
+    db_conn, registered_worker,
+):
+    """Finding 1's central requirement, tested directly: the worker asks
+    for a capability outside its offered scope; validate_response()
+    correctly denies it as UNAUTHORIZED_CAPABILITY (containment holds,
+    nothing executes) -- but the case must still FAIL, because
+    containment succeeding is not evidence the worker behaved well."""
+    from code_slayer.workers import conformance as conformance_module
+    from code_slayer.workers.protocol_validation import ValidationOutcome, validate_response
+
+    # First, confirm containment itself genuinely holds for this response
+    # shape (the premise the case's own FAIL must not be confused with).
+    probe_adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="run_command", params={}),
+        ),
+    ])
+    request = conformance_module._base_request("coder", allowed_tools=("read_file",))
+    outcome = validate_response(request, probe_adapter.infer(request))
+    assert outcome.outcome == ValidationOutcome.UNAUTHORIZED_CAPABILITY
+    assert not outcome.executable  # containment held
+
+    # Now confirm the actual case, given the identical response shape,
+    # still FAILs -- containment holding did not convert it to a PASS.
+    case_adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="run_command", params={}),
+        ),
+    ])
+    case_result = conformance_module._case_read_only_compliance(case_adapter, "coder")
+    assert case_result.passed is False
+    assert case_result.reason == "worker_requested_unauthorized_capability"
+
+
+def test_containment_case_passes_independently_of_worker_evidence_case_failing(
+    db_conn, registered_worker,
+):
+    """malformed_protocol_rejection (containment) must still PASS in a
+    run where read_only_compliance (worker evidence) FAILs -- neither
+    case's outcome is derived from the other's."""
+    responses = _passing_responses()
+    # Break read_only_compliance: worker requests a mutating capability.
+    responses[4] = WorkerResponse(
+        kind=WorkerResponseKind.TOOL_CALL,
+        tool_call=WorkerToolCall(tool="write_file", params={"path": "x", "content": "y"}),
+    )
+    adapter = FakeWorkerAdapter(responses)
+    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
+    results = {r.case_name: r.passed for r in ConformanceRepo(db_conn).list_results(result.run_id)}
+    assert results["read_only_compliance"] is False
+    assert results["malformed_protocol_rejection"] is True
+    # Still fails overall -- a required case is missing.
+    assert result.status == ConformanceRunStatus.FAILED
 
 
 # --- 17. malformed protocol incident regression remains contained ----------
@@ -366,7 +444,7 @@ def test_timeout_error_simulation_produces_durable_result(db_conn, registered_wo
     results = {r.case_name: r for r in ConformanceRepo(db_conn).list_results(result.run_id)}
     case = results["timeout_error_handling"]
     assert case.passed is True
-    assert "adapter_failure_contained" in case.reason
+    assert "expected_adapter_failure_contained" in case.reason
 
 
 # --- 19. crash/incomplete run remains non-passing ---------------------------
@@ -474,6 +552,231 @@ def test_run_suite_for_unknown_worker_refused(db_conn):
     assert not result.ok
     assert result.reason == "unknown_worker"
     assert result.run_id is None
+
+
+# --- staleness: a run must not outlive a later downgrade -------------------
+
+def test_downgrade_makes_the_already_used_run_stale(db_conn, registered_worker):
+    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
+    adapter = FakeWorkerAdapter(_passing_responses())
+    run_a = run_conformance_suite(
+        db_conn, adapter, worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    assert run_a.status == ConformanceRunStatus.PASSED
+
+    first_promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+    )
+    assert first_promo.ok
+
+    clock.now = "2026-01-01T01:00:00.000000Z"
+    manager = WorkerTrustManager(db_conn, now_fn=clock)
+    downgrade = manager.downgrade_to_locked(
+        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+    )
+    assert downgrade.ok
+    assert manager.current_trust(registered_worker, "coder") == TrustLevel.LOCKED
+
+    # The exact same run_id, already used once, cannot re-promote after
+    # the downgrade.
+    second_promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+    )
+    assert not second_promo.ok
+    assert second_promo.reason == "run_stale_relative_to_latest_trust_event"
+    assert manager.current_trust(registered_worker, "coder") == TrustLevel.LOCKED
+
+
+def test_a_different_run_completed_before_downgrade_is_also_stale(db_conn, registered_worker):
+    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
+
+    run_a = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+    )
+
+    # A second, independent passing run, completed BEFORE the downgrade
+    # below -- never used for the first promotion, but still too old.
+    clock.now = "2026-01-01T00:30:00.000000Z"
+    run_b = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    assert run_b.status == ConformanceRunStatus.PASSED
+
+    clock.now = "2026-01-01T01:00:00.000000Z"
+    WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
+        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+    )
+
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_b.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "run_stale_relative_to_latest_trust_event"
+
+
+def test_fresh_run_started_after_downgrade_can_promote(db_conn, registered_worker):
+    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
+    run_a = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+    )
+
+    clock.now = "2026-01-01T01:00:00.000000Z"
+    WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
+        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+    )
+
+    clock.now = "2026-01-01T02:00:00.000000Z"
+    run_c = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    assert run_c.status == ConformanceRunStatus.PASSED
+
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_c.run_id,
+    )
+    assert promo.ok
+    assert promo.level == TrustLevel.GUARDED
+
+
+def test_equal_freshness_boundary_fails_closed(db_conn, registered_worker):
+    """A run whose started_at exactly equals the latest trust event's
+    occurred_at must not be treated as fresh enough -- strict `>` only."""
+    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
+    run_a = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+    )
+
+    downgrade_time = "2026-01-01T01:00:00.000000Z"
+    clock.now = downgrade_time
+    WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
+        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+    )
+
+    # run_d's started_at is set to EXACTLY the downgrade's own timestamp.
+    clock.now = downgrade_time
+    run_d = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder", now_fn=clock,
+    )
+    assert run_d.status == ConformanceRunStatus.PASSED
+
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run_d.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "run_stale_relative_to_latest_trust_event"
+
+
+def test_no_prior_trust_history_means_no_freshness_constraint(db_conn, registered_worker):
+    """A worker/role/capability scope with no trust history at all has
+    nothing to be stale relative to -- any passing run, regardless of
+    when it started, may promote it."""
+    run = run_conformance_suite(
+        db_conn, FakeWorkerAdapter(_passing_responses()),
+        worker_id=registered_worker, role="coder",
+    )
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=run.run_id,
+    )
+    assert promo.ok
+
+
+# --- timeout/error: only the expected failure shape counts -----------------
+
+def test_unexpected_exception_does_not_count_as_timeout_containment(db_conn, registered_worker):
+    responses = _passing_responses()
+    responses[6] = KeyError("unexpected programming error, not a timeout")
+    adapter = FakeWorkerAdapter(responses)
+    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
+    results = {r.case_name: r for r in ConformanceRepo(db_conn).list_results(result.run_id)}
+    case = results["timeout_error_handling"]
+    assert case.passed is False
+    assert "unexpected_exception_not_valid_containment" in case.reason
+    assert "KeyError" in case.reason
+    assert result.status == ConformanceRunStatus.FAILED
+
+
+def test_unexpected_adapter_exception_prevents_passing_promotion(db_conn, registered_worker):
+    responses = _passing_responses()
+    responses[6] = ValueError("also not a valid timeout shape")
+    adapter = FakeWorkerAdapter(responses)
+    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
+    assert result.status == ConformanceRunStatus.FAILED
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "run_not_passed"
+
+
+# --- run identity immutability ----------------------------------------------
+
+def test_run_identity_fields_cannot_be_changed_while_running(db_conn, registered_worker):
+    repo = ConformanceRepo(db_conn)
+    with transaction(db_conn):
+        repo.start_run_in_transaction(
+            run_id="run-identity", worker_id=registered_worker, role="coder",
+            suite_version=SUITE_VERSION, started_at="2026-01-01T00:00:00.000000Z",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db_conn.execute(
+            "UPDATE worker_conformance_runs SET role = 'reviewer' WHERE run_id = 'run-identity'",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db_conn.execute(
+            "UPDATE worker_conformance_runs SET worker_id = 'someone-else' "
+            "WHERE run_id = 'run-identity'",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db_conn.execute(
+            "UPDATE worker_conformance_runs SET started_at = '2099-01-01T00:00:00.000000Z' "
+            "WHERE run_id = 'run-identity'",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db_conn.execute(
+            "UPDATE worker_conformance_runs SET suite_version = 'other-suite' "
+            "WHERE run_id = 'run-identity'",
+        )
+    # Still exactly as created -- none of the attempts above took effect.
+    run = repo.get_run("run-identity")
+    assert run.role == "coder"
+    assert run.worker_id == registered_worker
+    assert run.started_at == "2026-01-01T00:00:00.000000Z"
+    assert run.suite_version == SUITE_VERSION
+
+
+def test_legitimate_finalize_transition_still_works_with_identity_lock(db_conn, registered_worker):
+    repo = ConformanceRepo(db_conn)
+    with transaction(db_conn):
+        repo.start_run_in_transaction(
+            run_id="run-finalize-ok", worker_id=registered_worker, role="coder",
+            suite_version=SUITE_VERSION, started_at="2026-01-01T00:00:00.000000Z",
+        )
+    with transaction(db_conn):
+        run = repo.finalize_run_in_transaction(
+            "run-finalize-ok", status=ConformanceRunStatus.PASSED,
+            completed_at="2026-01-01T00:00:01.000000Z",
+        )
+    assert run.status == ConformanceRunStatus.PASSED
+    assert run.completed_at == "2026-01-01T00:00:01.000000Z"
+    # Identity fields untouched by the legitimate finalize.
+    assert run.worker_id == registered_worker
+    assert run.role == "coder"
+    assert run.started_at == "2026-01-01T00:00:00.000000Z"
 
 
 # --- concurrency: two promotion attempts for the same passing run ----------
