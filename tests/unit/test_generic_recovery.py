@@ -135,6 +135,79 @@ def test_reconcile_supported_dispatches_checkpoint_create_ref_absent_as_failed(
     assert reloaded.status == OperationStatus.FAILED
 
 
+# --- epoch_state: QUIESCING-aware classification (Phase 6 completion) -----
+
+def test_epoch_state_no_lease_when_worktree_never_leased(db_conn, task):
+    # A recorded generation, but the worktree currently has no lease row
+    # at all (e.g. fully released with nothing re-acquired since) -- not
+    # comparable to "the current epoch" because there isn't one.
+    op = start_operation(db_conn, task, tool_name="write_file", generation=1)
+    found = discover_unresolved(db_conn, task_id=task.task_id)
+    assert found[0].operation_id == op.operation_id
+    assert found[0].epoch_state == "no_lease"
+
+
+def test_epoch_state_unknown_when_operations_own_generation_unrecorded(db_conn, task):
+    op = start_operation(db_conn, task, tool_name="write_file", generation=None)
+    found = discover_unresolved(db_conn, task_id=task.task_id)
+    assert found[0].operation_id == op.operation_id
+    assert found[0].epoch_state == "unknown"
+
+
+def test_epoch_state_current_active_for_live_current_epoch(db_conn, task):
+    LeaseManager(db_conn).acquire(
+        worktree_id=task.worktree_id, task_id=task.task_id, worker_id="w", worker_session_id="s",
+    )
+    start_operation(db_conn, task, tool_name="write_file", generation=1)
+    found = discover_unresolved(db_conn, task_id=task.task_id)
+    assert found[0].epoch_state == "current_active"
+
+
+def test_epoch_state_stale_after_takeover(db_conn, task):
+    manager = LeaseManager(db_conn)
+    manager.acquire(
+        worktree_id=task.worktree_id, task_id=task.task_id, worker_id="a", worker_session_id="sa",
+    )
+    op = start_operation(db_conn, task, tool_name="write_file", generation=1)
+    from code_slayer.store.lease_repo import LeaseRepo
+
+    current = LeaseRepo(db_conn).get(task.worktree_id)
+    manager.release(_handle_from_row(current))
+    manager.acquire(
+        worktree_id=task.worktree_id, task_id=task.task_id, worker_id="b", worker_session_id="sb",
+    )
+    found = discover_unresolved(db_conn, task_id=task.task_id)
+    assert found[0].operation_id == op.operation_id
+    assert found[0].epoch_state == "stale"
+
+
+def test_epoch_state_current_quiescing_while_liveness_unresolved(db_conn, task):
+    """An operation whose epoch is the worktree's *current* lease, and
+    that lease is durably `QUIESCING`, must be reported as
+    `current_quiescing` — this *is* the "unknown process liveness" case:
+    recovery reports it, but never guesses an outcome from it."""
+
+    def clock():
+        return clock.now
+
+    clock.now = "2024-01-01T00:00:00.000000Z"
+    manager = LeaseManager(db_conn, ttl_seconds=1.0, now_fn=clock)
+    manager.acquire(
+        worktree_id=task.worktree_id, task_id=task.task_id, worker_id="a", worker_session_id="sa",
+    )
+    op = start_operation(db_conn, task, tool_name="write_file", generation=1)
+    clock.now = "2024-01-01T00:05:00.000000Z"  # well past the 1s TTL
+    # Own pid is genuinely alive, so this denies and parks in QUIESCING
+    # rather than completing a takeover.
+    result = manager.acquire(
+        worktree_id=task.worktree_id, task_id=task.task_id, worker_id="b", worker_session_id="sb",
+    )
+    assert result.decision.name == "DENY"
+    found = discover_unresolved(db_conn, task_id=task.task_id)
+    assert found[0].operation_id == op.operation_id
+    assert found[0].epoch_state == "current_quiescing"
+
+
 def test_discover_unresolved_scans_all_tasks_when_unscoped(db_conn, git_repo_with_commit):
     info = identity.resolve(git_repo_with_commit)
     task_a = TaskRepo(db_conn).create(

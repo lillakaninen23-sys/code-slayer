@@ -191,7 +191,11 @@ general "reconcile any stuck operation" mechanism. Schema v1 is unchanged;
 > `lease: LeaseHandle` — required (and checked before policy) for
 > `create()` to start a *new* attempt; not required for `reconcile()`,
 > which remains the explicit, evidence-based recovery path described
-> above, unchanged. See
+> above, unchanged. `create()` also revalidates fencing a second time,
+> deeper: immediately before `create_ref` — the last moment before a
+> checkpoint becomes externally visible — refusing to publish a built
+> (but still unreferenced, so harmless) commit under authority that may
+> have been superseded while tree/commit construction ran. See
 > [`docs/LEASES_AND_RECOVERY.md`](LEASES_AND_RECOVERY.md) for the full
-> fencing model and why checkpoint finalization is deliberately not
-> re-gated by lease state.
+> fencing/quiescence model and why checkpoint finalization itself
+> (`_finalize()`) is still deliberately not re-gated by lease state.

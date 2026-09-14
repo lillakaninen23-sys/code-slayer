@@ -1,10 +1,12 @@
 """Durable worktree lease/fencing: acquire, renew, release, takeover,
-expiry, and malformed-data handling — all against a real SQLite connection."""
+quiescence/liveness gating, expiry, and malformed-data handling — all
+against a real SQLite connection."""
 
 from __future__ import annotations
 
 import pytest
 
+from code_slayer.lease.liveness import Liveness
 from code_slayer.lease.manager import LeaseHandle, LeaseManager
 from code_slayer.policy.engine import Decision
 from code_slayer.store.lease_repo import LeaseRepo, LeaseStatus
@@ -41,7 +43,34 @@ def clock():
 
 @pytest.fixture
 def manager(db_conn, clock):
+    """A manager using the *real* liveness check. Since every acquire in
+    these tests runs from this same test process, the "old owner" is
+    always genuinely alive — exactly the scenario that must deny/quiesce
+    rather than take over."""
     return LeaseManager(db_conn, ttl_seconds=60.0, now_fn=clock)
+
+
+def fake_liveness(result: Liveness):
+    """Usable as either `liveness_fn(pid, started_at)` or
+    `child_liveness_fn(pid)` — both just need a fixed answer here."""
+    return lambda *args: result
+
+
+@pytest.fixture
+def dead_owner_manager(db_conn, clock):
+    """A manager that always finds the previous owner's process proven
+    gone — the only way `acquire()` should ever actually complete a
+    takeover of a TTL-expired lease."""
+    return LeaseManager(
+        db_conn, ttl_seconds=60.0, now_fn=clock, liveness_fn=fake_liveness(Liveness.GONE),
+    )
+
+
+@pytest.fixture
+def unknown_liveness_manager(db_conn, clock):
+    return LeaseManager(
+        db_conn, ttl_seconds=60.0, now_fn=clock, liveness_fn=fake_liveness(Liveness.UNKNOWN),
+    )
 
 
 def acquire(manager, task_id, worker="w1", session="s1", worktree="wt-1"):
@@ -50,7 +79,7 @@ def acquire(manager, task_id, worker="w1", session="s1", worktree="wt-1"):
     )
 
 
-# --- acquire -----------------------------------------------------------
+# --- acquire: fresh / busy / released -------------------------------------
 
 def test_acquire_fresh_task_succeeds_with_generation_one(manager, task_id):
     result = acquire(manager, task_id)
@@ -79,16 +108,6 @@ def test_acquire_after_release_succeeds_with_incremented_generation(manager, tas
     second = acquire(manager, task_id, worker="w2", session="s2")
     assert second.decision == Decision.ALLOW
     assert second.handle.generation == 2
-
-
-def test_acquire_after_expiry_takes_over(manager, task_id, clock):
-    first = acquire(manager, task_id)
-    clock.advance(120)  # past the 60s ttl
-    second = acquire(manager, task_id, worker="w2", session="s2")
-    assert second.decision == Decision.ALLOW
-    assert second.handle.generation == 2
-    # The old handle is now permanently stale.
-    assert not manager.is_current(first.handle)
 
 
 def test_acquire_not_yet_expired_denies_takeover(manager, task_id, clock):
@@ -152,6 +171,149 @@ def test_concurrent_acquire_exactly_one_winner(tmp_path, task_id):
         conn_b.close()
 
 
+# --- quiescence: an expired ACTIVE lease is never directly replaced --------
+
+def test_acquire_after_expiry_with_live_owner_denies_and_begins_quiescing(
+    manager, task_id, clock, db_conn,
+):
+    """The core Phase 6 completion requirement: a TTL-expired lease whose
+    owner is still provably alive must never be directly replaced."""
+    first = acquire(manager, task_id)
+    clock.advance(120)  # past the 60s ttl
+    second = acquire(manager, task_id, worker="w2", session="s2")
+
+    assert second.decision == Decision.DENY
+    assert second.reason == "quiescing_owner_still_alive"
+    row = LeaseRepo(db_conn).get("wt-1")
+    assert row.status == LeaseStatus.QUIESCING
+    assert row.generation == 1
+    assert row.worker_id == "w1"  # still the original owner's row
+    # The fencing gate immediately stops honoring it, even though no new
+    # epoch has been granted to anyone yet.
+    assert not manager.is_current(first.handle)
+
+
+def test_acquire_after_expiry_with_dead_owner_completes_takeover(
+    dead_owner_manager, task_id, clock,
+):
+    first = acquire(dead_owner_manager, task_id)
+    clock.advance(120)
+    second = acquire(dead_owner_manager, task_id, worker="w2", session="s2")
+
+    assert second.decision == Decision.ALLOW
+    assert second.handle.generation == 2
+    assert not dead_owner_manager.is_current(first.handle)
+    assert dead_owner_manager.is_current(second.handle)
+
+
+def test_acquire_after_expiry_with_unknown_liveness_fails_closed(
+    unknown_liveness_manager, task_id, clock, db_conn,
+):
+    acquire(unknown_liveness_manager, task_id)
+    clock.advance(120)
+    result = unknown_liveness_manager.acquire(
+        worktree_id="wt-1", task_id=task_id, worker_id="w2", worker_session_id="s2",
+    )
+    assert result.decision == Decision.DENY
+    assert result.reason == "quiescing_liveness_unknown"
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.QUIESCING
+
+
+def test_acquire_denies_when_recorded_child_process_still_alive(
+    db_conn, task_id, clock,
+):
+    """A worker process being gone does not prove a subprocess it spawned
+    is also gone (Foundation Plan §12)."""
+    from code_slayer.store.db import transaction
+    from code_slayer.store.tool_operations_repo import ToolOperationsRepo
+
+    manager = LeaseManager(
+        db_conn, ttl_seconds=60.0, now_fn=clock,
+        liveness_fn=fake_liveness(Liveness.GONE), child_liveness_fn=fake_liveness(Liveness.ALIVE),
+    )
+    first = acquire(manager, task_id)
+    with transaction(db_conn):
+        op = ToolOperationsRepo(db_conn).start_in_transaction(
+            task_id=task_id, worktree_id="wt-1", worker_id="w1", worker_session_id="s1",
+            lease_generation=first.handle.generation, tool_name="run_command",
+            risk_class="GIT_READ", request_hash="deadbeef", target_resource=".",
+        )
+    ToolOperationsRepo(db_conn).record_child_pid(op.operation_id, 4242, clock())
+    clock.advance(120)
+
+    result = acquire(manager, task_id, worker="w2", session="s2")
+    assert result.decision == Decision.DENY
+    assert result.reason == "quiescing_child_process_alive"
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.QUIESCING
+
+
+def test_full_cascade_in_one_call_is_durably_observable(
+    dead_owner_manager, task_id, clock, db_conn,
+):
+    """A single acquire() call may advance through every step when each
+    is provably safe, but each step is still its own committed
+    transaction — verified here via the audit trail it must leave behind."""
+    from code_slayer.audit.events import EventType
+
+    acquire(dead_owner_manager, task_id)
+    clock.advance(120)
+    result = acquire(dead_owner_manager, task_id, worker="w2", session="s2")
+    assert result.decision == Decision.ALLOW
+
+    events = [
+        r["event_type"] for r in db_conn.execute(
+            "SELECT event_type FROM audit_events WHERE task_id = ? ORDER BY seq", (task_id,),
+        )
+    ]
+    assert EventType.LEASE_QUIESCING.value in events
+    assert events.count(EventType.LEASE_EXPIRED.value) == 1
+    assert events[-1] == EventType.LEASE_ACQUIRED.value
+
+
+def test_quiescing_owner_can_reclaim_via_renew(manager, task_id, clock, db_conn):
+    first = acquire(manager, task_id)
+    clock.advance(120)
+    denied = acquire(manager, task_id, worker="w2", session="s2")
+    assert denied.decision == Decision.DENY
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.QUIESCING
+
+    reclaimed = manager.renew(first.handle)
+    assert reclaimed.decision == Decision.ALLOW
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.ACTIVE
+    assert manager.is_current(first.handle)
+
+    # A takeover attempt now correctly sees a live, ACTIVE, unexpired lease.
+    still_denied = acquire(manager, task_id, worker="w3", session="s3")
+    assert still_denied.decision == Decision.DENY
+    assert still_denied.reason == "lease_held_and_not_expired"
+
+
+def test_quiescing_owner_can_still_explicitly_release(manager, task_id, clock, db_conn):
+    first = acquire(manager, task_id)
+    clock.advance(120)
+    acquire(manager, task_id, worker="w2", session="s2")
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.QUIESCING
+
+    released = manager.release(first.handle)
+    assert released.decision == Decision.ALLOW
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.RELEASED
+
+    fresh = acquire(manager, task_id, worker="w2", session="s2")
+    assert fresh.decision == Decision.ALLOW
+    assert fresh.handle.generation == 2
+
+
+def test_is_current_false_immediately_on_quiescing_before_any_resolution(
+    manager, task_id, clock,
+):
+    first = acquire(manager, task_id)
+    clock.advance(120)
+    acquire(manager, task_id, worker="w2", session="s2")  # denied, but begins quiescing
+    # The fencing gate stops authorizing the original holder immediately,
+    # even though no one else has been granted anything yet.
+    assert not manager.is_current(first.handle)
+
+
 # --- renew ---------------------------------------------------------------
 
 def test_renew_current_holder_succeeds(manager, task_id, clock):
@@ -184,11 +346,12 @@ def test_renew_wrong_session_same_worktree_denied(manager, task_id):
     assert result.reason == "stale_fencing_token"
 
 
-def test_renew_after_expiry_and_takeover_denied(manager, task_id, clock):
-    first = acquire(manager, task_id)
+def test_renew_after_takeover_denied(dead_owner_manager, task_id, clock):
+    first = acquire(dead_owner_manager, task_id)
     clock.advance(120)
-    acquire(manager, task_id, worker="w2", session="s2")
-    result = manager.renew(first.handle)
+    second = acquire(dead_owner_manager, task_id, worker="w2", session="s2")
+    assert second.decision == Decision.ALLOW  # dead owner: genuine takeover completes
+    result = dead_owner_manager.renew(first.handle)
     assert result.decision == Decision.DENY
     assert result.reason == "stale_fencing_token"
 
@@ -252,37 +415,72 @@ def test_release_does_not_touch_task_state(manager, task_id, db_conn):
 
 # --- takeover / fencing invariants ------------------------------------------
 
-def test_token_strictly_increases_across_takeovers(manager, task_id, clock):
+def test_token_strictly_increases_across_takeovers(dead_owner_manager, task_id, clock):
     generations = []
     for i in range(4):
-        result = manager.acquire(
-            worktree_id="wt-1", task_id=task_id, worker_id=f"w{i}", worker_session_id=f"s{i}",
-        )
+        result = acquire(dead_owner_manager, task_id, worker=f"w{i}", session=f"s{i}")
         generations.append(result.handle.generation)
         clock.advance(120)
     assert generations == [1, 2, 3, 4]
 
 
-def test_old_token_permanently_rejected_after_multiple_takeovers(manager, task_id, clock):
-    first = acquire(manager, task_id)
+def test_old_token_permanently_rejected_after_multiple_takeovers(
+    dead_owner_manager, task_id, clock,
+):
+    first = acquire(dead_owner_manager, task_id)
     for i in range(2, 4):
         clock.advance(120)
-        acquire(manager, task_id, worker=f"w{i}", session=f"s{i}")
-    assert not manager.is_current(first.handle)
-    assert manager.renew(first.handle).decision == Decision.DENY
+        acquire(dead_owner_manager, task_id, worker=f"w{i}", session=f"s{i}")
+    assert not dead_owner_manager.is_current(first.handle)
+    assert dead_owner_manager.renew(first.handle).decision == Decision.DENY
 
 
-# --- expire_if_stale ---------------------------------------------------------
+def test_no_generation_burned_by_quiescing_alone(manager, task_id, clock, db_conn):
+    """Entering (and staying in) QUIESCING must not itself consume a
+    generation — only an actual new ACTIVE epoch does."""
+    acquire(manager, task_id)
+    clock.advance(120)
+    acquire(manager, task_id, worker="w2", session="s2")  # denied; begins quiescing
+    acquire(manager, task_id, worker="w3", session="s3")  # denied again; still quiescing
+    row = LeaseRepo(db_conn).get("wt-1")
+    assert row.status == LeaseStatus.QUIESCING
+    assert row.generation == 1  # unchanged
 
-def test_expire_if_stale_marks_expired_without_new_owner(manager, task_id, clock, db_conn):
+
+# --- expire_if_stale: one step at a time ------------------------------------
+
+def test_expire_if_stale_first_step_is_quiescing_not_expired(manager, task_id, clock, db_conn):
     acquired = acquire(manager, task_id)
     clock.advance(120)
     result = manager.expire_if_stale("wt-1")
     assert result.decision == Decision.ALLOW
+    assert result.reason == "quiescing"
     row = LeaseRepo(db_conn).get("wt-1")
-    assert row.status == LeaseStatus.EXPIRED
+    assert row.status == LeaseStatus.QUIESCING
     assert row.worker_id == "w1"  # no new owner yet
     assert not manager.is_current(acquired.handle)
+
+
+def test_expire_if_stale_second_call_completes_with_dead_owner(
+    dead_owner_manager, task_id, clock, db_conn,
+):
+    acquire(dead_owner_manager, task_id)
+    clock.advance(120)
+    dead_owner_manager.expire_if_stale("wt-1")  # -> QUIESCING
+    result = dead_owner_manager.expire_if_stale("wt-1")  # -> EXPIRED
+    assert result.decision == Decision.ALLOW
+    assert result.reason == "expired"
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.EXPIRED
+
+
+def test_expire_if_stale_stays_quiescing_with_live_owner(manager, task_id, clock, db_conn):
+    acquire(manager, task_id)
+    clock.advance(120)
+    manager.expire_if_stale("wt-1")  # -> QUIESCING
+    result = manager.expire_if_stale("wt-1")  # liveness: still alive
+    assert result.decision == Decision.DENY
+    assert result.reason == "quiescing_owner_still_alive"
+    assert LeaseRepo(db_conn).get("wt-1").status == LeaseStatus.QUIESCING
 
 
 def test_expire_if_stale_denies_when_not_yet_expired(manager, task_id):
@@ -296,6 +494,38 @@ def test_expire_if_stale_no_lease_denied(manager):
     result = manager.expire_if_stale("wt-none")
     assert result.decision == Decision.DENY
     assert result.reason == "no_lease"
+
+
+# --- restart while quiescing ------------------------------------------------
+
+def test_restart_while_quiescing_resumes_from_durable_state(db_conn, task_id, clock):
+    """Reopening the database must continue from exactly the durable
+    QUIESCING state, never resurrecting the old owner's authority nor
+    inventing a resolution that never happened."""
+    from code_slayer.store.db import connect
+
+    manager = LeaseManager(db_conn, ttl_seconds=60.0, now_fn=clock)
+    first = acquire(manager, task_id)
+    clock.advance(120)
+    acquire(manager, task_id, worker="w2", session="s2")  # -> QUIESCING
+    db_path = db_conn.execute("PRAGMA database_list").fetchone()["file"]
+
+    reopened = connect(db_path)
+    try:
+        row = LeaseRepo(reopened).get("wt-1")
+        assert row.status == LeaseStatus.QUIESCING
+        assert row.generation == 1
+        resumed_manager = LeaseManager(
+            reopened, ttl_seconds=60.0, now_fn=clock, liveness_fn=fake_liveness(Liveness.GONE),
+        )
+        assert not resumed_manager.is_current(first.handle)
+        result = resumed_manager.acquire(
+            worktree_id="wt-1", task_id=task_id, worker_id="w3", worker_session_id="s3",
+        )
+        assert result.decision == Decision.ALLOW
+        assert result.handle.generation == 2
+    finally:
+        reopened.close()
 
 
 # --- malformed persisted data (broader) -------------------------------------

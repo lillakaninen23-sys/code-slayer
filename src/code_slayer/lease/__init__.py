@@ -2,6 +2,7 @@
 mutate a worktree, and a monotonic token stale holders can never satisfy
 again once superseded."""
 
+from code_slayer.lease.liveness import Liveness
 from code_slayer.lease.manager import (
     DEFAULT_LEASE_TTL_SECONDS,
     LeaseError,
@@ -21,6 +22,7 @@ __all__ = [
     "LeaseHandle",
     "LeaseManager",
     "LeaseResult",
+    "Liveness",
     "UnresolvedOperation",
     "discover_unresolved",
     "reconcile_supported",

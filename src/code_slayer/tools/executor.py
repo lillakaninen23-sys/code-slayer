@@ -12,6 +12,7 @@ from pathlib import Path
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.core.states import TaskState
+from code_slayer.lease.liveness import process_start_time
 from code_slayer.lease.manager import LeaseHandle, LeaseManager
 from code_slayer.policy.engine import Decision, PolicyEngine, PolicyInput, PolicyResult
 from code_slayer.repo.baseline import InspectionService
@@ -117,7 +118,7 @@ class ToolExecutor:
             Path(manifest["inspection"]["repo_root"]),
             timeout=request.command.timeout if request.command else 3.0,
             on_spawn=lambda pid: self._operations.record_child_pid(
-                operation_id, pid, utcnow_iso(),
+                operation_id, pid, process_start_time(pid),
             ),
         )
         try:

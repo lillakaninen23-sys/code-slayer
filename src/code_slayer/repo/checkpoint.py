@@ -232,6 +232,14 @@ class CheckpointManager:
                 f"Code Slayer checkpoint\n\ntask: {task_id}\nseq: {context.seq}\n",
                 cwd=context.root,
             )
+            # Fencing revalidation at the deepest practical boundary: the
+            # tree/commit objects above are inert until a ref names them,
+            # so this is the last possible moment to refuse making the
+            # checkpoint externally visible under authority that may have
+            # since been superseded — never rely solely on the validation
+            # performed before `build_tree()` started.
+            if not self._leases.is_current(self._lease):
+                raise cg.CheckpointGitError("stale_fencing_token")
             cg.create_ref(context.git_ref, commit_sha, cwd=context.root)
         except Exception as exc:
             # A caught exception here means the failing subprocess already

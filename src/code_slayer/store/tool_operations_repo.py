@@ -91,9 +91,19 @@ class ToolOperationsRepo:
         )
         return self.get(operation_id)
 
-    def record_child_pid(self, operation_id: str, pid: int, pid_started_at: str) -> ToolOperation:
+    def record_child_pid(
+        self, operation_id: str, pid: int, pid_started_at: str | None,
+    ) -> ToolOperation:
         """Record the OS pid of a subprocess this operation spawned, so a
-        future `QUIESCING` reconciliation (§12) can find and check it."""
+        `QUIESCING` reconciliation can find and check it. `pid_started_at`
+        should be the child's real `/proc`-derived start time (see
+        `lease.liveness.process_start_time`), not a wall-clock timestamp
+        taken by the parent — only a start time read back from `/proc`
+        itself can later be cross-checked against pid reuse. It is `None`
+        when that could not be determined (no `/proc` on this platform,
+        or the child had already exited by the time we looked); liveness
+        checks then fail closed (`Liveness.UNKNOWN`) rather than trust an
+        unverifiable pid."""
         with transaction(self._conn):
             self._conn.execute(
                 "UPDATE tool_operations SET child_pid = ?, child_pid_started_at = ? "
