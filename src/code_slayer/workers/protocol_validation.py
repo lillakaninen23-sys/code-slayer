@@ -13,9 +13,10 @@ duplicates that decision (`docs/CODE_SLAYER_VISION.md` §40).
 
 - **`MALFORMED`** — the response is not, structurally, a valid instance
   of what it claims to be: `TOOL_CALL` without a real `WorkerToolCall`,
-  an empty/non-string tool name, non-mapping params, or the adapter
-  reporting `MALFORMED` itself. This is a *protocol* failure — the
-  response cannot be trusted to mean anything in particular.
+  an empty/non-string tool name, non-mapping params, the adapter
+  reporting `MALFORMED` itself, or `TEXT` content that contains reserved
+  tool-call transport syntax (see below). This is a *protocol* failure —
+  the response cannot be trusted to mean anything in particular.
 - **`UNAUTHORIZED_CAPABILITY`** — the response *is* a well-formed,
   structurally valid tool call, naming a real (if unknown-to-this-turn)
   tool, but not one this turn's `WorkerRequest.allowed_tools` offered.
@@ -30,13 +31,27 @@ Both outcomes are equally non-executable right now (`ValidationResult.
 executable` is `False` for either) — the distinction is for evidence and
 future trust-scoping, never for deciding *this* call gets to run.
 
-## No fallback parser
+## No fallback parser — but reserved transport syntax is still rejected
 
-`TEXT` and `MALFORMED` responses are never inspected for content that
-*looks like* a tool call and never "recovered" into one. A response
-either arrived through the adapter's own structured channel as a real
-`WorkerToolCall`, or it did not — there is no third path here that
-extracts one from a string after the fact.
+A `TEXT` response is never inspected for content that merely *resembles*
+a tool call in some loose, heuristic sense, and never "recovered" into
+one — a response either arrived through the adapter's own structured
+channel as a real `WorkerToolCall`, or it did not.
+
+One narrow, deliberate exception: a small, fixed set of *reserved tool-
+call transport markers* (`<function=`, `<tool_call>`, `</tool_call>`,
+`</function>`) appearing anywhere in `TEXT` content is itself evidence
+that the adapter's structured tool-calling channel did not fire and the
+underlying model/provider leaked raw protocol syntax into ordinary text
+instead — exactly the 2026-09-14 failure shape (`docs/CODE_SLAYER_VISION.
+md` §58). This is **presence detection, not parsing**: the check only
+asks "does this exact reserved substring occur," never extracts a tool
+name, parameters, or anything else from the text, and the result is
+always `MALFORMED` — never an attempt to salvage the intended call. It
+is deliberately narrow to these specific literal markers, not a general
+scan for `<...>`/XML/HTML/markdown, so ordinary text that happens to
+contain angle brackets, or that merely *discusses* tools in prose,
+remains `VALID_TEXT`.
 """
 
 from __future__ import annotations
@@ -51,6 +66,27 @@ from code_slayer.workers.protocol import (
     WorkerResponseKind,
     WorkerToolCall,
 )
+
+# Reserved tool-call transport markers: exact, literal substrings that
+# only ever appear when a model/provider's raw completion leaked the
+# structured tool-calling protocol's own syntax into plain text, instead
+# of the adapter receiving it through the provider's real structured
+# channel. Deliberately a small, fixed, literal set — never a pattern
+# that could also match ordinary prose, HTML, XML, markdown, or code.
+_RESERVED_TOOL_PROTOCOL_MARKERS = (
+    "<function=",
+    "<tool_call>",
+    "</tool_call>",
+    "</function>",
+)
+
+
+def _contains_reserved_tool_protocol_syntax(text: str) -> bool:
+    """`True` iff `text` contains one of the reserved transport markers
+    verbatim. Presence alone is the signal — this never extracts or
+    interprets anything from `text`, and callers must never do so either
+    (see the module docstring's "No fallback parser" section)."""
+    return any(marker in text for marker in _RESERVED_TOOL_PROTOCOL_MARKERS)
 
 
 class ValidationOutcome(StrEnum):
@@ -100,6 +136,8 @@ def validate_response(request: WorkerRequest, response: WorkerResponse) -> Valid
     if response.kind == WorkerResponseKind.TEXT:
         if not isinstance(response.text, str):
             return _reject(ValidationOutcome.MALFORMED, "text_response_missing_text")
+        if _contains_reserved_tool_protocol_syntax(response.text):
+            return _reject(ValidationOutcome.MALFORMED, "textual_tool_protocol_leakage")
         return ValidationResult(ValidationOutcome.VALID_TEXT, "text_response", text=response.text)
 
     if response.kind == WorkerResponseKind.TOOL_CALL:

@@ -91,10 +91,14 @@ def test_structured_params_preserved_exactly():
 # --- raw text resembling a tool call is never promoted --------------------
 
 def test_raw_function_tag_text_is_not_a_tool_call():
+    """Reserved tool-call transport syntax leaking into the TEXT channel
+    is itself a protocol failure -- MALFORMED, never VALID_TEXT -- and
+    is, either way, never promoted into an executable tool call."""
     raw = "<function=skill>\n<parameter=name>\ngit\n</parameter>\n</function>"
     response = WorkerResponse(kind=WorkerResponseKind.TEXT, text=raw)
     result = validate_response(_request(), response)
-    assert result.outcome == ValidationOutcome.VALID_TEXT
+    assert result.outcome == ValidationOutcome.MALFORMED
+    assert result.reason == "textual_tool_protocol_leakage"
     assert result.tool_call is None
     assert not result.executable
     spy = _SpyExecutor()
@@ -106,11 +110,46 @@ def test_raw_tool_call_tag_text_is_not_a_tool_call():
     raw = "<tool_call>{\"name\": \"run_command\", \"arguments\": {}}</tool_call>"
     response = WorkerResponse(kind=WorkerResponseKind.TEXT, text=raw)
     result = validate_response(_request(), response)
-    assert result.outcome == ValidationOutcome.VALID_TEXT
+    assert result.outcome == ValidationOutcome.MALFORMED
+    assert result.reason == "textual_tool_protocol_leakage"
     assert not result.executable
     spy = _SpyExecutor()
     _maybe_execute(spy, result)
     assert spy.calls == []
+
+
+def test_function_marker_alone_without_closing_tag_still_rejected():
+    """Detection is presence-based, not a match-the-whole-pattern parse
+    — a partial/truncated leak is just as disqualifying."""
+    response = WorkerResponse(kind=WorkerResponseKind.TEXT, text="<function=skill>\ngit")
+    result = validate_response(_request(), response)
+    assert result.outcome == ValidationOutcome.MALFORMED
+    assert result.reason == "textual_tool_protocol_leakage"
+
+
+def test_ordinary_html_xml_like_markup_remains_valid_text():
+    """Detection is narrow to the specific reserved markers -- ordinary
+    angle-bracket content (HTML, XML, markdown, code) is not disqualified
+    merely for containing `<...>`."""
+    raw = "Use <div class=\"card\">...</div> for the layout, or <b>bold</b> text."
+    response = WorkerResponse(kind=WorkerResponseKind.TEXT, text=raw)
+    result = validate_response(_request(), response)
+    assert result.outcome == ValidationOutcome.VALID_TEXT
+    assert result.text == raw
+    assert not result.executable
+
+
+def test_ordinary_discussion_of_tools_remains_valid_text():
+    """Talking *about* tools/functions in prose, without the reserved
+    transport syntax, is unaffected."""
+    raw = (
+        "I'll call the read_file function next to check the contents, "
+        "then decide whether a tool_call is even necessary."
+    )
+    response = WorkerResponse(kind=WorkerResponseKind.TEXT, text=raw)
+    result = validate_response(_request(), response)
+    assert result.outcome == ValidationOutcome.VALID_TEXT
+    assert result.text == raw
 
 
 # --- structurally malformed tool calls -------------------------------------
@@ -256,30 +295,37 @@ def test_2026_09_14_malformed_tool_call_incident_regression():
     """Reproduces the failure CLASS observed 2026-09-14 (documented in
     `docs/CODE_SLAYER_VISION.md` §58): a worker expected to issue a
     structured tool call instead produced raw, unparsed protocol-leakage
-    text (`<function=...>...</tool_call>`-shaped). A real adapter
-    integration is expected to report this as `WorkerResponseKind.
-    MALFORMED` — its own structured tool-calling channel did not fire,
-    which is a fact about the response's protocol-level shape, not a
-    judgment reached by pattern-matching the leaked text's content.
+    text (`<function=...>...</tool_call>`-shaped).
 
-    Required, and asserted here: rejected/classified MALFORMED, zero
-    executor invocation, no filesystem mutation, no fallback parser."""
+    Deliberately models the *naive/buggy* integration shape, not a
+    pre-labeled fake: the adapter never recognized anything was wrong and
+    simply passed the leaked text through as an ordinary
+    `WorkerResponseKind.TEXT` response (exactly what a naive integration
+    that just forwards the completion's text content would do; it did
+    not pre-classify it as `MALFORMED` itself). The assertion that
+    matters is that `validate_response()` — the real validator, not the
+    fake adapter — is what catches this and reclassifies it as
+    `MALFORMED`, by detecting the reserved tool-call transport markers
+    still present in the text, never by trying to parse or recover the
+    tool call those markers were meant to represent.
+
+    Required, and asserted here: rejected/classified MALFORMED by the
+    validator itself, zero executor invocation, zero filesystem
+    mutation, no fallback parser."""
     incident_text = (
         "<function=skill>\n<parameter=name>\ngit\n</parameter>\n</function>\n</tool_call>"
     )
-    response = WorkerResponse(
-        kind=WorkerResponseKind.MALFORMED,
-        raw=incident_text,
-        error="model_did_not_use_structured_tool_calling_channel",
-    )
+    response = WorkerResponse(kind=WorkerResponseKind.TEXT, text=incident_text)
     adapter = FakeWorkerAdapter([response])
     request = _request(allowed_tools=("read_file", "run_command"))
 
     received = adapter.infer(request)
+    assert received.kind == WorkerResponseKind.TEXT  # the adapter did NOT pre-flag it
+
     result = validate_response(request, received)
 
     assert result.outcome == ValidationOutcome.MALFORMED
-    assert result.reason == "model_did_not_use_structured_tool_calling_channel"
+    assert result.reason == "textual_tool_protocol_leakage"
     assert not result.executable
     assert result.tool_call is None
 
