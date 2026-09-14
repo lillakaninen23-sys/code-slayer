@@ -36,6 +36,7 @@ from pathlib import Path
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.core import TaskState, TaskStateMachine, TransitionRequest
+from code_slayer.lease.manager import LeaseHandle, LeaseManager
 from code_slayer.policy.engine import (
     CheckpointPolicyInput,
     Decision,
@@ -102,7 +103,16 @@ def _seq_from_ref(ref: str) -> int:
 class CheckpointManager:
     def __init__(
         self, conn: sqlite3.Connection, *, blobs_dir: Path | str, tmp_dir: Path | str,
+        lease: LeaseHandle | None = None,
     ) -> None:
+        # `lease` is optional here: `reconcile()` never consults it (Git-
+        # ref evidence and the state machine's own expected-state check
+        # already make a stale finalize safe — see `create()`'s docstring)
+        # so a purely-recovery caller (generic recovery, §13) need not
+        # hold one. `create()` requires a real `LeaseHandle` and denies
+        # closed if none was given.
+        if lease is not None and not isinstance(lease, LeaseHandle):
+            raise CheckpointError("malformed_lease_handle")
         self._conn = conn
         self._blobs_dir = Path(blobs_dir).resolve()
         self._tmp_dir = Path(tmp_dir).resolve()
@@ -112,14 +122,38 @@ class CheckpointManager:
         self._checkpoints = CheckpointRepo(conn)
         self._machine = TaskStateMachine(conn)
         self._audit = AuditWriter(conn)
+        self._lease = lease
+        self._leases = LeaseManager(conn)
 
     # -- public API ---------------------------------------------------
 
     def create(self, task_id: str) -> CheckpointResult:
-        """Create a checkpoint, first resolving any unfinished prior attempt."""
+        """Create a checkpoint, first resolving any unfinished prior attempt.
+
+        Starting a *new* checkpoint attempt requires a currently-valid
+        lease. Recovering/finalizing a prior attempt does not: once a
+        commit exists, checkpoint truth is Git-ref evidence, not lease
+        state (`docs/LEASES_AND_RECOVERY.md`) — and the state machine's
+        own expected-state check already refuses a stale finalize that
+        would conflict with whatever a newer session has since done.
+
+        This method's *automatic* reconciliation attempt is itself gated
+        on the caller holding a currently-valid lease: reconciliation
+        assumes the pending operation's own originating session is truly
+        gone, which is not something an arbitrary or stale caller should
+        get to assert as a side effect of merely calling `create()`. An
+        owner/operator who explicitly wants to attempt reconciliation
+        regardless — e.g. from generic recovery — has `reconcile()` for
+        exactly that (`docs/LEASES_AND_RECOVERY.md`'s known limitations).
+        """
         task = self._tasks.get(task_id)
+        lease_ok = (
+            self._lease is not None
+            and task.worktree_id == self._lease.worktree_id
+            and self._leases.is_current(self._lease)
+        )
         pending = self._find_pending_operation(task_id)
-        if pending is not None:
+        if pending is not None and lease_ok:
             resolved = self._safe_reconcile(task, pending)
             if resolved is not None:
                 # A prior attempt is now confirmed COMPLETE; do not also
@@ -137,6 +171,11 @@ class CheckpointManager:
             decision = PolicyResult(Decision.DENY, reason)
             facts = None
             context = None
+        if not lease_ok:
+            # Fencing supersedes whatever the checkpoint-specific facts/
+            # policy concluded, matching ToolExecutor's ordering (task
+            # state -> lease validity -> policy).
+            decision = PolicyResult(Decision.DENY, "stale_fencing_token")
 
         summary = {
             "operation_id": operation_id, "tool": TOOL_NAME,
@@ -147,6 +186,11 @@ class CheckpointManager:
             self._event(task_id, EventType.POLICY_EVALUATED, {
                 **summary, "decision": decision.decision, "reason": decision.reason,
             })
+            if not lease_ok:
+                self._event(task_id, EventType.FENCE_STALE_REJECTED, {
+                    **summary, "worktree_id": task.worktree_id,
+                    "claimed_generation": self._lease.generation if self._lease else None,
+                })
             if facts is not None and not facts.baseline_valid:
                 self._event(task_id, EventType.EXTERNAL_MODIFICATION_DETECTED, {
                     **summary, "kind": "baseline_drift",
@@ -162,7 +206,8 @@ class CheckpointManager:
                 return CheckpointResult(decision.decision, decision.reason)
             self._operations.start_in_transaction(
                 task_id=task_id, worktree_id=task.worktree_id,
-                worker_id="checkpoint-manager", worker_session_id=str(uuid.uuid4()),
+                worker_id=self._lease.worker_id, worker_session_id=self._lease.worker_session_id,
+                lease_generation=self._lease.generation,
                 tool_name=TOOL_NAME, risk_class=CAPABILITIES[TOOL_NAME].risk.value,
                 request_hash=context.request_hash, target_resource=context.git_ref,
                 before_evidence=context.parent_commit_sha or "ROOT", operation_id=operation_id,

@@ -194,3 +194,11 @@ and training remain out of scope for this phase, per
 or crash-orphaned `STARTED` operation is not implemented — Phase 4 blocks
 further mutation instead of guessing. No schema migration was needed or
 made; schema v1 already carried every column this phase populates.
+
+> **Phase 6 update:** `ToolExecutor` now requires a `lease: LeaseHandle`
+> constructor argument and checks it before policy and again immediately
+> before the actual effect, on every capability described above — see
+> [`docs/LEASES_AND_RECOVERY.md`](LEASES_AND_RECOVERY.md). Nothing about
+> the capability registry, policy model, or evidence semantics described
+> in this document changed; the lease is an additional precondition, not
+> a replacement for any of them.

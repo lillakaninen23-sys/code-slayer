@@ -9,7 +9,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
-## Status: Phase 5 — durable Git checkpoints
+## Status: Phase 6 — durable leases and fencing
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:
 
@@ -50,9 +50,17 @@ across the Git/SQLite durability boundary. See
 [`docs/CHECKPOINTS.md`](docs/CHECKPOINTS.md) for the trust boundary,
 ownership, Git/index strategy, and crash/recovery contracts.
 
-There is **no** agent loop, model integration, lease manager, scheduler,
-or daemon yet. See the ADRs and the Foundation Plan for what comes after
-Phase 1.
+Phase 6 adds durable worktree leases and fencing: one current ownership
+epoch per worktree, a monotonic fencing token every Phase 4/5 mutation
+path now checks (both before policy and immediately before its actual
+effect), and a generic recovery framework that discovers unresolved
+operations and dispatches only to the reconcilers that already exist,
+never guessing an outcome from a stale epoch or a vanished process. See
+[`docs/LEASES_AND_RECOVERY.md`](docs/LEASES_AND_RECOVERY.md) for the
+lease/fencing model, expiry-vs-fencing distinction, and known limitations.
+
+There is **no** agent loop, model integration, scheduler, or daemon yet.
+See the ADRs and the Foundation Plan for what comes after Phase 1.
 
 ## Development
 
@@ -84,5 +92,6 @@ src/code_slayer/
 │              #   service, checkpoint Git plumbing and manager
 ├── tools/     # closed capability registry, file/command primitives, controlled executor
 ├── policy/    # pure ALLOW/DENY/REQUIRE_APPROVAL decisions over explicit facts
+├── lease/     # durable worktree lease/fencing manager, generic recovery
 └── cli/       # minimal CLI wiring (`codeslayer inspect`)
 ```

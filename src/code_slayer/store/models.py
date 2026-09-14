@@ -76,3 +76,18 @@ class Checkpoint:
     verified_json: str
     changed_files_json: str
     next_action: str | None
+
+
+@dataclass(frozen=True)
+class WorkerLease:
+    worktree_id: str
+    task_id: str
+    worker_id: str
+    worker_session_id: str
+    generation: int
+    acquired_at: str
+    heartbeat_at: str
+    status: str
+    worker_pid: int | None
+    worker_pid_started_at: str | None
+    checkpoint_id: str | None

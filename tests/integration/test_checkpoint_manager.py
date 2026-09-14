@@ -26,11 +26,12 @@ from code_slayer.repo.baseline import InspectionService
 from code_slayer.repo.checkpoint import CheckpointManager
 from code_slayer.store.checkpoint_repo import CheckpointRepo, parse_verified
 from code_slayer.store.db import connect, transaction
+from code_slayer.store.lease_repo import LeaseRepo
 from code_slayer.store.task_repo import TaskRepo
 from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
 from code_slayer.tools.executor import ToolExecutor
 from code_slayer.tools.models import ToolRequest
-from tests.repo_helpers import commit, filesystem_snapshot, git
+from tests.repo_helpers import acquire_lease, commit, filesystem_snapshot, git
 
 
 def working_tree_snapshot(root):
@@ -66,8 +67,9 @@ def context(db_conn, git_repo_with_commit, tmp_path):
               (TaskState.BASELINED, TaskState.PLANNING),
               (TaskState.PLANNING, TaskState.PLANNED),
               (TaskState.PLANNED, TaskState.IMPLEMENTING))
-    executor = ToolExecutor(db_conn, blobs_dir=blobs_dir)
-    manager = CheckpointManager(db_conn, blobs_dir=blobs_dir, tmp_dir=tmp_dir)
+    lease = acquire_lease(db_conn, task)
+    executor = ToolExecutor(db_conn, blobs_dir=blobs_dir, lease=lease)
+    manager = CheckpointManager(db_conn, blobs_dir=blobs_dir, tmp_dir=tmp_dir, lease=lease)
     return root, task.task_id, executor, manager, blobs_dir, tmp_dir
 
 
@@ -331,13 +333,21 @@ def test_no_owned_paths_still_checkpoints_baseline_alone(context, db_conn):
 
 # --- crash consistency: real subprocess -----------------------------------
 
+_LEASE_PREAMBLE = """
+from code_slayer.lease.manager import LeaseHandle
+# The same session, resumed in a fresh process, reusing its already-
+# acquired lease (acquired_at is not part of the fencing comparison).
+lease = LeaseHandle(sys.argv[6], sys.argv[5], sys.argv[7], sys.argv[8], int(sys.argv[9]), "")
+"""
+
 _CRASH_AFTER_STARTED = """
 import os, sys
 sys.path.insert(0, sys.argv[1])
 from code_slayer.store.db import connect
 from code_slayer.repo.checkpoint import CheckpointManager
 conn = connect(sys.argv[2])
-manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4])
+""" + _LEASE_PREAMBLE + """
+manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4], lease=lease)
 import code_slayer.repo.checkpoint_git as cg
 real_build_tree = cg.build_tree
 def crash(*a, **kw):
@@ -353,7 +363,8 @@ sys.path.insert(0, sys.argv[1])
 from code_slayer.store.db import connect
 from code_slayer.repo.checkpoint import CheckpointManager
 conn = connect(sys.argv[2])
-manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4])
+""" + _LEASE_PREAMBLE + """
+manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4], lease=lease)
 import code_slayer.repo.checkpoint_git as cg
 real_commit_tree = cg.commit_tree
 def crash(*a, **kw):
@@ -369,7 +380,8 @@ sys.path.insert(0, sys.argv[1])
 from code_slayer.store.db import connect
 from code_slayer.repo.checkpoint import CheckpointManager
 conn = connect(sys.argv[2])
-manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4])
+""" + _LEASE_PREAMBLE + """
+manager = CheckpointManager(conn, blobs_dir=sys.argv[3], tmp_dir=sys.argv[4], lease=lease)
 real_finalize = CheckpointManager._finalize
 def crash(self, *a, **kw):
     os._exit(74)
@@ -379,12 +391,28 @@ os._exit(1)
 """
 
 
+def _current_lease_handle(conn, task_id):
+    from code_slayer.lease.manager import LeaseHandle
+
+    task = TaskRepo(conn).get(task_id)
+    lease = LeaseRepo(conn).get(task.worktree_id)
+    return LeaseHandle(
+        lease.worktree_id, lease.task_id, lease.worker_id, lease.worker_session_id,
+        lease.generation, lease.acquired_at,
+    )
+
+
 def _run_crash(script, context, db_conn):
     root, task_id, _executor, _manager, blobs_dir, tmp_dir = context
     db_path = db_conn.execute("PRAGMA database_list").fetchone()["file"]
     src = str(Path(__file__).resolve().parents[2] / "src")
+    task = TaskRepo(db_conn).get(task_id)
+    lease = LeaseRepo(db_conn).get(task.worktree_id)
     result = subprocess.run(
-        [sys.executable, "-c", script, src, db_path, str(blobs_dir), str(tmp_dir), task_id],
+        [
+            sys.executable, "-c", script, src, db_path, str(blobs_dir), str(tmp_dir), task_id,
+            lease.worktree_id, lease.worker_id, lease.worker_session_id, str(lease.generation),
+        ],
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 74, result.stderr
@@ -408,7 +436,10 @@ def test_crash_after_started_before_any_git_work_reconciles_as_failed(context, d
         ref = f"refs/codeslayer/checkpoints/{task_id}/0"
         assert cg.resolve_ref(ref, cwd=root) is None  # no git side effect happened
 
-        manager2 = CheckpointManager(reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir)
+        manager2 = CheckpointManager(
+            reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir,
+            lease=_current_lease_handle(reopened, task_id),
+        )
         reconciled = manager2.reconcile(task_id)
         assert reconciled is None  # nothing to finalize: it failed, not succeeded
         op_after = reopened.execute(
@@ -442,7 +473,10 @@ def test_crash_during_git_work_reconciles_as_failed_no_dangling_ref(context, db_
     try:
         ref = f"refs/codeslayer/checkpoints/{task_id}/0"
         assert cg.resolve_ref(ref, cwd=root) is None
-        manager2 = CheckpointManager(reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir)
+        manager2 = CheckpointManager(
+            reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir,
+            lease=_current_lease_handle(reopened, task_id),
+        )
         assert manager2.reconcile(task_id) is None
         op = reopened.execute(
             "SELECT status FROM tool_operations WHERE task_id = ? AND tool_name = ?",
@@ -485,7 +519,10 @@ def test_crash_after_ref_created_before_finalize_reconciles_as_succeeded(
         # create() itself, called fresh — not a separate reconcile() call —
         # must pick this up automatically rather than attempting (or
         # duplicating) a new checkpoint.
-        manager2 = CheckpointManager(reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir)
+        manager2 = CheckpointManager(
+            reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir,
+            lease=_current_lease_handle(reopened, task_id),
+        )
         reconciled = manager2.create(task_id)
 
         assert reconciled.operation_status == OperationStatus.SUCCEEDED
@@ -504,7 +541,10 @@ def test_crash_after_ref_created_before_finalize_reconciles_as_succeeded(
         # A second checkpoint attempt on the now-CHECKPOINTED task creates
         # nothing new — there is no more pending operation to reconcile,
         # and READY_FOR_CHECKPOINT is no longer the task's state.
-        again = CheckpointManager(reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir)
+        again = CheckpointManager(
+            reopened, blobs_dir=blobs_dir, tmp_dir=tmp_dir,
+            lease=_current_lease_handle(reopened, task_id),
+        )
         result = again.create(task_id)
         assert result.decision == Decision.DENY
         assert result.reason == "wrong_task_state"

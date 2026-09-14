@@ -12,6 +12,7 @@ from pathlib import Path
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.core.states import TaskState
+from code_slayer.lease.manager import LeaseHandle, LeaseManager
 from code_slayer.policy.engine import Decision, PolicyEngine, PolicyInput, PolicyResult
 from code_slayer.repo.baseline import InspectionService
 from code_slayer.store.baseline_repo import BaselineError, BaselineRepo
@@ -26,21 +27,31 @@ from code_slayer.tools.registry import CAPABILITIES
 
 
 class ToolExecutor:
-    def __init__(self, conn: sqlite3.Connection, *, blobs_dir: Path | str) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, *, blobs_dir: Path | str, lease: LeaseHandle,
+    ) -> None:
+        if not isinstance(lease, LeaseHandle):
+            raise ToolError("malformed_lease_handle")
         self._conn = conn
         self._blobs_dir = Path(blobs_dir).resolve()
         self._tasks = TaskRepo(conn)
         self._operations = ToolOperationsRepo(conn)
         self._audit = AuditWriter(conn)
         self._policy = PolicyEngine()
-        # Labels fill the existing journal actor/session fields. No worker
-        # runtime, worker registration, lease or generation is fabricated.
-        self._session = str(uuid.uuid4())
+        self._lease = lease
+        self._leases = LeaseManager(conn)
 
     def execute(self, task_id: str, request: ToolRequest) -> ToolResult:
         operation_id = str(uuid.uuid4())
         with transaction(self._conn):
             task = self._tasks.get(task_id)
+            # Ownership/lease validity is checked before policy (task state
+            # -> lease validity -> policy -> journaling -> effect ->
+            # evidence -> finalization): a stale caller is refused
+            # regardless of what policy would otherwise have allowed.
+            lease_ok = (
+                task.worktree_id == self._lease.worktree_id and self._leases.is_current(self._lease)
+            )
             try:
                 params = self._validate_request(request)
                 facts, manifest, owned_hash = self._facts(task, request)
@@ -58,6 +69,11 @@ class ToolExecutor:
                 decision = PolicyResult(Decision.DENY, reason)
                 facts = None
                 request_hash = None
+            if not lease_ok:
+                # Fencing supersedes whatever policy/validation concluded —
+                # a valid lease is not permission, but an invalid one is an
+                # unconditional refusal.
+                decision = PolicyResult(Decision.DENY, "stale_fencing_token")
             tool = request.tool if isinstance(request, ToolRequest) else "unknown"
             tool = tool if isinstance(tool, str) and tool in CAPABILITIES else "unknown"
             summary = {"operation_id": operation_id, "tool": tool, "request_hash": request_hash}
@@ -66,6 +82,11 @@ class ToolExecutor:
                 **summary, "decision": decision.decision, "reason": decision.reason,
                 "risk": facts.risk if facts else None,
             })
+            if not lease_ok:
+                self._event(task_id, EventType.FENCE_STALE_REJECTED, {
+                    **summary, "worktree_id": task.worktree_id,
+                    "claimed_generation": self._lease.generation,
+                })
             if decision.decision != Decision.ALLOW:
                 requires_approval = decision.decision == Decision.REQUIRE_APPROVAL
                 denial_event = (
@@ -80,7 +101,8 @@ class ToolExecutor:
             before = "ABSENT" if request.tool == "create_file" else owned_hash
             self._operations.start_in_transaction(
                 task_id=task_id, worktree_id=task.worktree_id,
-                worker_id="controlled-tools", worker_session_id=self._session,
+                worker_id=self._lease.worker_id, worker_session_id=self._lease.worker_session_id,
+                lease_generation=self._lease.generation,
                 tool_name=request.tool, risk_class=facts.risk.value,
                 request_hash=request_hash, target_resource=facts.resource,
                 before_evidence=before, operation_id=operation_id,
@@ -121,6 +143,11 @@ class ToolExecutor:
                     "output_limit" if output.truncated else "command_completed"
                 )
                 with transaction(self._conn):
+                    # Revalidate authority immediately before durable
+                    # finalization: a takeover during the command's run
+                    # must not let a now-stale caller record its result.
+                    if not self._leases.is_current(self._lease):
+                        raise ToolError("stale_fencing_token")
                     return self._finish(
                         task_id, operation_id, status, reason, output.stdout, output.stderr,
                         returncode=output.returncode, truncated=output.truncated,
@@ -128,6 +155,14 @@ class ToolExecutor:
             # A short SQLite writer transaction serializes the final policy
             # recheck, file effect and result against other managed writers.
             with transaction(self._conn):
+                # Lease validity is rechecked before the facts/policy
+                # recheck, mirroring the initial ordering (lease -> policy):
+                # task workflow state does not change merely because a
+                # lease was taken over, so this is precisely the check
+                # nothing in `_facts()` would otherwise catch a takeover
+                # against during a long-running IMPLEMENTING operation.
+                if not self._leases.is_current(self._lease):
+                    raise ToolError("stale_fencing_token")
                 current = self._tasks.get(task_id)
                 checked, _, latest_hash = self._facts(current, request, exclude=operation_id)
                 if self._decision(checked).decision != Decision.ALLOW or latest_hash != owned_hash:

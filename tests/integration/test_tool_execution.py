@@ -25,11 +25,12 @@ from code_slayer.repo import identity
 from code_slayer.repo.baseline import InspectionService
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import connect, transaction
+from code_slayer.store.lease_repo import LeaseRepo
 from code_slayer.store.task_repo import TaskRepo
 from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
 from code_slayer.tools.executor import ToolExecutor
 from code_slayer.tools.models import CommandRequest, PatchHunk, ToolRequest
-from tests.repo_helpers import commit, git
+from tests.repo_helpers import acquire_lease, commit, git
 
 
 @pytest.fixture
@@ -54,7 +55,8 @@ def context(db_conn, git_repo_with_commit, tmp_path):
         machine.transition(
             task.task_id, expected_state=expected, to_state=to_state, reason="progressing",
         )
-    executor = ToolExecutor(db_conn, blobs_dir=directory)
+    lease = acquire_lease(db_conn, task)
+    executor = ToolExecutor(db_conn, blobs_dir=directory, lease=lease)
     return root, task.task_id, executor, directory
 
 
@@ -144,7 +146,7 @@ def test_create_file_outside_declared_scope_denied(db_conn, git_repo_with_commit
                         to_state=TaskState.PLANNED, reason="r")
     machine.transition(task.task_id, expected_state=TaskState.PLANNED,
                         to_state=TaskState.IMPLEMENTING, reason="r")
-    executor = ToolExecutor(db_conn, blobs_dir=directory)
+    executor = ToolExecutor(db_conn, blobs_dir=directory, lease=acquire_lease(db_conn, task))
     result = executor.execute(
         task.task_id, ToolRequest(tool="create_file", path="outside.txt", content=b"x"),
     )
@@ -410,7 +412,7 @@ def test_protected_pre_existing_dirty_path_denies_mutation(db_conn, git_repo, tm
                         to_state=TaskState.PLANNED, reason="r")
     machine.transition(task.task_id, expected_state=TaskState.PLANNED,
                         to_state=TaskState.IMPLEMENTING, reason="r")
-    executor = ToolExecutor(db_conn, blobs_dir=directory)
+    executor = ToolExecutor(db_conn, blobs_dir=directory, lease=acquire_lease(db_conn, task))
     import hashlib
 
     result = executor.execute(task.task_id, ToolRequest(
@@ -488,6 +490,7 @@ _CRASH_BEFORE_MUTATION = """
 import os, sys
 sys.path.insert(0, sys.argv[1])
 from code_slayer.store.db import connect
+from code_slayer.lease.manager import LeaseHandle
 from code_slayer.tools import command_tools
 from code_slayer.tools.executor import ToolExecutor
 from code_slayer.tools.models import ToolRequest
@@ -499,7 +502,10 @@ def crash(self, *a, **kw):
     # mutation has happened yet. Crash here to exercise that boundary.
     os._exit(74)
 command_tools.CommandRunner.verify_identity = crash
-executor = ToolExecutor(conn, blobs_dir=sys.argv[3])
+# The same session, resumed in a fresh process, reusing its already-
+# acquired lease (acquired_at is not part of the fencing comparison).
+lease = LeaseHandle(sys.argv[5], sys.argv[4], sys.argv[6], sys.argv[7], int(sys.argv[8]), "")
+executor = ToolExecutor(conn, blobs_dir=sys.argv[3], lease=lease)
 executor.execute(sys.argv[4], ToolRequest(tool="create_file", path="crash.txt", content=b"x"))
 os._exit(1)  # should never reach here
 """
@@ -512,8 +518,13 @@ def test_process_crash_after_started_before_mutation_leaves_unresolved_journal(
     before = events(db_conn, task_id)
     db_path = db_conn.execute("PRAGMA database_list").fetchone()["file"]
     src = str(Path(__file__).resolve().parents[2] / "src")
+    task = TaskRepo(db_conn).get(task_id)
+    lease = LeaseRepo(db_conn).get(task.worktree_id)  # the fixture's own current lease
     result = subprocess.run(
-        [sys.executable, "-c", _CRASH_BEFORE_MUTATION, src, db_path, str(directory), task_id],
+        [
+            sys.executable, "-c", _CRASH_BEFORE_MUTATION, src, db_path, str(directory), task_id,
+            lease.worktree_id, lease.worker_id, lease.worker_session_id, str(lease.generation),
+        ],
         capture_output=True, text=True, timeout=15,
     )
     assert result.returncode == 74, result.stderr
