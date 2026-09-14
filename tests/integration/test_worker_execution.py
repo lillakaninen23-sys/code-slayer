@@ -8,6 +8,7 @@ of `validate_response()` is the real, unmodified production stack."""
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -17,9 +18,11 @@ from code_slayer.lease.manager import LeaseManager
 from code_slayer.policy.engine import Decision
 from code_slayer.repo import identity
 from code_slayer.repo.baseline import InspectionService
+from code_slayer.store.content_store import ContentStore
 from code_slayer.store.task_repo import TaskRepo
 from code_slayer.store.worker_trust_repo import TrustLevel
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.tools.executor import ToolExecutor
 from code_slayer.workers.execution import execute_guarded_turn
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter
 from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
@@ -122,6 +125,126 @@ def test_real_tool_executor_returns_actual_file_evidence(db_conn, turn_context):
     assert ops[0]["status"] == "SUCCEEDED"
     assert ops[0]["tool_name"] == "read_file"
     assert ops[0]["worker_id"] == WORKER_ID  # the lease's own identity, real evidence
+
+
+# --- Phase 7.5b: bound to exact ToolExecutor evidence, never a second read -
+
+def test_worker_continuation_immune_to_post_read_file_mutation(db_conn, turn_context, monkeypatch):
+    """The key TOCTOU acceptance test (Phase 7.5b): `ToolExecutor` reads
+    content A; the repository file is then changed to content B *after*
+    `ToolExecutor.execute()` has already finished, before the worker's
+    continuation inference runs. The continuation must still receive
+    EXACTLY content A from durable `ToolExecutor` evidence -- never B,
+    and without this module ever reading the repository a second time."""
+    root, task_id, lease, directory = turn_context
+    _grant_guarded(db_conn)
+    original_execute = ToolExecutor.execute
+
+    def _execute_then_mutate_repo(self, task_id_, request):
+        result = original_execute(self, task_id_, request)
+        if request.tool == "read_file":
+            # Simulate an external actor changing the repository file in
+            # the window between ToolExecutor's own authorized read and
+            # whatever the worker orchestration does next.
+            (root / request.path).write_bytes(b"CONTENT B -- changed after the authorized read")
+        return result
+
+    monkeypatch.setattr(ToolExecutor, "execute", _execute_then_mutate_repo)
+    adapter = FakeWorkerAdapter([_read_call(), _text("ok")])
+    outcome = execute_guarded_turn(
+        db_conn, adapter, task_id=task_id, worker_id=WORKER_ID, role=ROLE,
+        original_prompt="Inspect README.md.", lease=lease, blobs_dir=directory,
+    )
+    assert outcome.ok
+    assert outcome.executed
+    prior = adapter.calls[1].prior_tool_result
+    assert prior is not None
+    assert prior.output_summary == README_BYTES.decode()  # exactly content A
+    assert "CONTENT B" not in prior.output_summary
+    # The repository file really was changed -- proving the correct
+    # result above did not come from (coincidentally) still-matching
+    # repository state.
+    assert (root / "README.md").read_bytes() == b"CONTENT B -- changed after the authorized read"
+
+
+def test_missing_durable_evidence_fails_closed_without_rereading_repository(
+    db_conn, turn_context, monkeypatch,
+):
+    root, task_id, lease, directory = turn_context
+    _grant_guarded(db_conn)
+    original_execute = ToolExecutor.execute
+
+    def _execute_then_delete_evidence(self, task_id_, request):
+        result = original_execute(self, task_id_, request)
+        if request.tool == "read_file" and result.output_hash:
+            blob_path = Path(directory) / result.output_hash[:2] / result.output_hash
+            blob_path.chmod(0o644)
+            blob_path.unlink()
+        return result
+
+    monkeypatch.setattr(ToolExecutor, "execute", _execute_then_delete_evidence)
+    adapter = FakeWorkerAdapter([_read_call()])
+    outcome = execute_guarded_turn(
+        db_conn, adapter, task_id=task_id, worker_id=WORKER_ID, role=ROLE,
+        original_prompt="Inspect README.md.", lease=lease, blobs_dir=directory,
+    )
+    assert not outcome.ok
+    assert outcome.reason == "evidence_verification_failed"
+    assert outcome.executed
+    assert outcome.tool_result is not None
+    assert outcome.tool_result.status == "SUCCEEDED"  # the read itself genuinely succeeded
+    # The repository file itself is untouched and still perfectly
+    # readable -- this failure is solely about the missing durable
+    # evidence, never about repository access, and no fallback read of
+    # it was attempted to try to recover.
+    assert (root / "README.md").read_bytes() == README_BYTES
+    assert len(adapter.calls) == 1  # continuation never runs after evidence failure
+
+
+def test_corrupted_durable_evidence_fails_closed(db_conn, turn_context, monkeypatch):
+    root, task_id, lease, directory = turn_context
+    _grant_guarded(db_conn)
+    original_execute = ToolExecutor.execute
+
+    def _execute_then_corrupt_evidence(self, task_id_, request):
+        result = original_execute(self, task_id_, request)
+        if request.tool == "read_file" and result.output_hash:
+            blob_path = Path(directory) / result.output_hash[:2] / result.output_hash
+            blob_path.chmod(0o644)
+            blob_path.write_bytes(b"corrupted bytes that do not match the recorded hash")
+            blob_path.chmod(0o444)
+        return result
+
+    monkeypatch.setattr(ToolExecutor, "execute", _execute_then_corrupt_evidence)
+    adapter = FakeWorkerAdapter([_read_call()])
+    outcome = execute_guarded_turn(
+        db_conn, adapter, task_id=task_id, worker_id=WORKER_ID, role=ROLE,
+        original_prompt="Inspect README.md.", lease=lease, blobs_dir=directory,
+    )
+    assert not outcome.ok
+    assert outcome.reason == "evidence_verification_failed"
+    assert len(adapter.calls) == 1
+
+
+def test_evidence_content_accepted_regardless_of_preexisting_blob_classification(
+    db_conn, turn_context,
+):
+    """`_evidence_content()` does not gate on `source_kind`: what
+    establishes trust is that `expected_hash` itself came from the one
+    real, already-authorized `ToolExecutor.execute()` call, not the
+    label on whichever blob dedup happened to land on (see
+    `test_read_file_reuses_preexisting_blob_under_a_different_
+    classification`)."""
+    from code_slayer.workers.execution import _evidence_content
+
+    _root, _task_id, _lease, directory = turn_context
+    content = b"hello\n"
+    content_hash = hashlib.sha256(content).hexdigest()
+    ContentStore(db_conn, directory).put(
+        content, media_type="application/octet-stream", source_kind="command_output",
+        exportable=False,
+    )
+    assert _evidence_content(db_conn, directory, content_hash) == content
 
 
 def test_continuation_receives_the_real_tool_result(db_conn, turn_context):

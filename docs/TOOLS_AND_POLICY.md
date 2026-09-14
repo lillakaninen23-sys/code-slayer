@@ -138,15 +138,32 @@ re-checks described above, not eliminated.
 `ContentStore.put()`'s existing immutability and deduplication semantics
 (Phase 1/3) are unchanged. `ToolExecutor._finish()` stores real command
 output (`run_command`'s stdout/stderr) as `source_kind="command_output"`,
-non-exportable, bounded by the request's `output_limit`. A `read_file`'s
-bytes are never persisted as a blob under this or any label — its content
-hash is already durably recorded as the operation's `after_evidence`, and
-storing the same bytes again under a `command_output` label would
-misclassify file content as command output. If identical bytes already
-exist in the store under a conflicting `source_kind`/`exportable`
-classification, `_finish()` fails closed (`evidence_classification_conflict`)
-rather than silently accepting the pre-existing, differently-classified
-blob as if it were fresh command output.
+non-exportable, bounded by the request's `output_limit`.
+
+> **Phase 7.5b update:** a `read_file`'s bytes ARE now persisted — as a
+> `source_kind="tool_read_output"` blob, non-exportable, under the exact
+> digest already recorded as the operation's `after_evidence`/
+> `output_hash`. This exists so a caller that already holds a
+> `SUCCEEDED` `ToolResult` (the worker orchestration layer, `workers.
+> execution`) can retrieve the identical bytes `ToolExecutor` itself
+> just read and authorized, without ever reopening the repository file a
+> second time — see [`docs/CODE_SLAYER_VISION.md`](CODE_SLAYER_VISION.md)
+> and `workers/execution.py`'s module docstring. Unlike the
+> `command_output` convention above, an empty file is still persisted
+> (an empty read is a legitimate result, not "no evidence"), and
+> dedup landing on a pre-existing blob under a *different* classification
+> (e.g. a baseline-time `rules_snapshot` of a recognized document like
+> README.md whose content is byte-identical) is not treated as a
+> conflict — content-addressing already guarantees identical bytes for
+> an identical hash, and `_finish()` never relabels or mutates that
+> existing row; the pre-existing evidence is simply also valid read
+> evidence.
+
+For `command_output`, if identical bytes already exist in the store
+under a conflicting `source_kind`/`exportable` classification,
+`_finish()` fails closed (`evidence_classification_conflict`) rather
+than silently accepting the pre-existing, differently-classified blob as
+if it were fresh command output.
 
 ## Subprocess security model
 

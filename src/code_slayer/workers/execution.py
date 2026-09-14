@@ -1,6 +1,6 @@
 """Bounded, single-turn orchestration: a real `WorkerAdapter` inference,
 through Code Slayer's actual production security/tool stack, for exactly
-one qualified, read-only capability (Phase 7.5a — `docs/ROADMAP.md
+one qualified, read-only capability (Phase 7.5a/7.5b — `docs/ROADMAP.md
 #local-worker-runtime`, `docs/CODE_SLAYER_VISION.md` §40-43, §58).
 
 ## What this module is
@@ -41,34 +41,39 @@ a second tool request in the continuation is refused, not executed.
 
 ## The read_file content problem, and how this module solves it
 
-`ToolExecutor.execute()`'s existing contract for `read_file` — by
-original design (`tools/executor.py`'s `_finish()`/`_file_effect()`) —
-returns only a `ToolResult` carrying `output_hash` (a SHA-256 digest):
-the file's actual bytes are deliberately never persisted into the
-evidence store as "command_output" evidence, and are never returned to
-the caller either — nothing before this phase ever needed them, since
-Phase 1-6 only needed to *prove a read occurred*, not consume its
-content. That contract is unmodified here (touching `ToolExecutor` was
-explicitly out of scope for this slice).
+Phase 7.5a's original approach here — re-opening the target repository
+file a second time after `ToolExecutor.execute()` had already finished,
+then hash-verifying that second read against `ToolResult.output_hash` —
+was fail-safe (a mismatch was still caught) but left an unnecessary
+TOCTOU/provenance boundary: the bytes the worker actually consumed came
+from a *different* filesystem read than the one `ToolExecutor` itself
+authorized and audited, open to a window between the two reads.
 
-So, only *after* the real `ToolExecutor` has already independently
-validated lease/fencing, policy, baseline, scope, and ownership and
-produced a genuine, durably-audited `SUCCEEDED` result, `_verified_read()`
-re-opens the file using the exact same confinement-safe primitives
-`ToolExecutor` itself uses internally (`tools.file_tools.parent_fd`/
-`inspect_leaf`/`read_bytes` — the module whose own docstring is "Only
-the executor authorizes writes", implying reads are safe to share) and
-then verifies the freshly-read bytes' digest matches `ToolResult.
-output_hash` **exactly** before ever handing anything to the model —
-fail closed (`evidence_verification_failed`) on any mismatch, missing
-file, or read error. This is not a second, independent trust decision:
-every actual authorization (lease, policy, ownership, baseline, scope)
-already came from the one real `ToolExecutor.execute()` call; this is
-solely a hash-verified fetch of the exact bytes that call already
-proved it read. No path here is renormalized in a way that could
-disagree with `ToolExecutor`'s own confinement — the same
-`tools.file_tools.relative_path()` function is reused, never a
-bespoke path-safety check.
+Phase 7.5b closes that boundary from the other side, inside
+`ToolExecutor` itself (`tools/executor.py`'s `_finish()`/`_file_effect()`):
+a `read_file` operation's exact bytes are now persisted into the same
+content-addressed `ContentStore` every other piece of durable evidence
+already lives in, classified `source_kind="tool_read_output"`, under
+the exact digest `ToolResult.output_hash` already carries. The
+`_evidence_content()` helper below retrieves that already-persisted
+blob by that hash — it never touches the repository a second time, and
+it is not a second, independent trust decision: every actual
+authorization (lease, policy, ownership, baseline, scope) already came
+from the one real `ToolExecutor.execute()` call that produced this
+evidence. `_evidence_content()` still recomputes and compares the
+retrieved bytes' own digest against the expected hash before ever
+handing anything to the model — fail closed
+(`evidence_verification_failed`) on a missing blob, a read error
+against the blob store, or a digest mismatch. It deliberately does not
+require the retrieved blob's `source_kind` to still read
+`tool_read_output`: `ContentStore.put()`'s own dedup may legitimately
+land this exact hash on a blob some other trusted evidence path already
+stored first (e.g. a baseline-time `rules_snapshot` of a recognized
+document like README.md whose content is byte-identical) — see
+`ToolExecutor._finish()`'s own comment on this. What establishes trust
+is that `expected_hash` came from the one real `ToolExecutor.execute()`
+call, never the label on whichever row dedup happened to land on. No
+filesystem fallback to the repository is ever attempted.
 
 ## Trust gate
 
@@ -115,7 +120,6 @@ in this codebase uses. No new event store, no schema change.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,11 +128,10 @@ from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.lease.manager import LeaseHandle
 from code_slayer.policy.engine import Decision
-from code_slayer.repo.baseline import InspectionService
-from code_slayer.store.baseline_repo import BaselineError
+from code_slayer.store.content_store import ContentStore
 from code_slayer.tools import file_tools as files
 from code_slayer.tools.executor import ToolExecutor
-from code_slayer.tools.models import ToolError, ToolRequest, ToolResult
+from code_slayer.tools.models import ToolRequest, ToolResult
 from code_slayer.workers.protocol import (
     ToolRequirement,
     WorkerAdapter,
@@ -184,36 +187,34 @@ def _emit(conn: sqlite3.Connection, task_id: str, worker_id: str, event_type, pa
     )
 
 
-def _verified_read(
-    conn: sqlite3.Connection, blobs_dir: Path | str, task_id: str, path: object,
-    expected_hash: str | None,
+def _evidence_content(
+    conn: sqlite3.Connection, blobs_dir: Path | str, expected_hash: str | None,
 ) -> bytes | None:
-    """Re-read exactly the bytes `ToolExecutor`'s own already-authorized,
-    already-audited `read_file` operation proved it read, using the same
-    confinement-safe primitives it uses internally, and accept them only
-    if their digest matches `expected_hash` exactly. `None` on any
-    failure -- missing/changed file, path rejected by the same
-    `files.relative_path()` `ToolExecutor` itself uses, or a hash
-    mismatch -- fail closed, never a guess."""
-    if not isinstance(path, str) or not isinstance(expected_hash, str):
+    """Fetch the exact bytes the real `ToolExecutor.execute()` call
+    already read and durably persisted for this operation -- addressed
+    solely by the `output_hash` that same call already produced. Never
+    reopens the repository file: this is a lookup against the same
+    content-addressed `ContentStore` `ToolExecutor` itself just wrote
+    the evidence into, not a second, independent trust decision.
+
+    `None` on any failure -- no such blob, an unreadable/corrupted blob
+    file, or a digest mismatch -- fail closed, never a guess, and never a
+    filesystem fallback to the repository. Deliberately does not require
+    the blob's `source_kind` to be `READ_EVIDENCE_KIND` specifically:
+    `ToolExecutor`'s own dedup may legitimately have landed this exact
+    hash on a blob some other trusted evidence path stored first (e.g. a
+    baseline-time `rules_snapshot` of a recognized document like
+    README.md whose content happens to be byte-identical) -- see
+    `tools.executor.ToolExecutor._finish()`'s comment on this. What
+    actually establishes trust here is that `expected_hash` itself came
+    from the one real, already-authorized `ToolExecutor.execute()` call
+    above, not this blob's label."""
+    if not isinstance(expected_hash, str):
         return None
+    store = ContentStore(conn, blobs_dir)
     try:
-        manifest = InspectionService(conn, blobs_dir=blobs_dir).read_manifest(task_id)
-    except BaselineError:
-        return None
-    root = Path(manifest["inspection"]["repo_root"])
-    try:
-        normalized = files.relative_path(path)
-        with files.parent_fd(root, normalized) as (parent, name):
-            info = files.inspect_leaf(parent, name)
-            if info is None:
-                return None
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-            try:
-                content = files.read_bytes(fd)
-            finally:
-                os.close(fd)
-    except (ToolError, OSError):
+        content = store.read(expected_hash)
+    except (KeyError, OSError):
         return None
     if files.digest(content) != expected_hash:
         return None
@@ -307,9 +308,7 @@ def execute_guarded_turn(
             reason=tool_result.reason,
         )
 
-    content = _verified_read(
-        conn, blobs_dir, task_id, tool_request.path, tool_result.output_hash,
-    )
+    content = _evidence_content(conn, blobs_dir, tool_result.output_hash)
     if content is None:
         return _finish(
             "evidence_verification_failed",

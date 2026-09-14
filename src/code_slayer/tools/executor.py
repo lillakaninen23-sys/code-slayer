@@ -26,6 +26,15 @@ from code_slayer.tools.command_tools import CommandRunner, validate_command
 from code_slayer.tools.models import PatchHunk, RiskClass, ToolError, ToolRequest, ToolResult
 from code_slayer.tools.registry import CAPABILITIES
 
+# The `ContentStore.put(source_kind=...)` classification for a read_file
+# operation's exact bytes (§Phase 7.5b) -- never `"command_output"`,
+# which is reserved for a real subprocess's captured stdout/stderr. A
+# caller that already holds this operation's `ToolResult.output_hash`
+# (`workers.execution._evidence_content()`, today) retrieves the
+# identical bytes this classification names, never a second read of the
+# repository file itself.
+READ_EVIDENCE_KIND = "tool_read_output"
+
 
 class ToolExecutor:
     def __init__(
@@ -168,13 +177,16 @@ class ToolExecutor:
                 checked, _, latest_hash = self._facts(current, request, exclude=operation_id)
                 if self._decision(checked).decision != Decision.ALLOW or latest_hash != owned_hash:
                     raise ToolError("preconditions_changed")
-                # `_content` is only ever real file bytes for the read_file,
+                # `content` is only ever real file bytes for the read_file,
                 # non-mutating case (empty for every mutating tool); those
-                # bytes are not command output and must not be persisted
-                # into the evidence store mislabeled as such (§15) — `after`
-                # already carries their hash, all a caller or ownership
-                # check needs.
-                _content, after = self._file_effect(
+                # bytes are not command output and must never be persisted
+                # into the evidence store mislabeled as such (§15) — they
+                # are handed to `_finish()` as `read_content` below, which
+                # persists them, correctly classified, under the exact
+                # `after` digest already computed here, so a caller can
+                # later retrieve this exact, already-authorized read
+                # without ever reopening the repository file a second time.
+                content, after = self._file_effect(
                     Path(manifest["inspection"]["repo_root"]), request, owned_hash, effect,
                 )
                 if capability.mutation:
@@ -195,6 +207,7 @@ class ToolExecutor:
                 return self._finish(
                     task_id, operation_id, "SUCCEEDED", "completed", b"", b"", after=after,
                     output_hash=after if not capability.mutation else None,
+                    read_content=content if not capability.mutation else None,
                 )
         except Exception as exc:
             # A failed observation or DB result commit after mutation is
@@ -385,7 +398,7 @@ class ToolExecutor:
                 os.close(fd)
 
     def _finish(self, task_id, operation_id, status, reason, stdout, stderr, *, after=None,
-                returncode=None, truncated=False, output_hash=None):
+                returncode=None, truncated=False, output_hash=None, read_content=None):
         store = ContentStore(self._conn, self._blobs_dir)
 
         def _store(data: bytes) -> str | None:
@@ -401,6 +414,38 @@ class ToolExecutor:
                 # classification (§15) — fail rather than mislabel evidence.
                 raise ToolError("evidence_classification_conflict")
             return blob.content_hash
+
+        if read_content is not None:
+            # The exact bytes ToolExecutor itself just read for a read_file
+            # operation (§Phase 7.5b) — persisted under its own already-
+            # computed `output_hash` digest, so a caller can retrieve this
+            # identical, already-authorized read without ever reopening
+            # the repository file a second time. Unlike `_store()` above,
+            # empty content is still persisted: an empty file is a
+            # legitimate read result a caller must still be able to fetch.
+            #
+            # Unlike `_store()`'s `command_output` classification above,
+            # dedup landing on a pre-existing blob under a *different*
+            # source_kind (e.g. `rules_snapshot`, from a baseline-time
+            # snapshot of a recognized document like README.md whose
+            # content is byte-identical) is not a conflict to fail closed
+            # on here: content-addressing already guarantees identical
+            # bytes for an identical hash, this call never relabels or
+            # mutates that existing row, and the file being read is real
+            # repository content that a baseline/rules snapshot may
+            # entirely legitimately have captured first. What must never
+            # happen is this call disagreeing with the digest
+            # `_file_effect()` itself already computed for these exact
+            # bytes.
+            blob = store.put(
+                read_content, media_type="application/octet-stream",
+                source_kind=READ_EVIDENCE_KIND, exportable=False,
+            )
+            if blob.content_hash != output_hash:
+                # Unreachable in practice -- `output_hash` is `after`,
+                # already `digest(read_content)` -- but fail closed rather
+                # than trust a broken invariant if that ever changes.
+                raise ToolError("evidence_classification_conflict")
 
         hashes = [output_hash if output_hash is not None else _store(stdout), _store(stderr)]
         metadata = {"reason": reason, "output_hash": hashes[0], "stderr_hash": hashes[1],

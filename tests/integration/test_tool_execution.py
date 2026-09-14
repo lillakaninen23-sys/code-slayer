@@ -261,12 +261,15 @@ def test_apply_patch_context_mismatch_fails_without_mutating(context, db_conn):
     assert (root / "p.txt").read_bytes() == b"hello world"
 
 
-# --- read_file: no mislabeled evidence duplication --------------------------
+# --- read_file: exact-content evidence, never mislabeled --------------------
 
-def test_read_file_returns_hash_and_does_not_persist_a_command_output_blob(context, db_conn):
+def test_read_file_persists_exact_content_as_its_own_evidence_kind(context, db_conn):
+    """Phase 7.5b: read_file's bytes ARE persisted (unlike Phase 4), but
+    only ever under their own `tool_read_output` classification — never
+    mislabeled as `command_output`, and addressable by the exact digest
+    `output_hash` already carries."""
     root, task_id, executor, directory = context
     _create(executor, task_id, "readme_target.txt", b"the quick brown fox")
-    before_blob_count = db_conn.execute("SELECT count(*) FROM content_blobs").fetchone()[0]
 
     import hashlib
     expected_hash = hashlib.sha256(b"the quick brown fox").hexdigest()
@@ -274,13 +277,75 @@ def test_read_file_returns_hash_and_does_not_persist_a_command_output_blob(conte
 
     assert result.status == OperationStatus.SUCCEEDED
     assert result.output_hash == expected_hash
-    after_blob_count = db_conn.execute("SELECT count(*) FROM content_blobs").fetchone()[0]
-    assert after_blob_count == before_blob_count, (
-        "read_file must not persist file bytes into the evidence store"
-    )
-    assert ContentStore(db_conn, directory).get_meta(expected_hash) is None
+    blob = ContentStore(db_conn, directory).get_meta(expected_hash)
+    assert blob is not None, "read_file's exact bytes must be retrievable as durable evidence"
+    assert blob.source_kind == "tool_read_output"
+    assert blob.exportable is False
+    assert ContentStore(db_conn, directory).read(expected_hash) == b"the quick brown fox"
     op = operations(db_conn, task_id)[-1]
     assert op["after_evidence"] == expected_hash
+    del root
+
+
+def test_read_file_never_persists_a_command_output_blob(context, db_conn):
+    root, task_id, executor, directory = context
+    _create(executor, task_id, "readme_target.txt", b"the quick brown fox")
+
+    import hashlib
+    expected_hash = hashlib.sha256(b"the quick brown fox").hexdigest()
+    executor.execute(task_id, ToolRequest(tool="read_file", path="readme_target.txt"))
+
+    row = db_conn.execute(
+        "SELECT source_kind FROM content_blobs WHERE content_hash = ?", (expected_hash,),
+    ).fetchone()
+    assert row["source_kind"] == "tool_read_output", (
+        "read_file's bytes must never be classified as command_output"
+    )
+    del root
+
+
+def test_read_file_of_empty_file_still_persists_retrievable_evidence(context, db_conn):
+    """Unlike `command_output`'s stdout/stderr convention (empty capture
+    stores nothing), an empty *file* is a legitimate read result a caller
+    must still be able to fetch by hash — it is not "no evidence"."""
+    root, task_id, executor, directory = context
+    _create(executor, task_id, "empty.txt", b"")
+
+    import hashlib
+    expected_hash = hashlib.sha256(b"").hexdigest()
+    result = executor.execute(task_id, ToolRequest(tool="read_file", path="empty.txt"))
+
+    assert result.status == OperationStatus.SUCCEEDED
+    assert result.output_hash == expected_hash
+    assert ContentStore(db_conn, directory).read(expected_hash) == b""
+    del root
+
+
+def test_read_file_reuses_preexisting_blob_under_a_different_classification(context, db_conn):
+    """Unlike `run_command`'s `command_output` evidence (which fails
+    closed on a classification conflict -- see
+    `test_run_command_evidence_classification_conflict_fails_without_
+    mislabeling`), read_file evidence tolerates dedup landing on a
+    pre-existing blob under a *different* label: content-addressing
+    already guarantees identical bytes for an identical hash, and this
+    call never relabels or mutates that existing row -- it must simply
+    still succeed and remain retrievable, exactly the scenario a
+    baseline-time `rules_snapshot` of a recognized document (e.g.
+    README.md) produces before any worker ever reads it."""
+    root, task_id, executor, directory = context
+    _create(executor, task_id, "conflict.txt", b"same bytes")
+    pre_existing = ContentStore(db_conn, directory).put(
+        b"same bytes", media_type="text/plain", source_kind="rules_snapshot", exportable=True,
+    )
+    result = executor.execute(task_id, ToolRequest(tool="read_file", path="conflict.txt"))
+    assert result.status == OperationStatus.SUCCEEDED
+    assert result.output_hash == pre_existing.content_hash
+    # The pre-existing blob's own classification is left completely
+    # untouched -- no relabeling, no second row.
+    still = ContentStore(db_conn, directory).get_meta(pre_existing.content_hash)
+    assert still.source_kind == "rules_snapshot"
+    assert still.exportable is True
+    assert ContentStore(db_conn, directory).read(pre_existing.content_hash) == b"same bytes"
     del root
 
 

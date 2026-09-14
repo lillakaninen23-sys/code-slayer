@@ -38,10 +38,17 @@ path from a real, structurally-validated `WorkerToolCall` to the real
 `PolicyEngine`/`ToolExecutor` — bounded to one bounded turn, one
 capability (`read_file`), and only for a worker/role/capability scope
 that has already earned `GUARDED` trust through real conformance
-evidence; see `workers.execution`'s module docstring. Still without
-job-worktree mutation, mutation-capability trust, `AUTO` trust, or
-Prompt Analyst/Question Gate; see `docs/ROADMAP.md`'s Local Worker
-Runtime stage for what remains deferred."""
+evidence; see `workers.execution`'s module docstring. Phase 7.5b binds
+that turn's continuation to the exact bytes `ToolExecutor` itself
+already read and durably persisted for that operation, retrieved by its
+own `output_hash` from the same content-addressed evidence store,
+instead of the original approach of independently reopening the
+repository file a second time afterward — closing a TOCTOU/provenance
+gap without weakening or duplicating `ToolExecutor`'s own authority; see
+`workers.execution`'s module docstring. Still without job-worktree
+mutation, mutation-capability trust, `AUTO` trust, or Prompt Analyst/
+Question Gate; see `docs/ROADMAP.md`'s Local Worker Runtime stage for
+what remains deferred."""
 
 from code_slayer.store.conformance_repo import ConformanceRunStatus
 from code_slayer.store.worker_trust_repo import TrustLevel
