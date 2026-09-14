@@ -20,15 +20,15 @@ _PROC_STAT_PATH = "/proc/stat"
 _VALID_BOOT_LINE = "btime 1700000000\n"
 
 
-def _stat_bytes(starttime_ticks: int) -> bytes:
+def _stat_bytes(starttime_ticks: int, comm: str = "prog") -> bytes:
     """A syntactically valid `/proc/<pid>/stat` line whose `starttime`
     field (the 20th field after the parenthesized `comm`) is exactly
-    `starttime_ticks`."""
+    `starttime_ticks`, with an arbitrary (possibly awkward) `comm`."""
     fields_after_comm = [
         "S", "1", str(_PID), str(_PID), "0", "-1", "4194304",
         "0", "0", "0", "0", "0", "0", "0", "0", "20", "0", "1", "0", str(starttime_ticks),
     ]
-    return f"{_PID} (prog) ".encode() + " ".join(fields_after_comm).encode()
+    return f"{_PID} ({comm}) ".encode() + " ".join(fields_after_comm).encode()
 
 
 class _FakeOpen:
@@ -223,3 +223,189 @@ def test_process_start_time_round_trips_into_check_process_liveness(monkeypatch,
     recorded = process_start_time(_PID)
     assert recorded == "1700000000:12345:100"
     assert check_process_liveness(_PID, recorded) == Liveness.ALIVE
+
+
+# --- Finding 1: identity domain validation ------------------------------
+# Syntactically parseable but semantically impossible values must never
+# become usable identities -- neither on the recorded side nor on the
+# freshly-read /proc side -- and must resolve to UNKNOWN, never GONE.
+
+def test_recorded_negative_boot_time_is_unknown(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, "-1:999:100") == Liveness.UNKNOWN
+
+
+def test_recorded_negative_start_ticks_is_unknown(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, "1700000000:-500:100") == Liveness.UNKNOWN
+
+
+def test_recorded_zero_hz_is_unknown(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, "1700000000:999:0") == Liveness.UNKNOWN
+
+
+def test_recorded_negative_hz_is_unknown(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, "1700000000:999:-1") == Liveness.UNKNOWN
+
+
+def test_fully_invalid_recorded_triple_is_unknown_never_gone():
+    """The exact example from the review finding: every field invalid at
+    once must still resolve conservatively, never to GONE."""
+    assert liveness._parse_identity("-1:-500:0") is None
+
+
+def test_invalid_recorded_identity_never_produces_gone(monkeypatch, has_proc):
+    """A malformed-but-integer-looking recorded identity must not be
+    mistaken for a genuine mismatch (which would report GONE); it must
+    be rejected outright as UNKNOWN before any comparison happens."""
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    result = check_process_liveness(_PID, "-1:-500:0")
+    assert result == Liveness.UNKNOWN
+    assert result != Liveness.GONE
+
+
+def test_invalid_current_boot_evidence_is_unknown(monkeypatch, has_proc):
+    """The pid is definitely present and its stat parses fine, but the
+    system boot time we read back is semantically impossible -- must not
+    be trusted as this pid's identity."""
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_boot_time_epoch_seconds", lambda: -1)
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, _identity(1700000000, 999, 100)) == Liveness.UNKNOWN
+    assert process_start_time(_PID) is None
+
+
+def test_invalid_current_start_ticks_is_unknown(monkeypatch, has_proc):
+    """A negative starttime in the pid's own /proc entry is impossible
+    under Linux's own invariants -- present, but not a trustworthy
+    identity."""
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(-500),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert check_process_liveness(_PID, _identity(1700000000, 999, 100)) == Liveness.UNKNOWN
+    assert process_start_time(_PID) is None
+
+
+def test_invalid_current_hz_is_unknown(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 0)
+    assert check_process_liveness(_PID, _identity(1700000000, 999, 100)) == Liveness.UNKNOWN
+    assert process_start_time(_PID) is None
+
+
+# --- Finding 2: /proc disappearing between two observations -------------
+
+def test_pid_enoent_while_proc_remains_available_is_gone(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {_STAT_PATH: FileNotFoundError()})
+    # `has_proc` fixture keeps `_has_proc()` reporting True throughout,
+    # simulating /proc staying healthy — only this one pid is absent.
+    assert check_process_liveness(_PID, None) == Liveness.GONE
+
+
+def test_pid_enoent_while_proc_itself_becomes_unavailable_is_unknown(monkeypatch):
+    """The outer `_has_proc()` check can pass and then /proc itself can
+    still be gone by the time `open()` actually runs. Simulated here by
+    making `_has_proc()` report a *transient* True (so the outer fast
+    path proceeds) but False from inside the FileNotFoundError handler's
+    re-check, exactly the race window this hardening closes."""
+    calls = {"n": 0}
+
+    def flaky_has_proc() -> bool:
+        calls["n"] += 1
+        return calls["n"] == 1  # True on the outer check, False after
+
+    monkeypatch.setattr(liveness, "_has_proc", flaky_has_proc)
+    _patch_open(monkeypatch, {_STAT_PATH: FileNotFoundError()})
+    assert check_process_liveness(_PID, None) == Liveness.UNKNOWN
+    assert calls["n"] >= 2  # the re-check inside the handler actually ran
+
+
+def test_process_lookup_error_with_proc_available_is_gone(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {_STAT_PATH: ProcessLookupError()})
+    assert check_process_liveness(_PID, None) == Liveness.GONE
+
+
+# --- Finding 3: comm parser regression (awkward comm content) -----------
+
+_AWKWARD_COMM = "weird name ) with spaces"
+
+
+def test_awkward_comm_with_embedded_paren_parses_starttime_correctly(monkeypatch, has_proc):
+    """`comm` itself containing a `)` must not confuse the parser: the
+    last `)` in the whole line is always the closing paren of the `comm`
+    field, since no field after it ever contains one."""
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(778899, comm=_AWKWARD_COMM),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    assert process_start_time(_PID) == "1700000000:778899:100"
+
+
+def test_awkward_comm_exact_identity_is_alive(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(778899, comm=_AWKWARD_COMM),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    recorded = _identity(1700000000, 778899, 100)
+    assert check_process_liveness(_PID, recorded) == Liveness.ALIVE
+
+
+def test_awkward_comm_differing_identity_is_gone(monkeypatch, has_proc):
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(778899, comm=_AWKWARD_COMM),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    recorded = _identity(1700000000, 778898, 100)  # one tick off
+    assert check_process_liveness(_PID, recorded) == Liveness.GONE
+
+
+# --- legacy (pre-exact-identity) recorded format -------------------------
+
+def test_legacy_iso_timestamp_identity_is_unknown_never_gone(monkeypatch, has_proc):
+    """A lease persisted by a previous implementation recorded a
+    formatted ISO-8601 timestamp, not this exact `boot:ticks:hz` triple.
+    It must be rejected as UNKNOWN -- never guess-converted, and never
+    treated as proof the process is gone (which would incorrectly permit
+    a takeover based on data this module cannot trust)."""
+    _patch_open(monkeypatch, {
+        _STAT_PATH: _stat_bytes(999),
+        _PROC_STAT_PATH: _VALID_BOOT_LINE,
+    })
+    monkeypatch.setattr(liveness, "_clock_ticks_per_second", lambda: 100)
+    legacy = "2026-01-01T00:00:00.000000Z"
+    result = check_process_liveness(_PID, legacy)
+    assert result == Liveness.UNKNOWN
+    assert result != Liveness.GONE

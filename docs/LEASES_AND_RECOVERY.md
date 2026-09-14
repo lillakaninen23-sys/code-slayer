@@ -169,6 +169,40 @@ that has actually exited, and a simulated pid-reuse case built from a
 currently-alive pid paired with a deliberately mismatched recorded start
 time).
 
+### Evidence must be semantically valid, not just syntactically parseable
+
+A recorded identity that merely *parses* into three integers is not
+automatically trusted: `boot_time` must be positive, `starttime_ticks`
+must be non-negative, and `clock_ticks_per_second` must be positive —
+Linux's own invariants for these fields, applied identically whether the
+triple came from a live `/proc` read or was parsed back out of a
+persisted `worker_pid_started_at`/`child_pid_started_at` column. A triple
+violating any of them (e.g. `-1:-500:0`) is rejected exactly like a
+parse failure — `UNKNOWN`, never a route to `GONE`.
+
+One consequence worth naming explicitly: a lease persisted by a previous
+implementation (which recorded either a bare pid or a formatted
+timestamp, not this exact triple) can never be accepted as a valid exact
+identity — it does not parse into three semantically valid integers.
+Such a lease's `QUIESCING` review conservatively stays `UNKNOWN` and
+never resolves to `EXPIRED` on its own; resolving it requires an
+operator's explicit, out-of-band intervention (e.g. an authenticated
+`release()`), not a schema migration or a guessed conversion of the old
+value — either of which would undermine the exact-identity guarantee
+this validation exists to provide.
+
+### `/proc` disappearing between two observations
+
+Checking that `/proc` exists and then opening `/proc/<pid>/stat` are two
+separate observations with a gap between them. A `FileNotFoundError`
+opening that file normally means the pid is gone — but if `/proc` itself
+became unavailable in that gap, the failure proves nothing about the
+specific pid, only that the evidence source itself vanished. Rather than
+a retry loop, the failure handler re-confirms `/proc` is still present
+*at that exact moment* before concluding `GONE`; if `/proc` has also
+disappeared by then, the result is `UNKNOWN` instead. An ordinary,
+definite "no such pid" while `/proc` is otherwise healthy is unaffected.
+
 ## Child subprocesses
 
 A worker process being gone does not by itself prove a subprocess it
@@ -340,6 +374,11 @@ quiescing, or expired.
   `QUIESCING` epoch whose owner (or a recorded child) is genuinely alive
   simply stays `QUIESCING` (or is reclaimed by its true owner via
   `renew()`) until liveness evidence changes.
+- **A lease recorded under a pre-exact-identity format stays
+  `QUIESCING` indefinitely.** This is the direct consequence of never
+  guess-converting old evidence (see above) — an operator must resolve
+  such a lease explicitly rather than wait for automatic quiescence
+  resolution, which will never happen for it.
 - Generic recovery dispatches to exactly one reconciler
   (`checkpoint_create`); Phase 4's file/command capabilities remain
   without one, exactly as documented in `docs/TOOLS_AND_POLICY.md`.

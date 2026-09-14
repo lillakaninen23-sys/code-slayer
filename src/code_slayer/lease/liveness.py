@@ -63,6 +63,51 @@ by any amount, is a reused pid, not the recorded process.
 
 Only Linux's `/proc` is used; anywhere else this conservatively reports
 `UNKNOWN` for every query rather than fabricate an answer.
+
+## Evidence must be semantically valid, not just syntactically parseable
+
+A recorded identity string that merely *parses* into three integers is
+not automatically a usable identity: `boot_time` must be a positive
+epoch, `starttime_ticks` must be non-negative (Linux's own `starttime`
+field is always >= 0, counted in clock ticks since boot), and
+`clock_ticks_per_second` must be positive — these are Linux's own
+invariants for these fields, not an arbitrary policy choice. A triple
+violating any of them — `-1:-500:0`, say — is rejected as if it had
+failed to parse at all, and this validation is applied identically to a
+*recorded* identity (read back from a `worker_pid_started_at`/
+`child_pid_started_at` column) and to the identity this module itself
+just derived from a live `/proc` read: neither side gets to bypass it.
+Rejected evidence is `UNKNOWN`, never a route to `GONE` — invalid data is
+not proof of anything.
+
+One direct consequence: an already-persisted lease whose recorded
+identity predates this exact-identity scheme (the previous
+implementation stored a formatted timestamp, not this raw triple, and an
+even earlier one used a PID alone) can never be treated as a valid exact
+identity, by construction — it fails to parse into three integers at all
+in the overwhelming majority of cases, and even in the vanishing case
+where it coincidentally did, it would still need to satisfy the
+invariants above. Such a lease's `QUIESCING` review conservatively stays
+`UNKNOWN` (never resolves to `EXPIRED` on its own) until an operator
+resolves it explicitly (e.g. `release()` with independent, out-of-band
+proof the old owner is gone) — this module never guess-converts old
+evidence into a new exact identity, which would destroy the exact-identity
+guarantee this hardening pass exists to provide. No schema migration is
+needed or warranted to "fix" this: it is the intended, fail-closed
+behavior for evidence this module cannot trust.
+
+## `/proc` disappearing between two observations
+
+Checking that `/proc` exists and then opening `/proc/<pid>/stat` are two
+separate observations with a gap between them. If `/proc` itself became
+unavailable in that gap, a `FileNotFoundError` opening `/proc/<pid>/stat`
+no longer means *this pid* is absent — it means the evidence source
+itself is gone, which proves nothing about the process. To close that
+gap without a retry loop, every place that treats a missing-file error as
+positive absence re-confirms `/proc` itself is still present *at that
+exact moment* before concluding `GONE`; if `/proc` has also vanished by
+then, the result is `UNKNOWN` instead. An ordinary, definite "no such
+pid" while `/proc` is otherwise healthy is unaffected and still `GONE`.
 """
 
 from __future__ import annotations
@@ -116,6 +161,17 @@ def _clock_ticks_per_second() -> int | None:
     return hz if isinstance(hz, int) and hz > 0 else None
 
 
+def _is_valid_identity(identity: tuple[int, int, int]) -> bool:
+    """Linux's own invariants for these fields — not an arbitrary policy
+    choice: a boot time is always a positive epoch, `starttime` is always
+    non-negative (clock ticks since boot), and a clock-tick rate is
+    always positive. Applied identically to a freshly-read `/proc`
+    identity and to a recorded one parsed back out of storage; neither
+    is trusted merely for parsing as three integers."""
+    boot, starttime_ticks, hz = identity
+    return boot > 0 and starttime_ticks >= 0 and hz > 0
+
+
 def _pid_existence_and_identity(
     pid: int,
 ) -> tuple[_Existence, tuple[int, int, int] | None]:
@@ -133,7 +189,16 @@ def _pid_existence_and_identity(
         with open(f"/proc/{pid}/stat", "rb") as handle:
             raw = handle.read()
     except (FileNotFoundError, ProcessLookupError):
-        # Positive evidence: no such process exists right now.
+        # This normally means the pid is gone -- but only if /proc itself
+        # is still the evidence source that told us so. Checking that
+        # /proc exists and then opening this file are two separate
+        # observations with a gap between them; re-confirm /proc is still
+        # present *right now*, at the moment of this failure, rather than
+        # trusting an earlier, now possibly stale, observation. If /proc
+        # itself has also become unavailable, this proves nothing about
+        # the specific pid.
+        if not _has_proc():
+            return _Existence.UNKNOWN, None
         return _Existence.ABSENT, None
     except OSError:
         # Permission denied, or some other unreadable condition — this
@@ -155,7 +220,13 @@ def _pid_existence_and_identity(
     hz = _clock_ticks_per_second()
     if boot is None or hz is None:
         return _Existence.PRESENT, None
-    return _Existence.PRESENT, (boot, starttime_ticks, hz)
+    identity = (boot, starttime_ticks, hz)
+    if not _is_valid_identity(identity):
+        # The pid definitely exists, but what we read back does not
+        # satisfy Linux's own invariants for these fields -- corrupt or
+        # unexpected evidence, never trusted as an identity.
+        return _Existence.PRESENT, None
+    return _Existence.PRESENT, identity
 
 
 def _format_identity(identity: tuple[int, int, int]) -> str:
@@ -164,13 +235,25 @@ def _format_identity(identity: tuple[int, int, int]) -> str:
 
 
 def _parse_identity(value: str) -> tuple[int, int, int] | None:
+    """Parse a recorded identity string back into `(boot, starttime_ticks,
+    hz)` — `None` if it does not even have the right shape (this is also
+    where a *legacy* recorded identity, from a previous implementation
+    that stored a formatted timestamp or a bare pid, is rejected: it
+    essentially never happens to split into exactly three integers, and
+    even in the vanishing case it did, `_is_valid_identity` below still
+    has to accept it) or if it fails Linux's own invariants for these
+    fields. Never guess-converts old evidence into a new exact identity —
+    that would destroy the exact-identity guarantee this parser exists to
+    provide; a lease's `QUIESCING` review stays `UNKNOWN` here rather than
+    ever resolving from data it cannot trust."""
     parts = value.split(_ID_SEP)
     if len(parts) != 3:
         return None
     try:
-        return int(parts[0]), int(parts[1]), int(parts[2])
+        identity = int(parts[0]), int(parts[1]), int(parts[2])
     except ValueError:
         return None
+    return identity if _is_valid_identity(identity) else None
 
 
 def process_start_time(pid: int) -> str | None:
