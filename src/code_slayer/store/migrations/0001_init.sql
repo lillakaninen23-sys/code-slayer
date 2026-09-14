@@ -86,7 +86,7 @@ CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
 CREATE TABLE content_blobs (
   content_hash  TEXT PRIMARY KEY,         -- sha256 of raw bytes; stored at blobs/<hh>/<hash>
   media_type    TEXT NOT NULL,
-  source_kind   TEXT NOT NULL,            -- rules_snapshot|plan|patch_proposal|command_output|tool_read_output|...
+  source_kind   TEXT NOT NULL,            -- rules_snapshot|plan|patch_proposal|command_output|...
   byte_size     INTEGER NOT NULL,
   truncated     INTEGER NOT NULL DEFAULT 0,  -- 1 if capture was cut at a configured max size
   exportable    INTEGER NOT NULL DEFAULT 0,  -- deny by default
