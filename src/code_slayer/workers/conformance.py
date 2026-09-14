@@ -256,6 +256,25 @@ _CASE_ORDER: tuple[tuple[str, CaseKind, _CaseFn], ...] = (
 REQUIRED_CASES = frozenset(name for name, _kind, _fn in _CASE_ORDER)
 CASE_KIND = {name: kind for name, kind, _fn in _CASE_ORDER}
 
+# The exact set of concrete tool capabilities `SUITE_VERSION` actually
+# offers and validates a real WorkerToolCall against — code-owned,
+# tied explicitly to this suite version, never derived from what a
+# model/adapter claims about itself. Every request this suite builds
+# (`_base_request`'s own `allowed_tools` default, used by every case
+# above — see `test_worker_conformance.py`'s direct assertion of this)
+# offers only `read_file`; nothing else is ever exercised. A future
+# suite version that tests different or additional capabilities defines
+# its own `PROMOTABLE_CAPABILITIES` alongside its own `SUITE_VERSION`
+# bump — this set is never extended in place for an existing version,
+# which would silently backdate a claim the already-run suite never
+# actually earned.
+#
+# `workers.promotion.promote_from_conformance` is the sole consumer:
+# capability-specific promotion is refused for anything outside this
+# set, and role-level (`capability=None`) promotion is refused
+# outright — see that module for why.
+PROMOTABLE_CAPABILITIES = frozenset({"read_file"})
+
 
 def run_conformance_suite(
     conn, adapter: WorkerAdapter, *, worker_id: str, role: str, now_fn=utcnow_iso,

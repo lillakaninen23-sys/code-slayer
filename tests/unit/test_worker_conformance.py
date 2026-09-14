@@ -148,7 +148,8 @@ def test_incomplete_run_cannot_pass(db_conn, registered_worker):
     run = repo.get_run("run-incomplete")
     assert run.status == ConformanceRunStatus.RUNNING
     result = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id="run-incomplete",
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="run-incomplete",
     )
     assert not result.ok
     assert result.reason == "run_not_finalized"
@@ -219,7 +220,8 @@ def test_results_from_another_run_cannot_satisfy_missing_cases(db_conn, register
     # stitch run-a's cases together with run-b's to fabricate a pass.
     for run_id in ("run-a", "run-b"):
         result = promote_from_conformance(
-            db_conn, worker_id=registered_worker, role="coder", run_id=run_id,
+            db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+            run_id=run_id,
         )
         assert not result.ok
         assert result.reason == "run_not_passed"
@@ -229,7 +231,8 @@ def test_results_from_another_run_cannot_satisfy_missing_cases(db_conn, register
 
 def test_unknown_run_cannot_promote_trust(db_conn, registered_worker):
     result = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id="no-such-run",
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="no-such-run",
     )
     assert not result.ok
     assert result.reason == "unknown_conformance_run"
@@ -243,7 +246,8 @@ def test_running_run_cannot_promote_trust(db_conn, registered_worker):
             suite_version=SUITE_VERSION, started_at="2026-01-01T00:00:00.000000Z",
         )
     result = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id="run-running",
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="run-running",
     )
     assert not result.ok
     assert result.reason == "run_not_finalized"
@@ -256,7 +260,8 @@ def test_failed_run_cannot_promote_trust(db_conn, registered_worker):
     result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
     assert result.status == ConformanceRunStatus.FAILED
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_not_passed"
@@ -268,7 +273,7 @@ def test_passed_run_for_different_worker_cannot_promote_target_worker(db_conn, r
     WorkersRepo(db_conn).register(worker_id="w2", kind="fake", network_class="local")
     result = _run_passing_suite(db_conn, registered_worker)  # run belongs to w1
     promo = promote_from_conformance(
-        db_conn, worker_id="w2", role="coder", run_id=result.run_id,
+        db_conn, worker_id="w2", role="coder", capability="read_file", run_id=result.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_belongs_to_different_worker"
@@ -277,7 +282,8 @@ def test_passed_run_for_different_worker_cannot_promote_target_worker(db_conn, r
 def test_passed_run_for_different_role_cannot_promote_target_role(db_conn, registered_worker):
     result = _run_passing_suite(db_conn, registered_worker, role="coder")
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="reviewer", run_id=result.run_id,
+        db_conn, worker_id=registered_worker, role="reviewer", capability="read_file",
+        run_id=result.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_belongs_to_different_role"
@@ -287,22 +293,27 @@ def test_passed_run_for_different_role_cannot_promote_target_role(db_conn, regis
 
 def test_exact_valid_passing_run_promotes_locked_to_guarded(db_conn, registered_worker):
     manager = WorkerTrustManager(db_conn)
-    assert manager.current_trust(registered_worker, "coder") == TrustLevel.LOCKED
+    assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.LOCKED
     result = _run_passing_suite(db_conn, registered_worker)
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
     )
     assert promo.ok
     assert promo.level == TrustLevel.GUARDED
-    assert manager.current_trust(registered_worker, "coder") == TrustLevel.GUARDED
+    assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.GUARDED
+    # The role-wide scope is untouched -- promotion is always exactly
+    # capability-scoped, never role-wide (see the dedicated role=None test).
+    assert manager.current_trust(registered_worker, "coder", None) == TrustLevel.LOCKED
 
 
 def test_evidence_ref_written_to_trust_event_equals_exact_run_id(db_conn, registered_worker):
     result = _run_passing_suite(db_conn, registered_worker)
     promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
     )
-    history = WorkerTrustManager(db_conn).history(registered_worker, "coder")
+    history = WorkerTrustManager(db_conn).history(registered_worker, "coder", "read_file")
     assert len(history) == 1
     assert history[0].evidence_ref == result.run_id
 
@@ -335,6 +346,129 @@ def test_mutation_capability_not_promoted_from_conformance(db_conn, registered_w
     assert WorkerTrustManager(db_conn).current_trust(
         registered_worker, "coder", "write_file",
     ) == TrustLevel.LOCKED
+
+
+# --- capability-scope hardening: fail closed, never fail open --------------
+
+def test_unknown_capability_cannot_be_promoted(db_conn, registered_worker):
+    """The exact review finding: an unrecognized capability name must
+    never be treated the same as a known, non-mutating one."""
+    result = _run_passing_suite(db_conn, registered_worker)
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="totally_made_up_tool",
+        run_id=result.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "unknown_capability"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", "totally_made_up_tool",
+    ) == TrustLevel.LOCKED
+
+
+def test_arbitrary_invented_capability_cannot_be_promoted(db_conn, registered_worker):
+    """A second, differently-spelled invented name -- proving this is a
+    real allowlist check, not a coincidence of one specific string."""
+    result = _run_passing_suite(db_conn, registered_worker)
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="delete_everything",
+        run_id=result.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "unknown_capability"
+
+
+def test_known_nonmutating_but_untested_capability_cannot_be_promoted(db_conn, registered_worker):
+    """run_command is a real, registered, non-mutating capability -- but
+    the fixed Phase 7.3 suite never offers or exercises it (every request
+    it builds only ever offers read_file). Being non-mutating is
+    necessary but not sufficient for promotion."""
+    from code_slayer.tools.registry import CAPABILITIES
+
+    assert "run_command" in CAPABILITIES
+    assert not CAPABILITIES["run_command"].mutation  # confirms the premise
+
+    result = _run_passing_suite(db_conn, registered_worker)
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="run_command",
+        run_id=result.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "capability_not_covered_by_suite"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", "run_command",
+    ) == TrustLevel.LOCKED
+
+
+def test_capability_a_evidence_never_promotes_capability_b(db_conn, registered_worker):
+    result = _run_passing_suite(db_conn, registered_worker)
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
+    )
+    assert promo.ok
+    manager = WorkerTrustManager(db_conn)
+    assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.GUARDED
+    # A capability this same run never covers stays LOCKED regardless.
+    assert manager.current_trust(registered_worker, "coder", "run_command") == TrustLevel.LOCKED
+
+
+def test_role_level_capability_none_is_explicitly_denied_by_conformance(db_conn, registered_worker):
+    """capability=None (role-level) is refused outright by the
+    conformance-gated path -- explicit, dedicated coverage of this
+    specific, deliberate design decision (see workers.promotion's module
+    docstring for the full rationale). Phase 7.2's own primitive still
+    accepts capability=None directly; only this higher gate refuses it."""
+    result = _run_passing_suite(db_conn, registered_worker)
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability=None,
+        run_id=result.run_id,
+    )
+    assert not promo.ok
+    assert promo.reason == "role_level_promotion_not_supported_by_conformance"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", None,
+    ) == TrustLevel.LOCKED
+
+    # The same denial holds whether capability is passed explicitly or
+    # left at its default.
+    promo_default = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+    )
+    assert not promo_default.ok
+    assert promo_default.reason == "role_level_promotion_not_supported_by_conformance"
+
+
+def test_no_case_in_the_suite_offers_anything_beyond_promotable_capabilities():
+    """Guards against PROMOTABLE_CAPABILITIES silently drifting out of
+    sync with what the suite's cases actually offer: every real call
+    each case function makes to _base_request is captured and checked,
+    not merely re-derived from the same default -- a genuine regression
+    net if a future case starts offering something new."""
+    from code_slayer.workers import conformance as conformance_module
+
+    offered_per_case: dict[str, frozenset] = {}
+    original = conformance_module._base_request
+
+    def spy(role, *, allowed_tools=("read_file",), prior_tool_result=None):
+        offered_per_case[current_case[0]] = frozenset(allowed_tools or ())
+        return original(role, allowed_tools=allowed_tools, prior_tool_result=prior_tool_result)
+
+    current_case = [None]
+    conformance_module._base_request = spy
+    try:
+        for case_name, _kind, run_case in conformance_module._CASE_ORDER:
+            current_case[0] = case_name
+            adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="ok")])
+            run_case(adapter, "coder")  # outcome irrelevant; only the offered set matters
+    finally:
+        conformance_module._base_request = original
+
+    assert len(offered_per_case) == len(conformance_module._CASE_ORDER)
+    for case_name, offered in offered_per_case.items():
+        assert offered.issubset(conformance_module.PROMOTABLE_CAPABILITIES), (
+            f"case {case_name!r} offers {offered}, "
+            f"not a subset of PROMOTABLE_CAPABILITIES {conformance_module.PROMOTABLE_CAPABILITIES}"
+        )
 
 
 def test_read_only_compliance_case_fails_if_mutation_became_executable(db_conn, registered_worker):
@@ -469,7 +603,8 @@ def test_crash_incomplete_run_remains_non_passing(db_conn, registered_worker):
     assert run.status == ConformanceRunStatus.RUNNING
     assert run.status != ConformanceRunStatus.PASSED
     result = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id="run-crash",
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="run-crash",
     )
     assert not result.ok
 
@@ -565,26 +700,29 @@ def test_downgrade_makes_the_already_used_run_stale(db_conn, registered_worker):
     assert run_a.status == ConformanceRunStatus.PASSED
 
     first_promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_a.run_id,
     )
     assert first_promo.ok
 
     clock.now = "2026-01-01T01:00:00.000000Z"
     manager = WorkerTrustManager(db_conn, now_fn=clock)
     downgrade = manager.downgrade_to_locked(
-        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+        worker_id=registered_worker, role="coder", capability="read_file",
+        reason="malformed_tool_call",
     )
     assert downgrade.ok
-    assert manager.current_trust(registered_worker, "coder") == TrustLevel.LOCKED
+    assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.LOCKED
 
     # The exact same run_id, already used once, cannot re-promote after
     # the downgrade.
     second_promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_a.run_id,
     )
     assert not second_promo.ok
     assert second_promo.reason == "run_stale_relative_to_latest_trust_event"
-    assert manager.current_trust(registered_worker, "coder") == TrustLevel.LOCKED
+    assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.LOCKED
 
 
 def test_a_different_run_completed_before_downgrade_is_also_stale(db_conn, registered_worker):
@@ -595,7 +733,8 @@ def test_a_different_run_completed_before_downgrade_is_also_stale(db_conn, regis
         worker_id=registered_worker, role="coder", now_fn=clock,
     )
     promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_a.run_id,
     )
 
     # A second, independent passing run, completed BEFORE the downgrade
@@ -609,11 +748,13 @@ def test_a_different_run_completed_before_downgrade_is_also_stale(db_conn, regis
 
     clock.now = "2026-01-01T01:00:00.000000Z"
     WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
-        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+        worker_id=registered_worker, role="coder", capability="read_file",
+        reason="malformed_tool_call",
     )
 
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_b.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_b.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_stale_relative_to_latest_trust_event"
@@ -626,12 +767,14 @@ def test_fresh_run_started_after_downgrade_can_promote(db_conn, registered_worke
         worker_id=registered_worker, role="coder", now_fn=clock,
     )
     promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_a.run_id,
     )
 
     clock.now = "2026-01-01T01:00:00.000000Z"
     WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
-        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+        worker_id=registered_worker, role="coder", capability="read_file",
+        reason="malformed_tool_call",
     )
 
     clock.now = "2026-01-01T02:00:00.000000Z"
@@ -642,7 +785,8 @@ def test_fresh_run_started_after_downgrade_can_promote(db_conn, registered_worke
     assert run_c.status == ConformanceRunStatus.PASSED
 
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_c.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_c.run_id,
     )
     assert promo.ok
     assert promo.level == TrustLevel.GUARDED
@@ -657,13 +801,15 @@ def test_equal_freshness_boundary_fails_closed(db_conn, registered_worker):
         worker_id=registered_worker, role="coder", now_fn=clock,
     )
     promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_a.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_a.run_id,
     )
 
     downgrade_time = "2026-01-01T01:00:00.000000Z"
     clock.now = downgrade_time
     WorkerTrustManager(db_conn, now_fn=clock).downgrade_to_locked(
-        worker_id=registered_worker, role="coder", reason="malformed_tool_call",
+        worker_id=registered_worker, role="coder", capability="read_file",
+        reason="malformed_tool_call",
     )
 
     # run_d's started_at is set to EXACTLY the downgrade's own timestamp.
@@ -675,7 +821,8 @@ def test_equal_freshness_boundary_fails_closed(db_conn, registered_worker):
     assert run_d.status == ConformanceRunStatus.PASSED
 
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run_d.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run_d.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_stale_relative_to_latest_trust_event"
@@ -690,7 +837,8 @@ def test_no_prior_trust_history_means_no_freshness_constraint(db_conn, registere
         worker_id=registered_worker, role="coder",
     )
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=run.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=run.run_id,
     )
     assert promo.ok
 
@@ -717,7 +865,8 @@ def test_unexpected_adapter_exception_prevents_passing_promotion(db_conn, regist
     result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
     assert result.status == ConformanceRunStatus.FAILED
     promo = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", run_id=result.run_id,
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
     )
     assert not promo.ok
     assert promo.reason == "run_not_passed"
@@ -799,14 +948,16 @@ def test_concurrent_promotion_exactly_one_winner(tmp_path):
     conn_b = connect(db_path)
     try:
         result_a = promote_from_conformance(
-            conn_a, worker_id="w1", role="coder", run_id=run_result.run_id,
+            conn_a, worker_id="w1", role="coder", capability="read_file",
+            run_id=run_result.run_id,
         )
         result_b = promote_from_conformance(
-            conn_b, worker_id="w1", role="coder", run_id=run_result.run_id,
+            conn_b, worker_id="w1", role="coder", capability="read_file",
+            run_id=run_result.run_id,
         )
         outcomes = {result_a.ok, result_b.ok}
         assert outcomes == {True, False}
-        history = WorkerTrustManager(conn_a).history("w1", "coder")
+        history = WorkerTrustManager(conn_a).history("w1", "coder", "read_file")
         assert len(history) == 1
     finally:
         conn_a.close()

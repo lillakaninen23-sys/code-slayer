@@ -24,26 +24,43 @@ gate that actually earns the right to call it.
 1. the run exists
 2. the run belongs to the exact `worker_id` being promoted
 3. the run belongs to the exact `role` being promoted
-4. the run is finalized (not `RUNNING`)
-5. the run's status is `PASSED`
-6. every required case (`workers.conformance.REQUIRED_CASES`) has a
+4. **the requested capability scope is one the suite actually, concretely
+   tested — fail closed, with no default-allow path**:
+   - `capability=None` (role-level) is refused outright. Phase 7.2's
+     exact-scope semantics already mean `capability=None` never
+     implicitly grants `read_file`/`run_command`/`write_file`/etc — this
+     module additionally refuses to let conformance evidence promote the
+     role-level scope *at all*, because nothing about "the fixed suite
+     passed" is evidence for a scope broader than the one concrete
+     capability the suite exercises. Explicit, tested capability scope
+     is required every time.
+   - an unrecognized capability name is refused (`unknown_capability`) —
+     never treated the same as "known and non-mutating."
+   - a known *mutating* capability is refused
+     (`mutation_capability_not_conformance_tested`) — nothing in the
+     fixed Phase 7.3 suite ever tests mutation (`docs/CODE_SLAYER_VISION.
+     md` §37 isolation doesn't exist yet).
+   - a known, non-mutating capability the suite did not actually
+     exercise is refused (`capability_not_covered_by_suite`) — being
+     "non-mutating" is necessary but not sufficient; only
+     `conformance.PROMOTABLE_CAPABILITIES` (currently just `read_file`)
+     may be promoted from a `phase7.3-v1` run.
+5. the run is finalized (not `RUNNING`)
+6. the run's status is `PASSED`
+7. every required case (`workers.conformance.REQUIRED_CASES`) has a
    recorded result in *this* run
-7. every required case's recorded result is `passed`
-8. the run has not been invalidated — Phase 7.3 has no separate
+8. every required case's recorded result is `passed`
+9. the run has not been invalidated — Phase 7.3 has no separate
    invalidation flag or mechanism (a finalized run cannot be silently
    rewritten — see `worker_conformance_runs_no_mutate_finalized` — so a
    run's own durable `status` *is* its complete validity record; a
    future phase that needs to invalidate historical evidence without
    lying about what happened would add a new, separately durable event
    referencing this `run_id`, never a mutation of it)
-9. the requested scope is one the suite actually tested: the run's
-   `suite_version` matches this code's current `conformance.
-   SUITE_VERSION`, and `capability` (if given) does not name a mutating
-   tool capability — nothing in the fixed Phase 7.3 suite ever tests
-   mutation (`docs/CODE_SLAYER_VISION.md` §37 isolation doesn't exist
-   yet), so a mutating scope is refused outright, never granted merely
-   because a read-only suite happened to pass
-10. **the run is not stale relative to this exact scope's trust
+10. the run's `suite_version` matches this code's current `conformance.
+    SUITE_VERSION` — an older or newer suite's claims are never silently
+    reused
+11. **the run is not stale relative to this exact scope's trust
     history**: if `(worker_id, role, capability)` has *any* prior trust
     event at all, the run must have *begun* (`started_at`) strictly
     after that event's `occurred_at` — an equal or earlier timestamp
@@ -67,7 +84,7 @@ import sqlite3
 
 from code_slayer.store.conformance_repo import ConformanceRepo, ConformanceRunStatus
 from code_slayer.tools.registry import CAPABILITIES
-from code_slayer.workers.conformance import REQUIRED_CASES, SUITE_VERSION
+from code_slayer.workers.conformance import PROMOTABLE_CAPABILITIES, REQUIRED_CASES, SUITE_VERSION
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
 
 
@@ -75,11 +92,21 @@ def _deny(reason: str) -> TrustResult:
     return TrustResult(False, reason)
 
 
-def _is_mutating_capability(capability: str | None) -> bool:
+def _capability_scope_gate(capability: str | None) -> TrustResult | None:
+    """`None` on success; a terminal denial otherwise. Fails closed for
+    every case except a capability the fixed suite explicitly, concretely
+    covers — there is no default-allow branch here, deliberately:
+    an unrecognized name must never be treated the same as a known,
+    harmless one."""
     if capability is None:
-        return False
-    spec = CAPABILITIES.get(capability)
-    return spec is not None and spec.mutation
+        return _deny("role_level_promotion_not_supported_by_conformance")
+    if capability not in CAPABILITIES:
+        return _deny("unknown_capability")
+    if CAPABILITIES[capability].mutation:
+        return _deny("mutation_capability_not_conformance_tested")
+    if capability not in PROMOTABLE_CAPABILITIES:
+        return _deny("capability_not_covered_by_suite")
+    return None
 
 
 def promote_from_conformance(
@@ -87,7 +114,7 @@ def promote_from_conformance(
     run_id: str, reason: str = "conformance_suite_passed",
 ) -> TrustResult:
     """Verify `run_id` is genuine, complete, passing evidence for exactly
-    `(worker_id, role)` before invoking `WorkerTrustManager.
+    `(worker_id, role, capability)` before invoking `WorkerTrustManager.
     promote_to_guarded()` with it. See the module docstring for the full
     ordered check list; any failure denies before trust is ever touched."""
     if not isinstance(worker_id, str) or not worker_id:
@@ -99,8 +126,9 @@ def promote_from_conformance(
     if not isinstance(run_id, str) or not run_id:
         return _deny("malformed_promotion_request")
 
-    if _is_mutating_capability(capability):
-        return _deny("mutation_capability_not_conformance_tested")
+    gate = _capability_scope_gate(capability)
+    if gate is not None:
+        return gate
 
     run = ConformanceRepo(conn).get_run(run_id)
     if run is None:
