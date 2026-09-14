@@ -6,6 +6,10 @@ Read this alongside [`docs/CODE_SLAYER_VISION.md`](CODE_SLAYER_VISION.md) (the l
 
 > **Do not read this as a promise that every item must be built before Code Slayer becomes useful.** Project Mode and Maintenance Mode (the two most immediately useful [operating modes](CODE_SLAYER_VISION.md#6-operating-modes)) become usable once **Core Agent** and **Local Worker Runtime** exist — everything from **Engineering Intelligence** onward makes Code Slayer *better*, not *functional for the first time*.
 
+> **Current accepted baseline:** Phase 6 (durable worktree leases and fencing) is complete, including two follow-up hardening commits that closed a lease-takeover quiescence race and hardened process-liveness identity against unreliable/ambiguous `/proc` evidence (see [`docs/LEASES_AND_RECOVERY.md`](LEASES_AND_RECOVERY.md)). The long-term vision has since been expanded with an explicit safety, authority, and learning architecture (`docs/CODE_SLAYER_VISION.md` §32–§61). **Nothing beyond Phase 6 is implemented** — every stage below, including the safety/model-adapter groundwork **Local Worker Runtime** now describes as Phase 7, remains exactly as its own `Status:` line says.
+
+Every stage below also operates under principles [`docs/CODE_SLAYER_VISION.md`](CODE_SLAYER_VISION.md) already establishes as non-negotiable, restated here only by reference, never duplicated: **quality over throughput** (§2), the original user prompt stays authoritative over any derived analysis (§32, §59), **model consensus is never evidence** (§34), the Safety Runtime is deterministic and model-independent (§36), a model *earns* autonomy through conformance evidence rather than being granted it (§41, §42), the coding worker is never the sole judge of its own output (§47), Runtime Learning and model Training are separate systems (§55 vs. §18–23), and an operational incident becomes regression/evaluation evidence rather than being discarded (§58).
+
 ---
 
 ## How to read the dependency chain
@@ -29,9 +33,12 @@ Environments
 Knowledge ──────────────┐
    │                     │
    ▼                     ▼
-  Lab ────────────► Training
+  Lab              Runtime Learning
    │                     │
    └──────────┬──────────┘
+              ▼
+          Training
+              │
               ▼
       Autonomous R&D
               │
@@ -69,8 +76,13 @@ narrow policy decision, and crash-safe recovery (see
 [`docs/CHECKPOINTS.md`](CHECKPOINTS.md)); Phase 6 supplies the worktree
 lease with fencing, integrated into every Phase 4/5 mutation path, plus a
 generic unresolved-operation recovery framework (see
-[`docs/LEASES_AND_RECOVERY.md`](LEASES_AND_RECOVERY.md)). The agent loop
-itself remains deferred.
+[`docs/LEASES_AND_RECOVERY.md`](LEASES_AND_RECOVERY.md)) — completed by two
+follow-up hardening commits that close a lease-takeover quiescence race
+(an `ACTIVE`-but-expired lease now durably passes through `QUIESCING`
+before any new epoch is granted) and harden process-liveness identity
+(exact `/proc`-derived process identity, no time tolerance, and a strict
+`GONE`-requires-positive-evidence vs. `UNKNOWN` distinction). The agent
+loop itself remains deferred.
 
 The state-machine engine (task phases, legal transitions, guards), the tool abstraction with risk classification, the policy engine, the worktree lease (with fencing), the checkpoint mechanism (Git plumbing), and resume-from-crash. This is where a "task" becomes a real, resumable thing rather than a row that exists.
 
@@ -81,12 +93,18 @@ The state-machine engine (task phases, legal transitions, guards), the tool abst
 
 ## Local Worker Runtime
 
-**Status: not started.**
+**Status: not started — this is the Foundation Plan's Phase 7,** the first phase after Phase 6. Phase 7 is not one leap; it is expected to hold each of the following before the next is attempted, so that real autonomous execution never outruns the containment built to hold it:
 
-The Model Registry, Provider Registry, Capability Registry, and role routing described in the vision's [Model-Agnostic Architecture](CODE_SLAYER_VISION.md#3-model-agnostic-architecture). The first real provider adapter targets a local model (Qwen, per ADR 0006) behind a generic local-endpoint interface. Cloud escalation (`disabled`/`manual`/`maintenance`) is implemented here as a policy dimension, not bolted on later.
+1. **Safety Runtime baseline.** The deterministic, model-independent containment layer — path boundaries, the policy engine extended per [Tool / Command Safety](CODE_SLAYER_VISION.md#39-tool--command-safety), tool-protocol validation ([§40](CODE_SLAYER_VISION.md#40-tool-protocol-validation)) — exists *before* a real model is wired in, not retrofitted after. See [Safety Runtime](CODE_SLAYER_VISION.md#36-safety-runtime).
+2. **Model adapter + conformance.** The Model Registry, Provider Registry, Capability Registry, and role routing described in [Model-Agnostic Architecture](CODE_SLAYER_VISION.md#3-model-agnostic-architecture). The first real provider adapter targets a local model (Qwen, per ADR 0006) behind a generic local-endpoint interface, and must pass [preflight/conformance](CODE_SLAYER_VISION.md#41-model-preflight--conformance) before it receives any real task. Cloud escalation (`disabled`/`manual`/`maintenance`) is implemented here as a policy dimension, not bolted on later.
+3. **Trust starts `LOCKED`.** A newly adapted model begins at the most restricted [trust level](CODE_SLAYER_VISION.md#42-model-trust-levels) and only earns `GUARDED`, then broad `AUTO` autonomy, through demonstrated evidence — never granted upfront because a model looks capable in general.
+4. **Isolated mutating jobs.** Every mutating job runs in its own disposable worktree/sandbox per [Isolated Job Execution](CODE_SLAYER_VISION.md#37-isolated-job-execution), so a `GUARDED`-level worker's failure stays disposable and never reaches the owner's primary working tree.
+5. **Prompt / question intelligence.** The [Prompt Analyst](CODE_SLAYER_VISION.md#32-prompt-analyst) and [Question Gate](CODE_SLAYER_VISION.md#33-question-gate) sit in front of the worker from the start: the analyst's structured analysis never replaces the original prompt, and the gate suppresses a question only when authoritative evidence — repository, runtime, prior verified task evidence — already answers it.
+
+**Acceptance for this stage is therefore evidence, not a single "it runs" demo:** conformance results for the adapter (step 2), a trust-level history showing genuine `LOCKED → GUARDED` promotion rather than a default grant (step 3), and at least one mutating job that ran fully inside isolation (step 4) with its prompt handled through the analyst/gate (step 5).
 
 **Depends on:** Core Agent (a worker needs a task/phase/tool loop to plug into).
-**Delivers:** Code Slayer actually doing work with a real model, entirely locally, with cloud as an explicit, audited, off-by-default escape hatch.
+**Delivers:** Code Slayer actually doing work with a real model, entirely locally, with cloud as an explicit, audited, off-by-default escape hatch — and every step above holding before the next is attempted.
 
 ---
 
@@ -94,10 +112,10 @@ The Model Registry, Provider Registry, Capability Registry, and role routing des
 
 **Status: not started.**
 
-Repository indexing, a context engine (so a worker gets the *relevant* slice of a codebase, not all of it or a guess), planning that produces a durable, reviewable plan, and independent review as a distinct role from implementation.
+Repository indexing, a context engine (so a worker gets the *relevant* slice of a codebase, not all of it or a guess), planning that produces a durable, reviewable plan, deterministic finalization (tests/lint/typecheck/build/diff gates — see [Diff / Commit Gates](CODE_SLAYER_VISION.md#50-diff--commit-gates)), and [independent review](CODE_SLAYER_VISION.md#47-independent-review) as a distinct role from implementation. **The coding worker must not be the sole judge of its own output** — a reviewer's structured `PASS`/`NEEDS_FIX`/`FAIL`/`UNSAFE`/`INSUFFICIENT_EVIDENCE` outcome is only as trustworthy as the deterministic evidence handed to it alongside the diff, which is why finalization is deterministic *before* it is reviewed, not instead of being reviewed.
 
-**Depends on:** Local Worker Runtime (planning and review are role-routed work, like any other phase).
-**Delivers:** tasks that scale past "a few files" — real refactors, real multi-file features, plans a human can read and approve before implementation starts.
+**Depends on:** Local Worker Runtime (planning and review are role-routed work, like any other phase, gated by the same trust/conformance evidence that stage establishes).
+**Delivers:** tasks that scale past "a few files" — real refactors, real multi-file features, plans a human can read and approve before implementation starts, and a diff nothing merges without independent review having seen it.
 
 ---
 
@@ -134,14 +152,53 @@ Curriculum management, task generation, the skill model, hidden tests, and mutat
 
 ---
 
+## Runtime Learning
+
+**Status: not started.**
+
+Adapts *how the system operates* — model routing, role suitability, trust level, risk thresholds, prompt templates, context packaging, tool guardrails, question suppression, reviewer escalation, task-pattern reuse — from durable job outcomes: accepted work, policy denials, malformed tool calls, reviewer findings, repair counts, rollbacks. See the vision's [Runtime Learning](CODE_SLAYER_VISION.md#55-runtime-learning) section for the full input list.
+
+**Distinct from Training, deliberately (below):** Runtime Learning never changes a model's weights — only how Code Slayer routes, trusts, and gates the models it already has. It is the curated evidence trail an accepted job leaves on its way toward becoming training-eligible, not training itself; conflating the two is exactly what rule 9 of the accepted vision exists to prevent.
+
+**Depends on:** Knowledge (the same curated-evidence, provenance-first discipline) and Local Worker Runtime (there must be real job outcomes — accepted, denied, rolled back — to learn from).
+**Delivers:** routing and trust decisions grounded in this system's own demonstrated track record instead of a static configuration.
+
+---
+
 ## Training
 
 **Status: not started.**
 
-The verified-dataset pipeline, dataset splits (`TRAIN`/`VALIDATION`/`FROZEN_EVAL`), language/domain specialists, training recipes, and the frozen-benchmark discipline described in the vision's [Training Data Pipeline](CODE_SLAYER_VISION.md#18-training-data-pipeline) through [Benchmark-Driven Routing](CODE_SLAYER_VISION.md#23-benchmark-driven-routing) sections.
+The verified-dataset pipeline, dataset splits (`TRAIN`/`VALIDATION`/`FROZEN_EVAL`), language/domain specialists, training recipes, and the frozen-benchmark discipline described in the vision's [Training Data Pipeline](CODE_SLAYER_VISION.md#18-training-data-pipeline) through [Benchmark-Driven Routing](CODE_SLAYER_VISION.md#23-benchmark-driven-routing) sections, plus [Training Provenance](CODE_SLAYER_VISION.md#56-training-provenance) and [Training Evaluation](CODE_SLAYER_VISION.md#57-training-evaluation).
 
-**Depends on:** Lab (training data comes from verified Lab experience) and Knowledge (dataset curation reuses the same provenance/dedup discipline).
-**Delivers:** the ability to turn accumulated, verified experience into a measurably better local model — evidence-gated at every step, never a raw dump of audit logs into a fine-tune.
+A training candidate's path here is never a direct hop from raw worker output — every step below has to hold:
+
+```
+accepted verified job
+        │
+        ▼
+runtime learning evidence
+        │
+        ▼
+training eligibility / curated candidate
+        │
+        ▼
+dataset curation
+        │
+        ▼
+training
+        │
+        ▼
+held-out evaluation
+        │
+        ▼
+possible model promotion
+```
+
+**A trained model is not promoted on training loss alone** — it must clear the frozen (`FROZEN_EVAL`) held-out evaluation before it replaces, or is routed alongside, an existing proven model, exactly as [New Model Adoption](CODE_SLAYER_VISION.md#22-new-model-adoption) already requires for any model, applied here to one Code Slayer trained itself.
+
+**Depends on:** Lab (curriculum-generated verified experience, at scale) and Runtime Learning (the curated evidence trail real accepted jobs leave behind) — both routes converge here, and neither is a raw audit-log dump or raw worker output.
+**Delivers:** the ability to turn accumulated, verified experience into a measurably better local model — evidence-gated at every step, never a raw dump of audit logs or unverified worker output into a fine-tune.
 
 ---
 
@@ -192,3 +249,5 @@ Cross-compilation, QEMU-based boot/runtime testing, and eventually kernel and co
 ## A note on sequencing discipline
 
 Every "Depends on" above is a real dependency, not a suggestion: building a later stage before its dependency is solid produces a system that *looks* capable and fails unpredictably under the exact conditions the skipped stage exists to guard against (an unverified plan, an untested environment, an ungated self-modification). When in doubt about whether a stage is "ready to start," the test is not "do we want this capability" — it's "does every stage above it in this chain already hold up under real, adversarial use." If the answer is no, the next unit of work belongs in the stage that's still shaky, not the one that sounds more exciting.
+
+**Safety before autonomy is the sharpest instance of this rule.** Real autonomous model execution must never outrun the Safety Runtime containing it: if Local Worker Runtime introduces a model adapter before every safety feature a given capability needs actually exists, that capability stays `LOCKED` for that model — not "temporarily trusted until the safety work catches up." Capability and containment are not allowed to trade off against each other; a model that looks impressive does not buy its way past a `LOCKED`/`GUARDED` gate it hasn't earned through conformance evidence.
