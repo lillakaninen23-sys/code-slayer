@@ -58,6 +58,35 @@ class WorkerResponseKind(StrEnum):
     MALFORMED = "MALFORMED"
 
 
+class ToolRequirement(StrEnum):
+    """Whether this turn's `allowed_tools` are merely available
+    (`OPTIONAL`, the default) or a genuine structured tool call is
+    specifically required to satisfy this turn (`REQUIRED`) — Phase
+    7.4c (`docs/CODE_SLAYER_VISION.md` §58's follow-up investigation).
+
+    `OPTIONAL` is correct for essentially every ordinary task turn: a
+    task may legitimately have tools available without needing to call
+    one, and `allowed_tools` being non-empty must never, by itself, be
+    read as a demand to use one. `REQUIRED` exists for the narrow case
+    where the caller is not asking "can you get this done, optionally
+    with a tool" but specifically testing or requiring "prove a genuine
+    structured tool call can be produced right now" — today, that is
+    exactly `workers.conformance`'s `structured_tool_call` case, and
+    nothing else in this codebase sets it.
+
+    This is provider-neutral by construction: a concrete adapter decides
+    how to honor `REQUIRED` using whatever mechanism its own provider
+    exposes (`workers.openai_compatible_adapter.OpenAICompatibleAdapter`
+    maps it to the standard OpenAI-compatible `tool_choice: "required"`
+    field) — this type and field name never reference a provider or
+    model directly, and nothing here weakens `protocol_validation.
+    validate_response()`'s own judgment of whatever actually comes
+    back."""
+
+    OPTIONAL = "OPTIONAL"
+    REQUIRED = "REQUIRED"
+
+
 @dataclass(frozen=True)
 class WorkerToolCall:
     """A structurally claimed tool call. Being an instance of this exact
@@ -104,6 +133,12 @@ class WorkerRequest:
     different statement: no tool call is authorized at all this turn.
     `prior_tool_result`, when set, is the one immediately-preceding tool
     outcome this turn continues from — see `WorkerToolResult`.
+
+    `tool_requirement` (`ToolRequirement`, default `OPTIONAL`) is a
+    separate, deliberately narrow signal from `allowed_tools`: having
+    tools available (`allowed_tools` non-empty) never implies a demand
+    to use one. Only a caller that specifically needs proof a structured
+    tool call can be produced sets `REQUIRED` — see `ToolRequirement`.
     """
 
     task_id: str
@@ -111,6 +146,7 @@ class WorkerRequest:
     original_prompt: str
     allowed_tools: tuple[str, ...] | None = None
     prior_tool_result: WorkerToolResult | None = None
+    tool_requirement: ToolRequirement = ToolRequirement.OPTIONAL
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ from code_slayer.workers.conformance import (
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.protocol import (
+    ToolRequirement,
     WorkerAdapterError,
     WorkerResponse,
     WorkerResponseKind,
@@ -622,6 +623,36 @@ def test_structured_tool_call_case_passes_on_genuine_tool_call(db_conn, register
     result = _case_structured_tool_call(adapter, "coder")
     assert result.passed is True
     assert result.reason == "valid_tool_call"
+
+
+def test_structured_tool_call_case_requires_a_tool_call(db_conn, registered_worker):
+    """Phase 7.4c: this case is not asking "maybe use a tool" -- it
+    explicitly requires one, mapped generically by the adapter to
+    whatever the provider's own standard tool-choice mechanism is."""
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "x"}),
+        ),
+    ])
+    _case_structured_tool_call(adapter, "coder")
+    assert adapter.calls[0].tool_requirement == ToolRequirement.REQUIRED
+
+
+def test_no_other_case_requires_a_tool(db_conn, registered_worker):
+    """Test item 1, at the conformance-suite level: allowed_tools being
+    non-empty never, by itself, demands tool use for any case except the
+    one that explicitly needs to prove structured tool calling works."""
+    from code_slayer.workers import conformance as conformance_module
+
+    for case_name, _kind, run_case in conformance_module._CASE_ORDER:
+        if case_name == "structured_tool_call":
+            continue
+        adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="ok")])
+        run_case(adapter, "coder")
+        assert adapter.calls[0].tool_requirement == ToolRequirement.OPTIONAL, case_name
 
 
 def test_structured_tool_call_case_fails_on_plain_text(db_conn, registered_worker):

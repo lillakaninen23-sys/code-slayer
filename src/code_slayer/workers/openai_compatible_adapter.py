@@ -53,6 +53,33 @@ tool-call-shaped patterns here. `protocol_validation.validate_response()`
 leaked syntax and reclassifies the response `MALFORMED`. This module
 never second-guesses a `TEXT` response and never attempts to parse,
 repair, or "helpfully" recover a tool call from it.
+
+## Deterministic generation and explicit tool requirement (Phase 7.4c)
+
+The first live conformance runs against `qwen3-coder:30b` over Ollama's
+OpenAI-compatible endpoint showed the *same* `structured_tool_call`
+request sometimes returning a genuine structured `tool_calls` response
+and sometimes returning raw `<function=...>`/`</tool_call>` text
+instead — with generation left entirely uncontrolled (no `temperature`,
+no `tool_choice`), this was structurally unreproducible evidence.
+`OpenAICompatibleConfig.temperature` (default `0.0`) is the smallest
+provider-neutral, standard OpenAI-compatible sampling control this
+module adds — never a model-specific constant, and never something a
+`WorkerRequest`/model output can change.
+
+Separately, `WorkerRequest.tool_requirement` (`protocol.ToolRequirement`)
+is mapped, only when `REQUIRED`, onto the standard OpenAI-compatible
+`tool_choice: "required"` field. This is deliberately not derived from
+`allowed_tools` being non-empty — an ordinary task may have tools
+available without needing to use one — and it is deliberately not a
+provider- or model-specific hack: `tool_choice: "required"` is standard
+OpenAI-compatible request vocabulary, and this adapter maps it exactly
+the same way regardless of which concrete runtime/model
+`OpenAICompatibleConfig` happens to point at. Neither addition weakens
+`protocol_validation.validate_response()` or this module's own no-
+recovery contract above: a response that still arrives as leaked raw
+text is still just `TEXT`, still never parsed here, and still only ever
+reclassified by the validator.
 """
 
 from __future__ import annotations
@@ -63,6 +90,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from code_slayer.workers.protocol import (
+    ToolRequirement,
     WorkerAdapterError,
     WorkerRequest,
     WorkerResponse,
@@ -72,6 +100,7 @@ from code_slayer.workers.protocol import (
 
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_MAX_RESPONSE_BYTES = 1_000_000  # 1 MiB — bounded, not unlimited
+_DEFAULT_TEMPERATURE = 0.0  # deterministic by default — see the module docstring
 
 # The complete, fixed set of tool schemas this adapter can ever translate
 # a Code Slayer capability into. Deliberately not derived from
@@ -110,13 +139,23 @@ class OpenAICompatibleConfig:
     """Everything the adapter needs, and nothing more. `base_url` and
     `model` are required and always explicit — there is no default that
     could silently point anywhere, and nothing here is ever populated
-    from a `WorkerRequest` or model output."""
+    from a `WorkerRequest` or model output.
+
+    `temperature` defaults to `0.0` — deterministic generation, so
+    conformance evidence is reproducible — rather than leaving sampling
+    behavior at whatever the provider's own uncontrolled default is
+    (see the module docstring's "Phase 7.4c" section). It is a standard
+    OpenAI-compatible request field, generic across any provider this
+    adapter talks to; `None` omits it from the request entirely, falling
+    back to the provider's own default, for a caller that has a specific
+    reason to want that instead."""
 
     base_url: str
     model: str
     timeout: float = _DEFAULT_TIMEOUT_SECONDS
     api_key: str | None = field(default=None, repr=False)
     max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES
+    temperature: float | None = _DEFAULT_TEMPERATURE
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str) or not self.base_url:
@@ -127,6 +166,11 @@ class OpenAICompatibleConfig:
             raise ValueError("timeout must be a positive number")
         if not isinstance(self.max_response_bytes, int) or self.max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be a positive integer")
+        if self.temperature is not None:
+            if not isinstance(self.temperature, (int, float)):
+                raise ValueError("temperature must be a number or None")
+            if not (0.0 <= self.temperature <= 2.0):
+                raise ValueError("temperature must be between 0.0 and 2.0")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -178,9 +222,26 @@ class OpenAICompatibleAdapter:
                 ),
             })
         payload: dict = {"model": self._config.model, "messages": messages, "stream": False}
+        if self._config.temperature is not None:
+            payload["temperature"] = self._config.temperature
         tools = self._tool_schemas_for(request.allowed_tools)
         if tools:
             payload["tools"] = tools
+        if request.tool_requirement == ToolRequirement.REQUIRED:
+            if not tools:
+                # A construction-time contract violation, not a transport
+                # failure: nothing was actually offered to require use of.
+                # Raised here, before any network call, rather than
+                # silently sending a request that could never honor what
+                # the caller asked for.
+                raise ValueError(
+                    "tool_requirement is REQUIRED but no tool schemas were resolved "
+                    "from allowed_tools",
+                )
+            # Standard OpenAI-compatible vocabulary, mapped generically —
+            # never a provider- or model-specific branch (see the module
+            # docstring's "Phase 7.4c" section).
+            payload["tool_choice"] = "required"
         return payload
 
     def _tool_schemas_for(self, allowed_tools: tuple[str, ...] | None) -> list[dict]:

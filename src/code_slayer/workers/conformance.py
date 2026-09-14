@@ -52,6 +52,20 @@ This revision draws the line explicitly:
 change was needed to support Phase 7.4a's real adapter for any of the
 five cases it now executes.
 
+## Phase 7.4c: deterministic generation and explicit tool requirement
+
+The first `phase7.4b-v1` live run against `qwen3-coder:30b` still showed
+`structured_tool_call` failing intermittently — not because the case
+asked the worker to misbehave, but because the underlying request left
+sampling uncontrolled and never told the provider a tool call was
+actually required. `_case_structured_tool_call` now sets
+`tool_requirement=ToolRequirement.REQUIRED` on the request it builds
+(see `workers.protocol.ToolRequirement`), and `OpenAICompatibleAdapter`
+now defaults to deterministic generation (`temperature=0.0`) — see that
+module's docstring for the full investigation and mapping. No other
+case sets `tool_requirement`; `allowed_tools` being non-empty never, by
+itself, demands tool use.
+
 ## Worker-evidence cases
 
 Every case in `_CASE_ORDER` is `WORKER_CAPABILITY` evidence: the case's
@@ -94,6 +108,7 @@ from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.tools.registry import CAPABILITIES
 from code_slayer.workers.protocol import (
+    ToolRequirement,
     WorkerAdapter,
     WorkerAdapterError,
     WorkerRequest,
@@ -145,10 +160,12 @@ class ConformanceSuiteResult:
 def _base_request(
     role: str, *, allowed_tools: tuple[str, ...] | None = ("read_file",),
     prior_tool_result: WorkerToolResult | None = None, prompt: str = _PROMPT,
+    tool_requirement: ToolRequirement = ToolRequirement.OPTIONAL,
 ) -> WorkerRequest:
     return WorkerRequest(
         task_id="conformance", role=role, original_prompt=prompt,
         allowed_tools=allowed_tools, prior_tool_result=prior_tool_result,
+        tool_requirement=tool_requirement,
     )
 
 
@@ -191,9 +208,19 @@ def _case_structured_output(adapter: WorkerAdapter, role: str) -> CaseOutcome:
 
 
 def _case_structured_tool_call(adapter: WorkerAdapter, role: str) -> CaseOutcome:
-    """Exposes exactly `read_file` and explicitly instructs the model to
-    call it — a genuine structured tool call is required to pass."""
-    request = _base_request(role, allowed_tools=("read_file",), prompt=_TOOL_CALL_PROMPT)
+    """Exposes exactly `read_file`, explicitly instructs the model to
+    call it, AND sets `tool_requirement=REQUIRED` (Phase 7.4c) — this
+    case is not asking "maybe use a tool," it is specifically testing
+    "prove this integration can emit a genuine structured tool call," so
+    an adapter that supports standard OpenAI-compatible `tool_choice`
+    semantics is told to require one. A genuine structured tool call is
+    required to pass regardless of whether the adapter can honor
+    `REQUIRED` — an adapter that ignores it still only passes by
+    actually returning one."""
+    request = _base_request(
+        role, allowed_tools=("read_file",), prompt=_TOOL_CALL_PROMPT,
+        tool_requirement=ToolRequirement.REQUIRED,
+    )
     response = adapter.infer(request)
     result = validate_response(request, response)
     if result.outcome != ValidationOutcome.VALID_TOOL_CALL:

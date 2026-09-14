@@ -22,6 +22,7 @@ from code_slayer.workers.openai_compatible_adapter import (
     OpenAICompatibleConfig,
 )
 from code_slayer.workers.protocol import (
+    ToolRequirement,
     WorkerAdapterError,
     WorkerRequest,
     WorkerResponseKind,
@@ -278,6 +279,7 @@ def test_worker_request_has_no_endpoint_controlling_field():
     field_names = {f.name for f in fields(WorkerRequest)}
     assert field_names == {
         "task_id", "role", "original_prompt", "allowed_tools", "prior_tool_result",
+        "tool_requirement",
     }
 
 
@@ -336,3 +338,120 @@ def test_tool_result_continuation_round_trip(server):
     assert response.kind == WorkerResponseKind.TEXT
     sent = json.loads(script.last_request_body)
     assert any("hello world" in m.get("content", "") for m in sent["messages"])
+
+
+# --- Phase 7.4c: deterministic generation ------------------------------------
+
+def test_default_temperature_is_zero_and_sent_in_payload(server):
+    """Test item 4: deterministic generation options are encoded as
+    intended -- the default is 0.0 (deterministic), sent as a standard
+    OpenAI-compatible field, not left to the provider's own default."""
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    sent = json.loads(script.last_request_body)
+    assert sent["temperature"] == 0.0
+
+
+def test_temperature_none_omits_the_field(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url, temperature=None)).infer(_request())
+    sent = json.loads(script.last_request_body)
+    assert "temperature" not in sent
+
+
+def test_custom_temperature_is_sent_verbatim(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url, temperature=0.5)).infer(_request())
+    sent = json.loads(script.last_request_body)
+    assert sent["temperature"] == 0.5
+
+
+def test_out_of_range_temperature_rejected_at_construction():
+    # No live connection is ever attempted -- construction itself fails.
+    unreachable = "http://127.0.0.1:1/v1"
+    with pytest.raises(ValueError):
+        _config(unreachable, temperature=2.5)
+    with pytest.raises(ValueError):
+        _config(unreachable, temperature=-0.1)
+
+
+# --- Phase 7.4c: tool_requirement / tool_choice ------------------------------
+
+def test_normal_request_does_not_globally_require_a_tool(server):
+    """Test item 1: a request with tools available but the default
+    OPTIONAL tool_requirement never sends tool_choice at all -- having
+    tools available never, by itself, demands using one."""
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok, no tool needed"})
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request(allowed_tools=("read_file",)))
+    sent = json.loads(script.last_request_body)
+    assert "tool_choice" not in sent
+    assert "tools" in sent  # the tool was still offered, just not required
+
+
+def test_required_tool_requirement_emits_standard_tool_choice_field(server):
+    """Test items 2/3: an explicit REQUIRED tool_requirement is mapped to
+    the standard OpenAI-compatible tool_choice field."""
+    script, base_url = server
+    _respond(script, {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "function": {"name": "read_file", "arguments": json.dumps({"path": "a.txt"})},
+        }],
+    })
+    OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED),
+    )
+    sent = json.loads(script.last_request_body)
+    assert sent["tool_choice"] == "required"
+
+
+def test_required_tool_requirement_with_no_resolvable_tools_raises(server):
+    """A construction-time contract violation, never silently sent:
+    REQUIRED with nothing actually offered to require use of."""
+    _script, base_url = server
+    adapter = OpenAICompatibleAdapter(_config(base_url))
+    with pytest.raises(ValueError):
+        adapter.infer(_request(allowed_tools=None, tool_requirement=ToolRequirement.REQUIRED))
+    with pytest.raises(ValueError):
+        adapter.infer(_request(allowed_tools=(), tool_requirement=ToolRequirement.REQUIRED))
+
+
+def test_valid_structured_tool_call_still_maps_correctly_with_new_fields(server):
+    """Test item 5: valid structured tool_calls still map correctly with
+    deterministic generation and an explicit tool requirement both set."""
+    script, base_url = server
+    _respond(script, {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "function": {"name": "read_file", "arguments": json.dumps({"path": "b.txt"})},
+        }],
+    })
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED),
+    )
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call.tool == "read_file"
+    assert response.tool_call.params == {"path": "b.txt"}
+
+
+def test_textual_function_leakage_remains_malformed_with_required_tool_requirement(server):
+    """Test item 6: even with tool_choice=required sent, a provider that
+    still leaks raw textual protocol syntax is unaffected by this
+    module -- it stays TEXT, verbatim, and only validate_response()
+    reclassifies it MALFORMED (test item 7: no fallback parser exists
+    here, regardless of tool_requirement)."""
+    script, base_url = server
+    leaked = "<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>"
+    _respond(script, {"role": "assistant", "content": leaked})
+    request = _request(allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TEXT
+    assert response.text == leaked
+
+    result = validate_response(request, response)
+    assert result.outcome == ValidationOutcome.MALFORMED
+    assert result.reason == "textual_tool_protocol_leakage"
