@@ -71,6 +71,27 @@ class WorkerToolCall:
 
 
 @dataclass(frozen=True)
+class WorkerToolResult:
+    """The smallest possible representation of "a tool ran and here is
+    what happened," for a follow-up request to carry as context (Phase
+    7.3, added for the `tool_result_consumption` conformance case).
+
+    Deliberately not a conversation/message-history framework: exactly
+    one prior result, never a list, never roles, never turn ordering.
+    `output_summary` is a short, caller-prepared summary string — never
+    raw command output, file bytes, or anything that needs its own
+    evidence/redaction handling; a caller with real tool output decides
+    what's safe and useful to summarize before this field is ever built,
+    the same way `tools.executor` never puts raw bytes in an audit
+    payload. If a real multi-turn need ever outgrows this, that is a
+    deliberately later, separate design decision — not one this phase
+    makes by accident."""
+
+    tool: str
+    output_summary: str
+
+
+@dataclass(frozen=True)
 class WorkerRequest:
     """One inference request for one task/role turn.
 
@@ -81,12 +102,15 @@ class WorkerRequest:
     validator then skips the authorization check entirely — it never
     invents a default allowlist). An empty tuple is a deliberate,
     different statement: no tool call is authorized at all this turn.
+    `prior_tool_result`, when set, is the one immediately-preceding tool
+    outcome this turn continues from — see `WorkerToolResult`.
     """
 
     task_id: str
     role: str
     original_prompt: str
     allowed_tools: tuple[str, ...] | None = None
+    prior_tool_result: WorkerToolResult | None = None
 
 
 @dataclass(frozen=True)

@@ -120,3 +120,35 @@ class WorkerTrustEvent:
     reason: str
     evidence_ref: str | None
     occurred_at: str
+
+
+@dataclass(frozen=True)
+class WorkerConformanceRun:
+    """One durable conformance suite execution (Phase 7.3). `status` is
+    `RUNNING`/`PASSED`/`FAILED`; `completed_at` is `None` only while
+    `RUNNING`. `suite_version` names the fixed, code-owned case list this
+    run was checked against."""
+
+    run_id: str
+    worker_id: str
+    role: str
+    suite_version: str
+    started_at: str
+    completed_at: str | None
+    status: str
+
+
+@dataclass(frozen=True)
+class WorkerConformanceResult:
+    """One durable case result within exactly one run (Phase 7.3).
+    `detail_content_hash` is reserved for a future, optional evidence
+    blob (`content_blobs`) and is unpopulated by this phase's own
+    runner."""
+
+    id: int
+    run_id: str
+    case_name: str
+    passed: bool
+    reason: str
+    detail_content_hash: str | None
+    occurred_at: str

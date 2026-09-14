@@ -1,0 +1,114 @@
+"""Conformance-gated trust promotion — the normal, safe public route to
+`LOCKED -> GUARDED` (Phase 7.3).
+
+## The boundary this module exists to draw
+
+`workers.trust.WorkerTrustManager.promote_to_guarded()` is the Phase 7.2
+trust *primitive*: it only checks that a non-blank `evidence_ref` string
+was supplied, never that the string means anything. That was a
+deliberate, documented Phase 7.2 boundary — real verification needed a
+conformance store that did not exist yet.
+
+It still does not, and still should not, verify evidence — Phase 7.2's
+tests and semantics are unchanged by this module. What changes is that
+application code now has a better, safer route: **`promote_from_
+conformance()`, not `promote_to_guarded()` with a hand-picked string, is
+the intended normal path for conformance-based promotion.** This module
+does the real verification work Phase 7.2 always deferred, then calls
+the Phase 7.2 primitive with a concrete, checked `run_id` as
+`evidence_ref` — the primitive is never bypassed, only fronted by a
+gate that actually earns the right to call it.
+
+## What `promote_from_conformance` verifies before ever touching trust
+
+1. the run exists
+2. the run belongs to the exact `worker_id` being promoted
+3. the run belongs to the exact `role` being promoted
+4. the run is finalized (not `RUNNING`)
+5. the run's status is `PASSED`
+6. every required case (`workers.conformance.REQUIRED_CASES`) has a
+   recorded result in *this* run
+7. every required case's recorded result is `passed`
+8. the run has not been invalidated — Phase 7.3 has no separate
+   invalidation flag or mechanism (a finalized run cannot be silently
+   rewritten — see `worker_conformance_runs_no_mutate_finalized` — so a
+   run's own durable `status` *is* its complete validity record; a
+   future phase that needs to invalidate historical evidence without
+   lying about what happened would add a new, separately durable event
+   referencing this `run_id`, never a mutation of it)
+9. the requested scope is one the suite actually tested: the run's
+   `suite_version` matches this code's current `conformance.
+   SUITE_VERSION`, and `capability` (if given) does not name a mutating
+   tool capability — nothing in the fixed Phase 7.3 suite ever tests
+   mutation (`docs/CODE_SLAYER_VISION.md` §37 isolation doesn't exist
+   yet), so a mutating scope is refused outright, never granted merely
+   because a read-only suite happened to pass
+
+Only once every check above holds does this call the Phase 7.2
+primitive at all.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+from code_slayer.store.conformance_repo import ConformanceRepo, ConformanceRunStatus
+from code_slayer.tools.registry import CAPABILITIES
+from code_slayer.workers.conformance import REQUIRED_CASES, SUITE_VERSION
+from code_slayer.workers.trust import TrustResult, WorkerTrustManager
+
+
+def _deny(reason: str) -> TrustResult:
+    return TrustResult(False, reason)
+
+
+def _is_mutating_capability(capability: str | None) -> bool:
+    if capability is None:
+        return False
+    spec = CAPABILITIES.get(capability)
+    return spec is not None and spec.mutation
+
+
+def promote_from_conformance(
+    conn: sqlite3.Connection, *, worker_id: str, role: str, capability: str | None = None,
+    run_id: str, reason: str = "conformance_suite_passed",
+) -> TrustResult:
+    """Verify `run_id` is genuine, complete, passing evidence for exactly
+    `(worker_id, role)` before invoking `WorkerTrustManager.
+    promote_to_guarded()` with it. See the module docstring for the full
+    ordered check list; any failure denies before trust is ever touched."""
+    if not isinstance(worker_id, str) or not worker_id:
+        return _deny("malformed_promotion_request")
+    if not isinstance(role, str) or not role:
+        return _deny("malformed_promotion_request")
+    if capability is not None and (not isinstance(capability, str) or not capability):
+        return _deny("malformed_promotion_request")
+    if not isinstance(run_id, str) or not run_id:
+        return _deny("malformed_promotion_request")
+
+    if _is_mutating_capability(capability):
+        return _deny("mutation_capability_not_conformance_tested")
+
+    run = ConformanceRepo(conn).get_run(run_id)
+    if run is None:
+        return _deny("unknown_conformance_run")
+    if run.worker_id != worker_id:
+        return _deny("run_belongs_to_different_worker")
+    if run.role != role:
+        return _deny("run_belongs_to_different_role")
+    if run.status == ConformanceRunStatus.RUNNING:
+        return _deny("run_not_finalized")
+    if run.status != ConformanceRunStatus.PASSED:
+        return _deny("run_not_passed")
+    if run.suite_version != SUITE_VERSION:
+        return _deny("run_suite_version_outdated")
+
+    results = ConformanceRepo(conn).list_results(run_id)
+    passed_cases = {r.case_name for r in results if r.passed}
+    if not REQUIRED_CASES.issubset(passed_cases):
+        return _deny("required_conformance_cases_missing_or_failed")
+
+    return WorkerTrustManager(conn).promote_to_guarded(
+        worker_id=worker_id, role=role, capability=capability,
+        reason=reason, evidence_ref=run_id,
+    )
