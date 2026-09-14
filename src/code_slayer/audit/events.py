@@ -61,6 +61,15 @@ class EventType(StrEnum):
     # system-level event with no task to attribute it to yet.
     JOB_WORKTREE_CREATED = "JOB_WORKTREE_CREATED"
     JOB_WORKTREE_RELEASED = "JOB_WORKTREE_RELEASED"
+    # Phase 7.6: durable provenance for one Prompt Analyst / Question
+    # Gate decision (`workers.prompt_provenance`) -- the small,
+    # structured facts a later query needs (content hashes, the gate's
+    # decision, which ambiguities were asked/suppressed and why), never
+    # the raw prompt/analysis text itself, which lives in `content_blobs`
+    # instead. `task_id` may be `None`: a prompt can be analyzed before a
+    # task formally exists.
+    PROMPT_ANALYSIS_RECORDED = "PROMPT_ANALYSIS_RECORDED"
+    QUESTION_GATE_DECISION = "QUESTION_GATE_DECISION"
     LEASE_ACQUIRED = "LEASE_ACQUIRED"
     LEASE_RENEWED = "LEASE_RENEWED"
     LEASE_QUIESCING = "LEASE_QUIESCING"

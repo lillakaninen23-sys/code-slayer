@@ -1,8 +1,10 @@
 """The provider-independent worker protocol boundary, durable worker
-trust, durable worker conformance, the first real worker adapter, and
-the first real qualified-worker execution path (Phase 7.1/7.2/7.3/
-7.4a/7.4b/7.4c/7.4h/7.5a — `docs/ROADMAP.md#local-worker-runtime`,
-`docs/CODE_SLAYER_VISION.md` §40-43, §58).
+trust, durable worker conformance, the first real worker adapter, the
+first real qualified-worker execution path, and the Prompt Analyst /
+Question Gate (Phase 7.1/7.2/7.3/7.4a/7.4b/7.4c/7.4h/7.5a/7.5b/7.6 —
+`docs/ROADMAP.md#local-worker-runtime`, `docs/CODE_SLAYER_VISION.md`
+§32-33, §40-43, §58). Isolated job worktrees (Phase 7.5c) live in
+`repo.job_worktree`, outside this package.
 
 Phase 7.1 establishes the model/protocol boundary: immutable request/
 response structures, the minimal `WorkerAdapter` interface, strict
@@ -45,10 +47,19 @@ own `output_hash` from the same content-addressed evidence store,
 instead of the original approach of independently reopening the
 repository file a second time afterward — closing a TOCTOU/provenance
 gap without weakening or duplicating `ToolExecutor`'s own authority; see
-`workers.execution`'s module docstring. Still without job-worktree
-mutation, mutation-capability trust, `AUTO` trust, or Prompt Analyst/
-Question Gate; see `docs/ROADMAP.md`'s Local Worker Runtime stage for
-what remains deferred."""
+`workers.execution`'s module docstring. Phase 7.6 adds the Prompt
+Analyst (`workers.prompt_analysis`) and Question Gate (`workers.
+question_gate`): a provider-neutral, deterministic-first structured
+analysis of the original user prompt, and a pure `SUPPRESS`/`ASK`
+decision built only from the exact original prompt, that analysis, and
+explicit deterministic evidence — never from a model's own claim or
+model consensus. `workers.prompt_provenance` durably records a decision
+already made, reusing `ContentStore`/`AuditWriter`, no schema migration.
+Neither component can mutate files, execute tools, bypass `PolicyEngine`,
+or grant trust; this phase does not yet wire either into a real task
+runner (`docs/ROADMAP.md`'s Local Worker Runtime stage, step 5) — that
+integration, along with `AUTO` trust and mutation-capability trust, is
+still deferred."""
 
 from code_slayer.store.conformance_repo import ConformanceRunStatus
 from code_slayer.store.worker_trust_repo import TrustLevel
@@ -59,11 +70,26 @@ from code_slayer.workers.conformance import (
 )
 from code_slayer.workers.execution import TurnOutcome, execute_guarded_turn
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter, FakeWorkerAdapterError
+from code_slayer.workers.fake_prompt_analyst import (
+    FakePromptAnalyst,
+    FakePromptAnalystError,
+)
 from code_slayer.workers.openai_compatible_adapter import (
     OpenAICompatibleAdapter,
     OpenAICompatibleConfig,
 )
 from code_slayer.workers.promotion import promote_from_conformance
+from code_slayer.workers.prompt_analysis import (
+    Ambiguity,
+    AmbiguityRiskClass,
+    EvidenceContext,
+    EvidenceItem,
+    EvidenceSource,
+    PromptAnalysis,
+    PromptAnalyst,
+    hash_original_prompt,
+)
+from code_slayer.workers.prompt_provenance import PromptProvenance, record_prompt_analysis
 from code_slayer.workers.protocol import (
     ToolRequirement,
     WorkerAdapter,
@@ -79,16 +105,30 @@ from code_slayer.workers.protocol_validation import (
     ValidationResult,
     validate_response,
 )
+from code_slayer.workers.question_gate import GateDecision, QuestionGate, QuestionGateResult
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
 
 __all__ = [
+    "Ambiguity",
+    "AmbiguityRiskClass",
     "CaseKind",
     "ConformanceRunStatus",
     "ConformanceSuiteResult",
+    "EvidenceContext",
+    "EvidenceItem",
+    "EvidenceSource",
+    "FakePromptAnalyst",
+    "FakePromptAnalystError",
     "FakeWorkerAdapter",
     "FakeWorkerAdapterError",
+    "GateDecision",
     "OpenAICompatibleAdapter",
     "OpenAICompatibleConfig",
+    "PromptAnalysis",
+    "PromptAnalyst",
+    "PromptProvenance",
+    "QuestionGate",
+    "QuestionGateResult",
     "ToolRequirement",
     "TrustLevel",
     "TrustResult",
@@ -104,7 +144,9 @@ __all__ = [
     "WorkerToolResult",
     "WorkerTrustManager",
     "execute_guarded_turn",
+    "hash_original_prompt",
     "promote_from_conformance",
+    "record_prompt_analysis",
     "run_conformance_suite",
     "validate_response",
 ]
