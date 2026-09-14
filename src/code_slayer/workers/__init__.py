@@ -1,6 +1,6 @@
 """The provider-independent worker protocol boundary, durable worker
 trust, durable worker conformance, and the first real worker adapter
-(Phase 7.1/7.2/7.3/7.4a — `docs/ROADMAP.md#local-worker-runtime`,
+(Phase 7.1/7.2/7.3/7.4a/7.4b — `docs/ROADMAP.md#local-worker-runtime`,
 `docs/CODE_SLAYER_VISION.md` §40-43, §58).
 
 Phase 7.1 establishes the model/protocol boundary: immutable request/
@@ -14,10 +14,16 @@ route, not `WorkerTrustManager.promote_to_guarded` with a hand-picked
 string. Phase 7.4a adds `OpenAICompatibleAdapter`, the first real
 (non-fake) `WorkerAdapter` — a provider-neutral HTTP client for any
 local OpenAI-compatible chat-completions endpoint, still read-only,
-still starting every worker `LOCKED`. Still without job-worktree
-mutation, mutation-capability trust, `AUTO` trust, or Prompt Analyst/
-Question Gate; see `docs/ROADMAP.md`'s Local Worker Runtime stage for
-what remains deferred."""
+still starting every worker `LOCKED`. Phase 7.4b separates genuine
+worker-behavior conformance (what `run_conformance_suite()` now
+executes and what promotion can be earned from) from Code Slayer's own
+safety-regression checks (malformed-protocol rejection, timeout
+containment), which remain fully tested but no longer require a
+healthy real worker to misbehave on demand — see `workers.conformance`'s
+module docstring. Still without job-worktree mutation,
+mutation-capability trust, `AUTO` trust, or Prompt Analyst/Question
+Gate; see `docs/ROADMAP.md`'s Local Worker Runtime stage for what
+remains deferred."""
 
 from code_slayer.store.conformance_repo import ConformanceRunStatus
 from code_slayer.store.worker_trust_repo import TrustLevel

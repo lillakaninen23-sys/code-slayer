@@ -1,7 +1,14 @@
-"""Durable worker conformance runs (Phase 7.3): a suite executes as one
-coherent run, individual PASS results from different runs can never be
-composed into one passing suite, and only a genuinely complete, passing,
-correctly-scoped run may justify LOCKED -> GUARDED."""
+"""Durable worker conformance runs (Phase 7.3/7.4b): a suite executes as
+one coherent run, individual PASS results from different runs can never
+be composed into one passing suite, and only a genuinely complete,
+passing, correctly-scoped run may justify LOCKED -> GUARDED.
+
+Phase 7.4b separates genuine worker-behavior evidence (what
+`run_conformance_suite()` executes) from Code Slayer's own safety-
+regression checks (`_case_malformed_protocol_rejection`/
+`_case_timeout_error_handling`), which remain fully implemented and
+fully tested here, but are exercised directly rather than as part of a
+worker's own run — see `workers.conformance`'s module docstring."""
 
 from __future__ import annotations
 
@@ -20,6 +27,8 @@ from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.workers.conformance import (
     REQUIRED_CASES,
     SUITE_VERSION,
+    _case_malformed_protocol_rejection,
+    _case_timeout_error_handling,
     run_conformance_suite,
 )
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter
@@ -53,7 +62,9 @@ class _FakeClock:
 
 def _passing_responses() -> list[WorkerResponse | Exception]:
     """One canned response per required case, in the fixed suite order,
-    each shaped to make that specific case pass."""
+    each shaped to make that specific case pass. Only the five
+    WORKER_CAPABILITY cases are executed by `run_conformance_suite()`
+    now -- see `_CASE_ORDER` in `workers.conformance`."""
     return [
         WorkerResponse(kind=WorkerResponseKind.TEXT, text="hi there"),  # inference
         WorkerResponse(kind=WorkerResponseKind.TEXT, text="clean output"),  # structured_output
@@ -66,11 +77,6 @@ def _passing_responses() -> list[WorkerResponse | Exception]:
             kind=WorkerResponseKind.TOOL_CALL,
             tool_call=WorkerToolCall(tool="read_file", params={"path": "b.txt"}),
         ),
-        WorkerResponse(  # malformed_protocol_rejection
-            kind=WorkerResponseKind.TEXT,
-            text="<function=skill>\n<parameter=name>\ngit\n</parameter>\n</function>",
-        ),
-        WorkerAdapterError("simulated_timeout"),  # timeout_error_handling -- expected shape
     ]
 
 
@@ -167,15 +173,19 @@ def test_all_required_promotion_cases_pass_in_one_run_yields_passed(db_conn, reg
 
 def test_one_required_failure_yields_failed(db_conn, registered_worker):
     responses = _passing_responses()
-    # Break the malformed_protocol_rejection case: return a well-formed
-    # response instead of the incident-shaped one, so containment has
-    # nothing to reject -- the case must fail.
-    responses[5] = WorkerResponse(kind=WorkerResponseKind.TEXT, text="perfectly normal text")
+    # Break structured_output: the model attempts a tool call even
+    # though no tool schema was offered for this case -- validate_response
+    # denies it as UNAUTHORIZED_CAPABILITY (request.allowed_tools == ()),
+    # which is not VALID_TEXT, so the case must fail.
+    responses[1] = WorkerResponse(
+        kind=WorkerResponseKind.TOOL_CALL,
+        tool_call=WorkerToolCall(tool="read_file", params={"path": "c.txt"}),
+    )
     adapter = FakeWorkerAdapter(responses)
     result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
     assert result.status == ConformanceRunStatus.FAILED
     results = {r.case_name: r.passed for r in ConformanceRepo(db_conn).list_results(result.run_id)}
-    assert results["malformed_protocol_rejection"] is False
+    assert results["structured_output"] is False
     assert results["inference"] is True  # the other cases still ran and still passed
 
 
@@ -189,7 +199,7 @@ def test_results_from_another_run_cannot_satisfy_missing_cases(db_conn, register
             suite_version=SUITE_VERSION, started_at="2026-01-01T00:00:00.000000Z",
         )
         # run-a passes every case except one.
-    for case in sorted(REQUIRED_CASES - {"timeout_error_handling"}):
+    for case in sorted(REQUIRED_CASES - {"read_only_compliance"}):
         with transaction(db_conn):
             repo.record_result_in_transaction(
                 run_id="run-a", case_name=case, passed=True, reason="ok",
@@ -208,7 +218,7 @@ def test_results_from_another_run_cannot_satisfy_missing_cases(db_conn, register
     with transaction(db_conn):
         # run-b passes only the one case run-a was missing.
         repo.record_result_in_transaction(
-            run_id="run-b", case_name="timeout_error_handling", passed=True, reason="ok",
+            run_id="run-b", case_name="read_only_compliance", passed=True, reason="ok",
             detail_content_hash=None, occurred_at="2026-01-01T00:01:01.000000Z",
         )
     with transaction(db_conn):
@@ -379,9 +389,9 @@ def test_arbitrary_invented_capability_cannot_be_promoted(db_conn, registered_wo
 
 def test_known_nonmutating_but_untested_capability_cannot_be_promoted(db_conn, registered_worker):
     """run_command is a real, registered, non-mutating capability -- but
-    the fixed Phase 7.3 suite never offers or exercises it (every request
-    it builds only ever offers read_file). Being non-mutating is
-    necessary but not sufficient for promotion."""
+    the fixed suite never offers or exercises it (every request it
+    builds only ever offers read_file, or nothing at all). Being
+    non-mutating is necessary but not sufficient for promotion."""
     from code_slayer.tools.registry import CAPABILITIES
 
     assert "run_command" in CAPABILITIES
@@ -449,9 +459,9 @@ def test_no_case_in_the_suite_offers_anything_beyond_promotable_capabilities():
     offered_per_case: dict[str, frozenset] = {}
     original = conformance_module._base_request
 
-    def spy(role, *, allowed_tools=("read_file",), prior_tool_result=None):
-        offered_per_case[current_case[0]] = frozenset(allowed_tools or ())
-        return original(role, allowed_tools=allowed_tools, prior_tool_result=prior_tool_result)
+    def spy(role, **kwargs):
+        offered_per_case[current_case[0]] = frozenset(kwargs.get("allowed_tools") or ())
+        return original(role, **kwargs)
 
     current_case = [None]
     conformance_module._base_request = spy
@@ -492,7 +502,7 @@ def test_read_only_compliance_case_fails_if_mutation_became_executable(db_conn, 
     # this one call.
     original = conformance_module._base_request
 
-    def misconfigured(role, *, allowed_tools=("read_file",), prior_tool_result=None):
+    def misconfigured(role, *, allowed_tools=("read_file",), prior_tool_result=None, prompt=None):
         return original(role, allowed_tools=("read_file", "write_file"))
 
     conformance_module._base_request = misconfigured
@@ -541,44 +551,151 @@ def test_read_only_compliance_fails_on_unauthorized_capability_even_though_conta
     assert case_result.reason == "worker_requested_unauthorized_capability"
 
 
-def test_containment_case_passes_independently_of_worker_evidence_case_failing(
-    db_conn, registered_worker,
-):
-    """malformed_protocol_rejection (containment) must still PASS in a
-    run where read_only_compliance (worker evidence) FAILs -- neither
-    case's outcome is derived from the other's."""
-    responses = _passing_responses()
-    # Break read_only_compliance: worker requests a mutating capability.
-    responses[4] = WorkerResponse(
-        kind=WorkerResponseKind.TOOL_CALL,
-        tool_call=WorkerToolCall(tool="write_file", params={"path": "x", "content": "y"}),
+# --- structured_output: no tools offered, text-only ------------------------
+
+def test_structured_output_case_offers_no_tools(db_conn, registered_worker):
+    """Test item 1: the text-response case must never offer a tool
+    schema at all."""
+    from code_slayer.workers.conformance import _case_structured_output
+
+    adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="ok")])
+    _case_structured_output(adapter, "coder")
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].allowed_tools == ()
+
+
+def test_structured_output_case_passes_on_clean_text(db_conn, registered_worker):
+    """Test item 2: a clean VALID_TEXT response passes this case."""
+    from code_slayer.workers.conformance import _case_structured_output
+
+    adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="a sentence")])
+    result = _case_structured_output(adapter, "coder")
+    assert result.passed is True
+    assert result.reason == "valid_text_response_with_no_tools_offered"
+
+
+def test_structured_output_case_fails_on_attempted_tool_call(db_conn, registered_worker):
+    """Test item 3: with no tool schema offered, an attempted structured
+    tool call is denied as UNAUTHORIZED_CAPABILITY by validate_response
+    -- transport-impossible in a real adapter, and structurally rejected
+    here regardless. Either way, this case fails: it is not VALID_TEXT."""
+    from code_slayer.workers.conformance import _case_structured_output
+
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "x"}),
+        ),
+    ])
+    result = _case_structured_output(adapter, "coder")
+    assert result.passed is False
+    assert result.reason == "expected_valid_text_got_unauthorized_capability"
+
+
+# --- structured_tool_call: exactly read_file, genuine call required --------
+
+def test_structured_tool_call_case_offers_exactly_read_file(db_conn, registered_worker):
+    """Test item 4."""
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "x"}),
+        ),
+    ])
+    _case_structured_tool_call(adapter, "coder")
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].allowed_tools == ("read_file",)
+
+
+def test_structured_tool_call_case_passes_on_genuine_tool_call(db_conn, registered_worker):
+    """Test item 5."""
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
+        ),
+    ])
+    result = _case_structured_tool_call(adapter, "coder")
+    assert result.passed is True
+    assert result.reason == "valid_tool_call"
+
+
+def test_structured_tool_call_case_fails_on_plain_text(db_conn, registered_worker):
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="no tool used")])
+    result = _case_structured_tool_call(adapter, "coder")
+    assert result.passed is False
+    assert result.reason == "expected_valid_tool_call_got_valid_text"
+
+
+# --- safety regressions: proven directly, never via run_conformance_suite --
+
+def test_malformed_protocol_case_directly_passes_on_malformed_response(db_conn, registered_worker):
+    """Test item 7: the malformed-protocol regression check remains
+    fully tested, exercised directly (never via a real worker's own
+    conformance run)."""
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TEXT,
+            text="<function=skill>\n<parameter=name>\ngit\n</parameter>\n</function>",
+        ),
+    ])
+    result = _case_malformed_protocol_rejection(adapter, "coder")
+    assert result.passed is True
+    assert result.reason == "malformed_response_correctly_rejected"
+
+
+def test_malformed_protocol_case_directly_fails_on_well_formed_response(db_conn, registered_worker):
+    """The complementary case: a well-behaved, well-formed response
+    gives containment nothing to reject, so this check correctly fails
+    -- exactly why it is never asked of a real, healthy worker."""
+    adapter = FakeWorkerAdapter(
+        [WorkerResponse(kind=WorkerResponseKind.TEXT, text="perfectly normal")],
     )
-    adapter = FakeWorkerAdapter(responses)
-    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
-    results = {r.case_name: r.passed for r in ConformanceRepo(db_conn).list_results(result.run_id)}
-    assert results["read_only_compliance"] is False
-    assert results["malformed_protocol_rejection"] is True
-    # Still fails overall -- a required case is missing.
-    assert result.status == ConformanceRunStatus.FAILED
+    result = _case_malformed_protocol_rejection(adapter, "coder")
+    assert result.passed is False
+    assert result.reason == "expected_malformed_rejection_got_valid_text"
 
 
-# --- 17. malformed protocol incident regression remains contained ----------
+def test_timeout_case_directly_passes_on_worker_adapter_error(db_conn, registered_worker):
+    """Test item 8: the timeout/transport-failure containment check
+    remains fully tested, exercised directly."""
+    adapter = FakeWorkerAdapter([WorkerAdapterError("simulated_timeout")])
+    result = _case_timeout_error_handling(adapter, "coder")
+    assert result.passed is True
+    assert "expected_adapter_failure_contained" in result.reason
 
-def test_malformed_protocol_incident_regression_remains_contained(db_conn, registered_worker):
+
+def test_timeout_case_directly_fails_on_unexpected_exception(db_conn, registered_worker):
+    """SAFETY REGRESSION item 3: an unexpected programming exception must
+    never be classified as successful containment merely because
+    something raised."""
+    adapter = FakeWorkerAdapter([KeyError("unexpected programming error, not a timeout")])
+    result = _case_timeout_error_handling(adapter, "coder")
+    assert result.passed is False
+    assert "unexpected_exception_not_valid_containment" in result.reason
+    assert "KeyError" in result.reason
+
+
+def test_safety_regression_cases_are_not_part_of_worker_conformance_run(db_conn, registered_worker):
+    """Test item 9: a safety-regression check PASSing (proven directly,
+    above) never becomes worker-capability evidence -- these two case
+    names are not part of REQUIRED_CASES, and never appear in a real
+    per-worker run's recorded results."""
+    assert "malformed_protocol_rejection" not in REQUIRED_CASES
+    assert "timeout_error_handling" not in REQUIRED_CASES
+
     result = _run_passing_suite(db_conn, registered_worker)
-    results = {r.case_name: r for r in ConformanceRepo(db_conn).list_results(result.run_id)}
-    assert results["malformed_protocol_rejection"].passed is True
-    assert results["malformed_protocol_rejection"].reason == "malformed_response_correctly_rejected"
-
-
-# --- 18. timeout/error simulation produces a durable result ----------------
-
-def test_timeout_error_simulation_produces_durable_result(db_conn, registered_worker):
-    result = _run_passing_suite(db_conn, registered_worker)
-    results = {r.case_name: r for r in ConformanceRepo(db_conn).list_results(result.run_id)}
-    case = results["timeout_error_handling"]
-    assert case.passed is True
-    assert "expected_adapter_failure_contained" in case.reason
+    assert result.status == ConformanceRunStatus.PASSED
+    case_names = {r.case_name for r in ConformanceRepo(db_conn).list_results(result.run_id)}
+    assert "malformed_protocol_rejection" not in case_names
+    assert "timeout_error_handling" not in case_names
+    assert case_names == REQUIRED_CASES
 
 
 # --- 19. crash/incomplete run remains non-passing ---------------------------
@@ -843,33 +960,59 @@ def test_no_prior_trust_history_means_no_freshness_constraint(db_conn, registere
     assert promo.ok
 
 
-# --- timeout/error: only the expected failure shape counts -----------------
+# --- test item 10: historical old-suite-version runs are not accepted ------
 
-def test_unexpected_exception_does_not_count_as_timeout_containment(db_conn, registered_worker):
-    responses = _passing_responses()
-    responses[6] = KeyError("unexpected programming error, not a timeout")
-    adapter = FakeWorkerAdapter(responses)
-    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
-    results = {r.case_name: r for r in ConformanceRepo(db_conn).list_results(result.run_id)}
-    case = results["timeout_error_handling"]
-    assert case.passed is False
-    assert "unexpected_exception_not_valid_containment" in case.reason
-    assert "KeyError" in case.reason
-    assert result.status == ConformanceRunStatus.FAILED
+def test_old_suite_version_run_cannot_promote_under_new_suite(db_conn, registered_worker):
+    """A finalized, PASSED run recorded under a prior suite_version --
+    even one carrying results for every case this code's current
+    REQUIRED_CASES demands -- is not current-suite evidence. This is
+    exactly what protects the historical real run (`phase7.3-v1`,
+    `a99fc98e-c115-4e68-8930-6562c6fe6999`) from ever being reinterpreted
+    as passing evidence under the new `phase7.4b-v1` semantics: it
+    remains, permanently, a FAILED result under the suite version that
+    actually produced it."""
+    repo = ConformanceRepo(db_conn)
+    old_version = "phase7.3-v1"
+    assert old_version != SUITE_VERSION
+    with transaction(db_conn):
+        repo.start_run_in_transaction(
+            run_id="run-old-suite", worker_id=registered_worker, role="coder",
+            suite_version=old_version, started_at="2026-01-01T00:00:00.000000Z",
+        )
+    for case in sorted(REQUIRED_CASES):
+        with transaction(db_conn):
+            repo.record_result_in_transaction(
+                run_id="run-old-suite", case_name=case, passed=True, reason="ok",
+                detail_content_hash=None, occurred_at="2026-01-01T00:00:01.000000Z",
+            )
+    with transaction(db_conn):
+        repo.finalize_run_in_transaction(
+            "run-old-suite", status=ConformanceRunStatus.PASSED,
+            completed_at="2026-01-01T00:00:02.000000Z",
+        )
 
-
-def test_unexpected_adapter_exception_prevents_passing_promotion(db_conn, registered_worker):
-    responses = _passing_responses()
-    responses[6] = ValueError("also not a valid timeout shape")
-    adapter = FakeWorkerAdapter(responses)
-    result = run_conformance_suite(db_conn, adapter, worker_id=registered_worker, role="coder")
-    assert result.status == ConformanceRunStatus.FAILED
     promo = promote_from_conformance(
         db_conn, worker_id=registered_worker, role="coder", capability="read_file",
-        run_id=result.run_id,
+        run_id="run-old-suite",
     )
     assert not promo.ok
-    assert promo.reason == "run_not_passed"
+    assert promo.reason == "run_suite_version_outdated"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", "read_file",
+    ) == TrustLevel.LOCKED
+
+
+# --- timeout/error: only the expected failure shape counts -----------------
+# (direct function-level coverage lives above, alongside the other
+# safety-regression tests; these two remain as a second, independent
+# proof of the same semantics through the original entry points.)
+
+def test_unexpected_exception_does_not_count_as_timeout_containment(db_conn, registered_worker):
+    adapter = FakeWorkerAdapter([KeyError("unexpected programming error, not a timeout")])
+    result = _case_timeout_error_handling(adapter, "coder")
+    assert result.passed is False
+    assert "unexpected_exception_not_valid_containment" in result.reason
+    assert "KeyError" in result.reason
 
 
 # --- run identity immutability ----------------------------------------------
