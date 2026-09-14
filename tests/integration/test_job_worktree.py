@@ -513,6 +513,132 @@ def test_cleanup_refuses_content_owned_after_the_latest_checkpoint(job):
     assert handle.path.exists()
 
 
+# --- Git-level dirtiness: an independent fail-safe over real on-disk state -
+
+@pytest.fixture
+def checkpointed(job):
+    """A job worktree carrying one real checkpointed mutation, its task
+    already driven to COMPLETED and its lease released -- the point at
+    which the existing (bookkeeping-only) checks would already consider
+    cleanup safe. Each dirty-worktree test starts here and then disturbs
+    the actual working tree in some way the bookkeeping never sees."""
+    from code_slayer.lease.manager import LeaseManager
+
+    primary, handle, conn, task_id, executor, lease = job
+    executor.execute(
+        task_id, ToolRequest(tool="create_file", path="checked.txt", content=b"checkpoint me"),
+    )
+    _to_ready_for_checkpoint(conn, task_id)
+    manager = CheckpointManager(
+        conn, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir, lease=lease,
+    )
+    checkpointed_result = manager.create(task_id)
+    assert checkpointed_result.operation_status == OperationStatus.SUCCEEDED
+    TaskStateMachine(conn).transition(
+        task_id, expected_state=TaskState.CHECKPOINTED, to_state=TaskState.COMPLETED,
+        reason="done", completion_decision=True,
+    )
+    LeaseManager(conn).release(lease)
+    return primary, handle, conn
+
+
+def test_clean_checkpointed_worktree_can_still_be_released(checkpointed):
+    """The baseline this whole section disturbs from: with nothing
+    touched after the checkpoint, cleanup must still succeed."""
+    _primary, handle, _conn = checkpointed
+    result = release_job_worktree(handle)
+    assert result.ok
+    assert not handle.path.exists()
+
+
+def test_modified_tracked_file_after_checkpoint_refuses_cleanup(checkpointed):
+    primary, handle, _conn = checkpointed
+    del primary
+    (handle.path / "checked.txt").write_bytes(b"modified after the checkpoint")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+
+
+def test_deleted_tracked_file_after_checkpoint_refuses_cleanup(checkpointed):
+    _primary, handle, _conn = checkpointed
+    (handle.path / "checked.txt").unlink()
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+
+
+def test_staged_change_after_checkpoint_refuses_cleanup(checkpointed):
+    _primary, handle, _conn = checkpointed
+    (handle.path / "checked.txt").write_bytes(b"staged content")
+    git(handle.path, "add", "checked.txt")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+
+
+def test_untracked_file_after_checkpoint_refuses_cleanup(checkpointed):
+    _primary, handle, _conn = checkpointed
+    (handle.path / "untracked-after-checkpoint.txt").write_text("surprise\n")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+
+
+def test_out_of_band_file_absent_from_task_owned_paths_still_refuses(checkpointed):
+    """The exact finding this hardening addresses: a file that Code
+    Slayer's own bookkeeping (`task_owned_paths`) never heard about at
+    all -- written directly to the filesystem, not through
+    `ToolExecutor` -- must still block cleanup."""
+    _primary, handle, conn = checkpointed
+    (handle.path / "human-was-here.txt").write_text("a human, not ToolExecutor\n")
+
+    owned = {row["path"] for row in conn.execute(
+        "SELECT path FROM task_owned_paths WHERE deleted = 0",
+    )}
+    assert "human-was-here.txt" not in owned  # confirms the bookkeeping truly never saw it
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+
+
+def test_dirty_worktree_refusal_leaves_worktree_and_state_intact(checkpointed):
+    _primary, handle, conn = checkpointed
+    (handle.path / "untracked-after-checkpoint.txt").write_text("surprise\n")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+
+    assert handle.path.exists()
+    assert (handle.path / "checked.txt").read_bytes() == b"checkpoint me"
+    assert (handle.path / "untracked-after-checkpoint.txt").exists()
+    assert handle.state_dir.exists()
+    assert handle.db_path.exists()
+    # The durable checkpoint evidence itself is untouched.
+    rows = conn.execute("SELECT status FROM checkpoints").fetchall()
+    assert [row["status"] for row in rows] == ["COMPLETE"]
+
+
+def test_dirty_worktree_refusal_leaves_primary_untouched(checkpointed):
+    primary, handle, _conn = checkpointed
+    before_head = git(primary, "rev-parse", "HEAD")
+    before_index = git(primary, "ls-files", "--stage")
+    before_snapshot = working_tree_snapshot(primary)
+
+    (handle.path / "untracked-after-checkpoint.txt").write_text("surprise\n")
+    result = release_job_worktree(handle)
+    assert not result.ok
+
+    assert git(primary, "rev-parse", "HEAD") == before_head
+    assert git(primary, "ls-files", "--stage") == before_index
+    assert working_tree_snapshot(primary) == before_snapshot
+
+
 def test_cleanup_refuses_when_state_setup_incomplete(primary, tmp_path):
     """A handle whose database was never created (setup never completed)
     must refuse cleanup rather than guess."""

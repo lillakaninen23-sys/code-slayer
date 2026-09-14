@@ -107,10 +107,22 @@ bookkeeping managed to record.
 `release_job_worktree()` never deletes a job worktree unless it can
 positively confirm, from durable evidence, that doing so loses nothing:
 no active/quiescing lease, no unresolved (`STARTED`/`UNKNOWN`) tool
-operation, no non-terminal task, and no task-owned path that was never
-covered by at least one durable checkpoint. Any of those — or simply not
-yet being able to determine them (e.g. the job's own database was never
-successfully created) — is a refusal, not a best-effort guess. Even a
+operation, no non-terminal task, no task-owned path that was never
+covered by at least one durable checkpoint (Code-Slayer-owned
+bookkeeping) — **and**, independently, that the ACTUAL on-disk working
+tree exactly matches the latest checkpoint's tree (or the pinned
+`base_revision`, if none exists yet), via real Git plumbing
+(`job_worktree_git.worktree_status()`), never a filesystem diff this
+module invents. That last check is a deliberate, independent fail-safe:
+the bookkeeping checks alone only know what Code Slayer itself recorded
+as owned, so a human debugging the worktree, another process, or a
+future bug could otherwise leave a modified/deleted/staged/untracked
+change entirely invisible to them. Neither check is redundant with the
+other — see `release_job_worktree()`'s own docstring for the case each
+one catches that the other does not. Any refusal condition — or simply
+not yet being able to determine one safely (e.g. the job's own database
+was never successfully created, or the Git cleanliness check itself
+could not run) — is a refusal, not a best-effort guess. Even a
 successful cleanup only removes the disposable Git working tree itself
 (`job_worktree_git.remove_worktree()`); the job's own `state.db`/`blobs/`
 audit trail is deliberately left in place as a historical record, never
@@ -367,6 +379,22 @@ def _has_uncheckpointed_ownership(conn: sqlite3.Connection, worktree_id: str) ->
     return False
 
 
+def _latest_checkpoint_tree(conn: sqlite3.Connection, worktree_id: str) -> str | None:
+    """The `tree_sha` of the most recently created durable checkpoint
+    across every task that has ever run against `worktree_id`, or `None`
+    if none exists yet. Read via a plain SQL join rather than
+    `CheckpointRepo` (which is scoped to one task_id at a time) because a
+    worktree may have had more than one terminal task over its lifetime."""
+    row = conn.execute(
+        "SELECT c.verified_json FROM checkpoints c JOIN tasks t ON c.task_id = t.task_id "
+        "WHERE t.worktree_id = ? AND c.status = 'COMPLETE' ORDER BY c.created_at DESC LIMIT 1",
+        (worktree_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row["verified_json"])["tree_sha"]
+
+
 def release_job_worktree(handle: JobWorktree) -> CleanupResult:
     """Remove the disposable Git working tree at `handle.path` — never
     `handle.state_dir` itself (the `state.db`/`blobs/` audit trail is
@@ -377,10 +405,30 @@ def release_job_worktree(handle: JobWorktree) -> CleanupResult:
     - no unresolved (`STARTED`/`UNKNOWN`) tool operation for it
     - no non-terminal task currently using it
     - no task-owned path that was never covered by at least one durable
-      checkpoint
+      checkpoint (`_has_uncheckpointed_ownership()` — Code-Slayer-owned
+      bookkeeping)
+    - the ACTUAL, on-disk working tree exactly matches the most recent
+      durable checkpoint's tree (or, if none exists yet, `handle.
+      base_revision`) — `job_worktree_git.worktree_status()`, real Git
+      plumbing, never this module's own filesystem diff. This is an
+      *independent* fail-safe from the bookkeeping check above: it also
+      catches a modified/deleted tracked file, a staged change, or an
+      untracked file that arrived through any means other than
+      `ToolExecutor` — a human debugging the worktree, another process,
+      a future bug — regardless of whether `task_owned_paths` ever heard
+      about it. Neither check subsumes the other (see `docs/JOB_WORKTREES.md`
+      for the full picture): the bookkeeping check can refuse when Code
+      Slayer's own ownership record disagrees with a
+      now-clean working tree (e.g. externally deleted again), and the
+      Git check can refuse when the working tree disagrees with a
+      pristine bookkeeping record. Shared Git object/ref additions (a
+      checkpoint commit reachable only from its own dedicated ref) are
+      never on-disk working-tree files and therefore never count as
+      dirtiness here.
 
     Any of those (or simply being unable to open the job's own database
-    at all, e.g. because setup never completed) is a refusal
+    at all, e.g. because setup never completed, or being unable to run
+    the Git cleanliness check at all) is a refusal
     (`CleanupResult(ok=False, reason=...)`), never a best-effort deletion.
     """
     if not handle.db_path.exists():
@@ -406,6 +454,18 @@ def release_job_worktree(handle: JobWorktree) -> CleanupResult:
 
         if _has_uncheckpointed_ownership(conn, handle.worktree_id):
             return CleanupResult(False, "uncheckpointed_changes")
+
+        target = _latest_checkpoint_tree(conn, handle.worktree_id) or handle.base_revision
+        handle.tmp_dir.mkdir(parents=True, exist_ok=True)
+        index_path = handle.tmp_dir / f"cleanup-status-{uuid.uuid4().hex}"
+        try:
+            dirty = jwg.worktree_status(handle.path, against=target, index_path=index_path)
+        except jwg.JobWorktreeGitError:
+            return CleanupResult(False, "git_worktree_status_unavailable")
+        finally:
+            index_path.unlink(missing_ok=True)
+        if dirty:
+            return CleanupResult(False, "git_worktree_dirty")
 
         jwg.remove_worktree(handle.path, cwd=handle.primary_repo_root, force=True)
         with transaction(conn):

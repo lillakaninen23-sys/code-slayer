@@ -109,12 +109,34 @@ worktree unless durable evidence positively confirms it is safe:
 
 - no active or quiescing lease for its `worktree_id`,
 - no unresolved (`STARTED`/`UNKNOWN`) tool operation,
-- no non-terminal task currently using it, and
+- no non-terminal task currently using it,
 - no task-owned path that was never covered by at least one durable
-  checkpoint.
+  checkpoint (Code-Slayer-owned bookkeeping: `task_owned_paths` /
+  `checkpoints`), and
+- **(cleanup-hardening follow-up)** the ACTUAL on-disk working tree
+  exactly matches the most recent durable checkpoint's tree — or, if
+  none exists yet, the pinned `base_revision` — checked with real Git
+  plumbing (`job_worktree_git.worktree_status()`, a `git read-tree` into
+  a private temporary index followed by `git status --porcelain=v2
+  --untracked-files=all`), never a filesystem diff this module invents.
 
-Any of those — or simply being unable to open the job's own database at
-all (setup never completed) — is a refusal
+The last check is a deliberate, independent fail-safe over the
+bookkeeping checks above it: `task_owned_paths` only knows what
+`ToolExecutor` itself recorded as owned, so a human debugging the
+worktree, another process, or a future bug could otherwise leave a
+modified file, a deleted file, a staged change, or an untracked file
+entirely invisible to the bookkeeping-only checks. Neither check
+subsumes the other: the bookkeeping check can refuse when Code Slayer's
+own ownership record disagrees with an (again) clean working tree (e.g.
+externally created content later externally deleted), and the Git check
+can refuse when the actual working tree disagrees with an otherwise
+pristine bookkeeping record. A shared Git object/ref addition (a
+checkpoint commit reachable only from its own dedicated ref) is not an
+on-disk working-tree file and is never itself reported as dirtiness.
+
+Any of those conditions — or simply being unable to open the job's own
+database at all (setup never completed), or being unable to run the Git
+cleanliness check at all — is a refusal
 (`CleanupResult(ok=False, reason=...)`), never a best-effort deletion.
 Even a successful cleanup only removes the disposable Git working tree
 itself; the job's own `state.db`/`blobs/` audit trail is deliberately
@@ -155,3 +177,12 @@ uncheckpointed owned content, then succeeding once none of those apply;
 and that a simulated setup failure after `git worktree add` leaves the
 worktree recoverable (visible in Git's own `git worktree list`) rather
 than silently discarded.
+
+The cleanup-hardening follow-up adds: a clean, checkpointed worktree
+still releases; a modified, deleted, staged, or untracked change made to
+the actual working tree *after* a checkpoint each independently refuses
+cleanup — including a file `task_owned_paths` never heard about at all,
+proving the Git-level check is not redundant with the bookkeeping check;
+a refusal from either check leaves the worktree, its state directory,
+and its checkpoint evidence completely intact; and the primary
+repository's `HEAD`/index/working tree remain untouched throughout.
