@@ -47,6 +47,13 @@ class EventType(StrEnum):
     WORKER_TRUST_CHANGED = "WORKER_TRUST_CHANGED"
     WORKER_CONFORMANCE_RUN_STARTED = "WORKER_CONFORMANCE_RUN_STARTED"
     WORKER_CONFORMANCE_RUN_FINALIZED = "WORKER_CONFORMANCE_RUN_FINALIZED"
+    # Phase 7.5a: attributes one bounded worker turn's protocol/trust
+    # decisions to worker_id/role/capability -- concepts ToolExecutor's
+    # own TOOL_REQUESTED/POLICY_EVALUATED/OPERATION_STARTED/
+    # OPERATION_FINISHED audit trail (unmodified) has no notion of. See
+    # `workers.execution`'s module docstring.
+    WORKER_TOOL_CALL_EVALUATED = "WORKER_TOOL_CALL_EVALUATED"
+    WORKER_TURN_FINISHED = "WORKER_TURN_FINISHED"
     LEASE_ACQUIRED = "LEASE_ACQUIRED"
     LEASE_RENEWED = "LEASE_RENEWED"
     LEASE_QUIESCING = "LEASE_QUIESCING"

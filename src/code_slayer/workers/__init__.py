@@ -1,7 +1,8 @@
 """The provider-independent worker protocol boundary, durable worker
-trust, durable worker conformance, and the first real worker adapter
-(Phase 7.1/7.2/7.3/7.4a/7.4b/7.4c/7.4h — `docs/ROADMAP.md
-#local-worker-runtime`, `docs/CODE_SLAYER_VISION.md` §40-43, §58).
+trust, durable worker conformance, the first real worker adapter, and
+the first real qualified-worker execution path (Phase 7.1/7.2/7.3/
+7.4a/7.4b/7.4c/7.4h/7.5a — `docs/ROADMAP.md#local-worker-runtime`,
+`docs/CODE_SLAYER_VISION.md` §40-43, §58).
 
 Phase 7.1 establishes the model/protocol boundary: immutable request/
 response structures, the minimal `WorkerAdapter` interface, strict
@@ -32,9 +33,15 @@ direct, provider-neutral imperative after diagnostic evidence showed
 the prior "Code Slayer conformance check: ..." framing measurably
 suppressed structured tool use on a real runtime that otherwise
 supports it reliably; see `workers.conformance`'s module docstring.
-Still without job-worktree mutation, mutation-capability trust, `AUTO`
-trust, or Prompt Analyst/Question Gate; see `docs/ROADMAP.md`'s Local
-Worker Runtime stage for what remains deferred."""
+Phase 7.5a adds `workers.execution.execute_guarded_turn`, the first
+path from a real, structurally-validated `WorkerToolCall` to the real
+`PolicyEngine`/`ToolExecutor` — bounded to one bounded turn, one
+capability (`read_file`), and only for a worker/role/capability scope
+that has already earned `GUARDED` trust through real conformance
+evidence; see `workers.execution`'s module docstring. Still without
+job-worktree mutation, mutation-capability trust, `AUTO` trust, or
+Prompt Analyst/Question Gate; see `docs/ROADMAP.md`'s Local Worker
+Runtime stage for what remains deferred."""
 
 from code_slayer.store.conformance_repo import ConformanceRunStatus
 from code_slayer.store.worker_trust_repo import TrustLevel
@@ -43,6 +50,7 @@ from code_slayer.workers.conformance import (
     ConformanceSuiteResult,
     run_conformance_suite,
 )
+from code_slayer.workers.execution import TurnOutcome, execute_guarded_turn
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter, FakeWorkerAdapterError
 from code_slayer.workers.openai_compatible_adapter import (
     OpenAICompatibleAdapter,
@@ -77,6 +85,7 @@ __all__ = [
     "ToolRequirement",
     "TrustLevel",
     "TrustResult",
+    "TurnOutcome",
     "ValidationOutcome",
     "ValidationResult",
     "WorkerAdapter",
@@ -87,6 +96,7 @@ __all__ = [
     "WorkerToolCall",
     "WorkerToolResult",
     "WorkerTrustManager",
+    "execute_guarded_turn",
     "promote_from_conformance",
     "run_conformance_suite",
     "validate_response",
