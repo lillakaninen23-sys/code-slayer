@@ -54,6 +54,13 @@ class EventType(StrEnum):
     # `workers.execution`'s module docstring.
     WORKER_TOOL_CALL_EVALUATED = "WORKER_TOOL_CALL_EVALUATED"
     WORKER_TURN_FINISHED = "WORKER_TURN_FINISHED"
+    # Phase 7.5c: an isolated, disposable job worktree's own lifecycle
+    # (`repo.job_worktree`) -- not scoped to any one task_id (a job
+    # worktree may exist before any task is created against it), so
+    # these are recorded with `task_id=None`, same as any other
+    # system-level event with no task to attribute it to yet.
+    JOB_WORKTREE_CREATED = "JOB_WORKTREE_CREATED"
+    JOB_WORKTREE_RELEASED = "JOB_WORKTREE_RELEASED"
     LEASE_ACQUIRED = "LEASE_ACQUIRED"
     LEASE_RENEWED = "LEASE_RENEWED"
     LEASE_QUIESCING = "LEASE_QUIESCING"
