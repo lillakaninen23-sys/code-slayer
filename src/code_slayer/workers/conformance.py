@@ -9,12 +9,23 @@ cannot declare which cases count toward its own conformance: `_CASE_ORDER`
 below is the complete, fixed vocabulary, defined here, not configurable
 per call.
 
-**Phase 7.3 executes against `FakeWorkerAdapter` only.** This module
-proves the orchestration — protocol → conformance → durable run/results
-→ promotion eligibility — end to end without any real model or network
-dependency; a real adapter is a strict drop-in for the `WorkerAdapter`
-protocol in a later phase, not something this module needs to change to
-support.
+**Phase 7.3 executes against `FakeWorkerAdapter` only; Phase 7.4a adds
+the first real adapter as a strict drop-in.** `run_conformance_suite()`
+is generic over any `WorkerAdapter` — no change was needed to support a
+real adapter for six of the seven cases. `timeout_error_handling` is the
+one honest exception: `FakeWorkerAdapter` demonstrates it with a canned
+exception queued at the right position in the *same* adapter instance,
+which has no equivalent for a real adapter that is, by construction,
+actually healthy and responding normally for every other case in the
+run. `run_conformance_suite()`'s optional `timeout_probe_adapter`
+parameter is the smallest correct accommodation: when given, it is used
+*only* for that one case, so a real run can supply a second adapter
+instance genuinely configured to fail (an impossibly short timeout, an
+unreachable port, ...) without needing the main run's own healthy
+endpoint to misbehave, and without changing anything about how
+`FakeWorkerAdapter`-based tests already work (the parameter defaults to
+`None`, which falls back to the main `adapter` — today's exact,
+unchanged behavior).
 
 ## Worker-evidence cases vs. containment/safety-regression cases
 
@@ -278,6 +289,7 @@ PROMOTABLE_CAPABILITIES = frozenset({"read_file"})
 
 def run_conformance_suite(
     conn, adapter: WorkerAdapter, *, worker_id: str, role: str, now_fn=utcnow_iso,
+    timeout_probe_adapter: WorkerAdapter | None = None,
 ) -> ConformanceSuiteResult:
     """Execute the complete fixed suite as one coherent run, durably.
 
@@ -287,7 +299,10 @@ def run_conformance_suite(
     however many results actually completed, never a fabricated verdict
     (`ConformanceRunStatus`/the `worker_conformance_runs_no_mutate_
     finalized` trigger together make a `RUNNING` row with incomplete
-    results structurally unable to read as `PASSED`)."""
+    results structurally unable to read as `PASSED`).
+
+    `timeout_probe_adapter`, when given, is used only for the
+    `timeout_error_handling` case — see the module docstring."""
     if WorkersRepo(conn).get(worker_id) is None:
         return ConformanceSuiteResult(False, "unknown_worker")
 
@@ -311,7 +326,10 @@ def run_conformance_suite(
 
     all_passed = True
     for case_name, _kind, run_case in _CASE_ORDER:
-        outcome = run_case(adapter, role)
+        case_adapter = adapter
+        if case_name == "timeout_error_handling" and timeout_probe_adapter is not None:
+            case_adapter = timeout_probe_adapter
+        outcome = run_case(case_adapter, role)
         with transaction(conn):
             repo.record_result_in_transaction(
                 run_id=run_id, case_name=case_name, passed=outcome.passed,
