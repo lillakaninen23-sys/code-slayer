@@ -66,6 +66,20 @@ module's docstring for the full investigation and mapping. No other
 case sets `tool_requirement`; `allowed_tools` being non-empty never, by
 itself, demands tool use.
 
+`SUITE_VERSION` is bumped to `phase7.4c-v1` for this: `structured_tool_
+call`'s request protocol materially changed (deterministic sampling, an
+explicit `tool_choice: "required"`), even though the case name, the
+overall case list, and the final `VALID_TOOL_CALL` pass condition are
+all unchanged — a persisted `suite_version` identifies the test
+protocol/semantics actually exercised, not merely which case names ran.
+The one live run generated under the new request semantics while still
+labeled `phase7.4b-v1` (`run_id ab801467-3c25-4bdc-adb3-0bff7faf91dd`)
+is therefore historical/ineligible evidence under either version now:
+`promote_from_conformance`'s `run.suite_version != SUITE_VERSION` gate
+refuses it going forward exactly as it already refuses every other
+prior-version run, and that row is never rewritten or relabeled — see
+`workers.promotion` and `docs/CODE_SLAYER_VISION.md` §58.
+
 ## Worker-evidence cases
 
 Every case in `_CASE_ORDER` is `WORKER_CAPABILITY` evidence: the case's
@@ -116,7 +130,7 @@ from code_slayer.workers.protocol import (
 )
 from code_slayer.workers.protocol_validation import ValidationOutcome, validate_response
 
-SUITE_VERSION = "phase7.4b-v1"
+SUITE_VERSION = "phase7.4c-v1"
 
 _PROMPT = "Code Slayer conformance check: respond appropriately to this fixed test prompt."
 

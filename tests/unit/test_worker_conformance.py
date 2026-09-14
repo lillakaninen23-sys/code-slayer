@@ -997,11 +997,13 @@ def test_old_suite_version_run_cannot_promote_under_new_suite(db_conn, registere
     """A finalized, PASSED run recorded under a prior suite_version --
     even one carrying results for every case this code's current
     REQUIRED_CASES demands -- is not current-suite evidence. This is
-    exactly what protects the historical real run (`phase7.3-v1`,
-    `a99fc98e-c115-4e68-8930-6562c6fe6999`) from ever being reinterpreted
-    as passing evidence under the new `phase7.4b-v1` semantics: it
-    remains, permanently, a FAILED result under the suite version that
-    actually produced it."""
+    exactly what protects every historical real run (`phase7.3-v1`'s
+    `a99fc98e-c115-4e68-8930-6562c6fe6999`, and `phase7.4b-v1`'s
+    `6761e00f-9ff5-4806-aabf-c5aafe2fcd6d`/
+    `ab801467-3c25-4bdc-adb3-0bff7faf91dd`) from ever being reinterpreted
+    as passing evidence under whatever the current suite semantics
+    happen to be: each remains, permanently, its own recorded result
+    under the suite version that actually produced it."""
     repo = ConformanceRepo(db_conn)
     old_version = "phase7.3-v1"
     assert old_version != SUITE_VERSION
@@ -1031,6 +1033,62 @@ def test_old_suite_version_run_cannot_promote_under_new_suite(db_conn, registere
     assert WorkerTrustManager(db_conn).current_trust(
         registered_worker, "coder", "read_file",
     ) == TrustLevel.LOCKED
+
+
+def test_phase7_4b_run_cannot_promote_under_phase7_4c_suite(db_conn, registered_worker):
+    """The specific transition this evidence-version fix exists for: a
+    run recorded under `phase7.4b-v1` -- built before
+    `structured_tool_call` required deterministic temperature and an
+    explicit `tool_choice: "required"` -- is not current-suite evidence
+    once `SUITE_VERSION` is `phase7.4c-v1`, even if (hypothetically) it
+    had passed every case. This is exactly the historical shape of the
+    real `6761e00f-9ff5-4806-aabf-c5aafe2fcd6d`/
+    `ab801467-3c25-4bdc-adb3-0bff7faf91dd` runs -- neither is rewritten
+    or relabeled; this test only proves the *code* now refuses to reuse
+    that vintage of evidence going forward."""
+    repo = ConformanceRepo(db_conn)
+    assert SUITE_VERSION == "phase7.4c-v1"
+    with transaction(db_conn):
+        repo.start_run_in_transaction(
+            run_id="run-phase7-4b", worker_id=registered_worker, role="coder",
+            suite_version="phase7.4b-v1", started_at="2026-01-01T00:00:00.000000Z",
+        )
+    for case in sorted(REQUIRED_CASES):
+        with transaction(db_conn):
+            repo.record_result_in_transaction(
+                run_id="run-phase7-4b", case_name=case, passed=True, reason="ok",
+                detail_content_hash=None, occurred_at="2026-01-01T00:00:01.000000Z",
+            )
+    with transaction(db_conn):
+        repo.finalize_run_in_transaction(
+            "run-phase7-4b", status=ConformanceRunStatus.PASSED,
+            completed_at="2026-01-01T00:00:02.000000Z",
+        )
+
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="run-phase7-4b",
+    )
+    assert not promo.ok
+    assert promo.reason == "run_suite_version_outdated"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", "read_file",
+    ) == TrustLevel.LOCKED
+
+
+def test_fresh_phase7_4c_run_can_still_promote_read_file(db_conn, registered_worker):
+    """A genuinely current-suite (`phase7.4c-v1`) passing run is
+    unaffected by the version bump -- promotion still works exactly as
+    before for evidence actually produced under the current protocol."""
+    result = _run_passing_suite(db_conn, registered_worker)
+    run = ConformanceRepo(db_conn).get_run(result.run_id)
+    assert run.suite_version == "phase7.4c-v1"
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id=result.run_id,
+    )
+    assert promo.ok
+    assert promo.level == TrustLevel.GUARDED
 
 
 # --- timeout/error: only the expected failure shape counts -----------------
