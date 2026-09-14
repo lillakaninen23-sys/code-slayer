@@ -13,7 +13,7 @@ import pytest
 
 from code_slayer.audit.verify import verify_chain
 from code_slayer.core import StaleTaskState, TaskState, TaskStateMachine
-from code_slayer.store.db import connect, migrate
+from code_slayer.store.db import connect, known_schema_version, migrate
 from code_slayer.store.task_repo import TaskRepo
 
 _SRC = str(Path(__file__).resolve().parents[2] / "src")
@@ -188,7 +188,12 @@ def test_subprocess_crash_never_splits_state_phase_and_audit(tmp_path, point, ta
 
     reopened = connect(db_path)
     try:
-        assert migrate(reopened) == 1
+        # Re-running migrate() on the reopened database is idempotent and
+        # lands at whatever the highest known schema version is -- not
+        # hardcoded to "1", so this assertion doesn't need updating every
+        # time a later phase adds a migration; what actually matters here
+        # is that the crash didn't corrupt schema_migrations bookkeeping.
+        assert migrate(reopened) == known_schema_version()
         task = TaskRepo(reopened).get("task")
         after = audit_rows(reopened)
         if point == "after_commit":

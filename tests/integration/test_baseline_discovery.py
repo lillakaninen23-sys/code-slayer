@@ -18,7 +18,7 @@ from code_slayer.repo.baseline import InspectionService
 from code_slayer.repo.inspection import RepositoryChangedError
 from code_slayer.store.baseline_repo import BaselineAlreadyExists, BaselineError, BaselineRepo
 from code_slayer.store.content_store import ContentStore
-from code_slayer.store.db import connect, migrate, schema_version, transaction
+from code_slayer.store.db import connect, known_schema_version, migrate, schema_version, transaction
 from code_slayer.store.task_repo import TaskRepo
 from tests.repo_helpers import commit, filesystem_snapshot, git
 
@@ -87,7 +87,7 @@ def test_full_baseline_state_audit_and_target_preservation(context, db_conn):
         assert payload["manifest_hash"] == result.manifest_hash
         assert payload["head"] == inspection["head"]
     assert verify_chain(db_conn, task_id=task.task_id).ok
-    assert schema_version(db_conn) == 1
+    assert schema_version(db_conn) == known_schema_version()
     assert db_conn.execute("SELECT count(*) FROM task_owned_paths").fetchone()[0] == 0
     assert filesystem_snapshot(root) == before_target
 
@@ -418,7 +418,7 @@ def test_process_crash_cannot_publish_partial_baseline(context, db_conn, point):
     assert result.returncode == 74, result.stderr
     reopened = connect(db_path)
     try:
-        assert migrate(reopened) == 1
+        assert migrate(reopened) == known_schema_version()
         if point == "after_commit":
             assert TaskRepo(reopened).get(task.task_id).state == "BASELINED"
             assert BaselineRepo(reopened).get(task.task_id).manifest_hash

@@ -91,3 +91,32 @@ class WorkerLease:
     worker_pid: int | None
     worker_pid_started_at: str | None
     checkpoint_id: str | None
+
+
+@dataclass(frozen=True)
+class Worker:
+    worker_id: str
+    kind: str
+    network_class: str
+    capabilities_json: str
+    availability_state: str
+    available_after: str | None
+    last_probe_at: str | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class WorkerTrustEvent:
+    """One durable trust transition (Phase 7.2). `capability` is `None`
+    when the event is scoped to the whole `role` rather than one
+    narrower capability within it."""
+
+    id: int
+    worker_id: str
+    role: str
+    capability: str | None
+    from_level: str
+    to_level: str
+    reason: str
+    evidence_ref: str | None
+    occurred_at: str
