@@ -66,7 +66,7 @@ module's docstring for the full investigation and mapping. No other
 case sets `tool_requirement`; `allowed_tools` being non-empty never, by
 itself, demands tool use.
 
-`SUITE_VERSION` is bumped to `phase7.4c-v1` for this: `structured_tool_
+`SUITE_VERSION` was bumped to `phase7.4c-v1` for this: `structured_tool_
 call`'s request protocol materially changed (deterministic sampling, an
 explicit `tool_choice: "required"`), even though the case name, the
 overall case list, and the final `VALID_TOOL_CALL` pass condition are
@@ -79,6 +79,28 @@ is therefore historical/ineligible evidence under either version now:
 refuses it going forward exactly as it already refuses every other
 prior-version run, and that row is never rewritten or relabeled — see
 `workers.promotion` and `docs/CODE_SLAYER_VISION.md` §58.
+
+## Phase 7.4h: a provider-neutral, direct prompt
+
+Phase 7.4c's request-protocol fix was not enough on its own: a fresh
+`phase7.4c-v1` live run against `devstral:24b` — a model/runtime that
+had otherwise repeatedly demonstrated genuine structured tool calling —
+still failed `structured_tool_call` with a plain `VALID_TEXT` response.
+A dedicated diagnostic (never committed, never part of this evidence
+chain) isolated the variable: `_TOOL_CALL_PROMPT`'s "Code Slayer
+conformance check: ..." framing, not the tool schema, `tool_choice`, or
+sampling settings, measurably suppressed structured tool use on that
+real runtime, while a short, direct imperative with no Code-Slayer-
+specific preamble reliably produced genuine `message.tool_calls`
+responses (2/2) through the same, unmodified adapter. `_TOOL_CALL_PROMPT`
+is now exactly that direct imperative — this case tests "can this
+worker obey a direct instruction to invoke an available tool," never
+"can it parse Code-Slayer-specific framing," and the prompt now says
+only that. `SUITE_VERSION` is bumped again, to `phase7.4h-v1`, for the
+same reason as the 7.4c bump: the request protocol materially changed.
+Every prior-version run (`phase7.3-v1`, `phase7.4b-v1` ×2,
+`phase7.4c-v1`) remains historical/ineligible evidence, untouched and
+unrewritten, refused automatically by the same `suite_version` gate.
 
 ## Worker-evidence cases
 
@@ -130,7 +152,7 @@ from code_slayer.workers.protocol import (
 )
 from code_slayer.workers.protocol_validation import ValidationOutcome, validate_response
 
-SUITE_VERSION = "phase7.4c-v1"
+SUITE_VERSION = "phase7.4h-v1"
 
 _PROMPT = "Code Slayer conformance check: respond appropriately to this fixed test prompt."
 
@@ -140,11 +162,20 @@ _TEXT_ONLY_PROMPT = (
     "call one."
 )
 
-_TOOL_CALL_PROMPT = (
-    "Code Slayer conformance check: call the read_file tool to read the "
-    "file at path 'README.md'. Respond only with that structured tool "
-    "call — do not answer in plain text."
-)
+# Deliberately NOT "Code Slayer conformance check: ..." framing (Phase
+# 7.4c/7.4g's wording) -- Phase 7.4g's own diagnostic evidence showed
+# that exact framing measurably suppressed structured tool use on a real
+# runtime/model (devstral:24b: 1/1 OpenAI-compatible and 2/2 native
+# TEXT), while a short, direct imperative with no Code-Slayer-specific
+# preamble produced genuine structured tool_calls 2/2 through the same,
+# unmodified adapter (Phase 7.4h). This case is testing "can this worker
+# obey a direct instruction to invoke an available tool," never "can it
+# parse Code-Slayer-specific framing" -- so the prompt says exactly that
+# and nothing more. Provider-neutral: no model/runtime name appears
+# here, and this wording was validated only by observing the real
+# provider's own structured response field, never by relaxing what
+# counts as a pass.
+_TOOL_CALL_PROMPT = "Use the read_file tool to read README.md. Do not answer with text."
 
 
 class CaseKind(StrEnum):

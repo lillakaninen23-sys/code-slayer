@@ -1,6 +1,6 @@
 """The provider-independent worker protocol boundary, durable worker
 trust, durable worker conformance, and the first real worker adapter
-(Phase 7.1/7.2/7.3/7.4a/7.4b/7.4c — `docs/ROADMAP.md
+(Phase 7.1/7.2/7.3/7.4a/7.4b/7.4c/7.4h — `docs/ROADMAP.md
 #local-worker-runtime`, `docs/CODE_SLAYER_VISION.md` §40-43, §58).
 
 Phase 7.1 establishes the model/protocol boundary: immutable request/
@@ -27,6 +27,11 @@ explicitly require a genuine structured tool call — never inferred from
 (`OpenAICompatibleConfig.temperature`, default `0.0`) so conformance
 evidence is reproducible; see `workers.openai_compatible_adapter`'s
 module docstring for the runtime-compatibility findings this produced.
+Phase 7.4h replaces `structured_tool_call`'s prompt with a short,
+direct, provider-neutral imperative after diagnostic evidence showed
+the prior "Code Slayer conformance check: ..." framing measurably
+suppressed structured tool use on a real runtime that otherwise
+supports it reliably; see `workers.conformance`'s module docstring.
 Still without job-worktree mutation, mutation-capability trust, `AUTO`
 trust, or Prompt Analyst/Question Gate; see `docs/ROADMAP.md`'s Local
 Worker Runtime stage for what remains deferred."""

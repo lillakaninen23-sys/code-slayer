@@ -664,6 +664,39 @@ def test_structured_tool_call_case_fails_on_plain_text(db_conn, registered_worke
     assert result.reason == "expected_valid_tool_call_got_valid_text"
 
 
+def test_structured_tool_call_case_fails_on_raw_textual_leakage(db_conn, registered_worker):
+    """Test item 7: raw textual tool-call protocol leakage still fails
+    this case -- never parsed or recovered, only ever reclassified
+    MALFORMED by the existing validator, exactly as before the prompt
+    change."""
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    leaked = "<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>"
+    adapter = FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text=leaked)])
+    result = _case_structured_tool_call(adapter, "coder")
+    assert result.passed is False
+    assert result.reason == "expected_valid_tool_call_got_malformed"
+
+
+def test_structured_tool_call_case_uses_the_exact_new_prompt(db_conn, registered_worker):
+    """Test item 1: the short, direct, provider-neutral imperative
+    validated in Phase 7.4h -- not the old "Code Slayer conformance
+    check: ..." framing that measurably suppressed structured tool use
+    on a real runtime."""
+    from code_slayer.workers.conformance import _case_structured_tool_call
+
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
+        ),
+    ])
+    _case_structured_tool_call(adapter, "coder")
+    assert adapter.calls[0].original_prompt == (
+        "Use the read_file tool to read README.md. Do not answer with text."
+    )
+
+
 # --- safety regressions: proven directly, never via run_conformance_suite --
 
 def test_malformed_protocol_case_directly_passes_on_malformed_response(db_conn, registered_worker):
@@ -1035,19 +1068,18 @@ def test_old_suite_version_run_cannot_promote_under_new_suite(db_conn, registere
     ) == TrustLevel.LOCKED
 
 
-def test_phase7_4b_run_cannot_promote_under_phase7_4c_suite(db_conn, registered_worker):
-    """The specific transition this evidence-version fix exists for: a
-    run recorded under `phase7.4b-v1` -- built before
+def test_phase7_4b_run_cannot_promote_under_current_suite(db_conn, registered_worker):
+    """A run recorded under `phase7.4b-v1` -- built before
     `structured_tool_call` required deterministic temperature and an
     explicit `tool_choice: "required"` -- is not current-suite evidence
-    once `SUITE_VERSION` is `phase7.4c-v1`, even if (hypothetically) it
+    under whatever `SUITE_VERSION` is now, even if (hypothetically) it
     had passed every case. This is exactly the historical shape of the
     real `6761e00f-9ff5-4806-aabf-c5aafe2fcd6d`/
     `ab801467-3c25-4bdc-adb3-0bff7faf91dd` runs -- neither is rewritten
     or relabeled; this test only proves the *code* now refuses to reuse
     that vintage of evidence going forward."""
     repo = ConformanceRepo(db_conn)
-    assert SUITE_VERSION == "phase7.4c-v1"
+    assert SUITE_VERSION != "phase7.4b-v1"
     with transaction(db_conn):
         repo.start_run_in_transaction(
             run_id="run-phase7-4b", worker_id=registered_worker, role="coder",
@@ -1076,13 +1108,55 @@ def test_phase7_4b_run_cannot_promote_under_phase7_4c_suite(db_conn, registered_
     ) == TrustLevel.LOCKED
 
 
-def test_fresh_phase7_4c_run_can_still_promote_read_file(db_conn, registered_worker):
-    """A genuinely current-suite (`phase7.4c-v1`) passing run is
-    unaffected by the version bump -- promotion still works exactly as
-    before for evidence actually produced under the current protocol."""
+def test_phase7_4c_run_cannot_promote_under_phase7_4h_suite(db_conn, registered_worker):
+    """Test item 8, and the specific transition Phase 7.4i exists for: a
+    run recorded under `phase7.4c-v1` -- built before
+    `_TOOL_CALL_PROMPT` became the short, direct, provider-neutral
+    imperative -- is not current-suite evidence once `SUITE_VERSION` is
+    `phase7.4h-v1`, even if (hypothetically) it had passed every case.
+    This is exactly the historical shape of the real live Devstral run
+    that FAILed `structured_tool_call` under the old "Code Slayer
+    conformance check: ..." framing -- that row is never rewritten or
+    relabeled; this test only proves the *code* now refuses to reuse
+    that vintage of evidence going forward."""
+    repo = ConformanceRepo(db_conn)
+    assert SUITE_VERSION == "phase7.4h-v1"
+    with transaction(db_conn):
+        repo.start_run_in_transaction(
+            run_id="run-phase7-4c", worker_id=registered_worker, role="coder",
+            suite_version="phase7.4c-v1", started_at="2026-01-01T00:00:00.000000Z",
+        )
+    for case in sorted(REQUIRED_CASES):
+        with transaction(db_conn):
+            repo.record_result_in_transaction(
+                run_id="run-phase7-4c", case_name=case, passed=True, reason="ok",
+                detail_content_hash=None, occurred_at="2026-01-01T00:00:01.000000Z",
+            )
+    with transaction(db_conn):
+        repo.finalize_run_in_transaction(
+            "run-phase7-4c", status=ConformanceRunStatus.PASSED,
+            completed_at="2026-01-01T00:00:02.000000Z",
+        )
+
+    promo = promote_from_conformance(
+        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        run_id="run-phase7-4c",
+    )
+    assert not promo.ok
+    assert promo.reason == "run_suite_version_outdated"
+    assert WorkerTrustManager(db_conn).current_trust(
+        registered_worker, "coder", "read_file",
+    ) == TrustLevel.LOCKED
+
+
+def test_fresh_phase7_4h_run_can_still_promote_read_file(db_conn, registered_worker):
+    """Test item 9: a genuinely current-suite (`phase7.4h-v1`) passing
+    run is unaffected by the version bump -- promotion still works
+    exactly as before for evidence actually produced under the current
+    protocol."""
     result = _run_passing_suite(db_conn, registered_worker)
     run = ConformanceRepo(db_conn).get_run(result.run_id)
-    assert run.suite_version == "phase7.4c-v1"
+    assert run.suite_version == "phase7.4h-v1"
     promo = promote_from_conformance(
         db_conn, worker_id=registered_worker, role="coder", capability="read_file",
         run_id=result.run_id,
