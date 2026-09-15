@@ -577,7 +577,10 @@ def test_staged_change_after_checkpoint_refuses_cleanup(checkpointed):
 
     result = release_job_worktree(handle)
     assert not result.ok
-    assert result.reason == "git_worktree_dirty"
+    # Phase 7.7b: a staged addition is caught by the real-index check
+    # (`job_worktree_git.staged_changes()`) before the working-tree-vs-
+    # checkpoint comparison even runs, so the more specific reason wins.
+    assert result.reason == "git_worktree_staged_changes"
 
 
 def test_untracked_file_after_checkpoint_refuses_cleanup(checkpointed):
@@ -700,3 +703,434 @@ def test_audit_chain_valid_across_job_worktree_lifecycle(job):
     )
     assert verify_chain(conn, task_id=task_id).ok
     assert verify_chain(conn, task_id=None).ok
+
+
+# --- Phase 7.7b: job-worktree cleanup integrity hardening ------------------
+#
+# Real-index staged-change detection, ignored-file detection, and the
+# cleanup/delete race close the three findings an independent Phase 7
+# audit reported against the Phase 7.5c/hardening cleanup logic above.
+# See `repo.job_worktree.release_job_worktree()`'s own docstring for the
+# two-phase (claim, then verify-and-remove) protocol these tests exercise.
+
+def test_staged_modification_then_restored_bytes_refuses_cleanup(checkpointed):
+    """The exact Phase 7.7b finding #1: stage a real edit, then restore
+    the working-tree bytes to exactly what the checkpoint tree has. A
+    working-tree-vs-tree-only comparison (run against a private,
+    temporary index, as the pre-7.7b check did) sees nothing wrong; the
+    job worktree's own REAL index still carries the staged edit, and a
+    later `git commit` would use it -- cleanup must not discard that.
+
+    Uses `README.md`, not `checked.txt`: a checkpoint commit is built
+    directly from blobs/trees (`repo.checkpoint_git`), never by staging
+    into or committing onto the job worktree's own real index/HEAD (see
+    this module's docstring, "No promotion into the primary worktree"),
+    so `checked.txt` -- created only through `ToolExecutor`, never `git
+    add`ed for real -- has no prior real-HEAD content to "stage a
+    modification, then restore" against. `README.md` is genuinely
+    tracked in the job worktree's real (frozen, pinned) `HEAD`, inherited
+    from the primary repository's base revision.
+    """
+    _primary, handle, _conn = checkpointed
+    original = (handle.path / "README.md").read_bytes()
+    (handle.path / "README.md").write_bytes(b"a real edit, staged")
+    git(handle.path, "add", "README.md")
+    (handle.path / "README.md").write_bytes(original)  # restore working-tree bytes
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_staged_changes"
+    assert handle.path.exists()
+    assert (handle.path / "README.md").read_bytes() == original
+
+
+def test_staged_new_file_refuses_cleanup(checkpointed):
+    """Regression test #2: a brand new file, staged, refuses cleanup --
+    already exercised as a side effect of
+    `test_staged_change_after_checkpoint_refuses_cleanup` above, restated
+    here as its own named case per the required regression list."""
+    _primary, handle, _conn = checkpointed
+    (handle.path / "brand-new.txt").write_bytes(b"never seen before")
+    git(handle.path, "add", "brand-new.txt")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_staged_changes"
+    assert (handle.path / "brand-new.txt").exists()
+
+
+def test_staged_deletion_refuses_cleanup(checkpointed):
+    """Regression test #3: `git rm --cached` stages a deletion without
+    touching the working-tree file at all -- the real index disagrees
+    with HEAD even though the working tree does not. Uses `README.md`
+    (genuinely tracked in the job worktree's real HEAD) for the same
+    reason `test_staged_modification_then_restored_bytes_refuses_cleanup`
+    does -- `checked.txt` was never really staged/committed in the first
+    place, so it has nothing real to `git rm --cached`."""
+    _primary, handle, _conn = checkpointed
+    git(handle.path, "rm", "--cached", "README.md")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_staged_changes"
+    assert (handle.path / "README.md").exists()  # --cached never touches the file
+
+
+def test_ignored_untracked_file_after_checkpoint_refuses_cleanup(job):
+    """Regression test #6, the exact Phase 7.7b finding #2: a file
+    matched by `.gitignore` is real filesystem content a `git worktree
+    remove` would destroy just the same as an untracked one. Checkpoints
+    `.gitignore` itself first so only the ignored file's own status is
+    under test."""
+    from code_slayer.lease.manager import LeaseManager
+
+    _primary, handle, conn, task_id, executor, lease = job
+    executor.execute(
+        task_id, ToolRequest(tool="create_file", path=".gitignore", content=b"ignored.log\n"),
+    )
+    _to_ready_for_checkpoint(conn, task_id)
+    manager = CheckpointManager(
+        conn, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir, lease=lease,
+    )
+    checkpointed_result = manager.create(task_id)
+    assert checkpointed_result.operation_status == OperationStatus.SUCCEEDED
+    TaskStateMachine(conn).transition(
+        task_id, expected_state=TaskState.CHECKPOINTED, to_state=TaskState.COMPLETED,
+        reason="done", completion_decision=True,
+    )
+    LeaseManager(conn).release(lease)
+
+    (handle.path / "ignored.log").write_text("should not be silently discarded\n")
+    # Confirm this file really is ignored, not merely untracked -- a
+    # plain `git status` (no `--ignored`, the pre-Phase-7.7b query shape)
+    # genuinely cannot see it, which is exactly the finding.
+    plain_status = git(handle.path, "status", "--porcelain=v2", "--untracked-files=all")
+    assert "ignored.log" not in plain_status
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+    assert (handle.path / "ignored.log").exists()
+
+
+def test_ignored_nested_file_after_checkpoint_refuses_cleanup(job):
+    """Regression test #7: an ignored file nested several directories
+    deep is reported individually (plain `--ignored`, never
+    `--ignored=matching`, which would collapse it to just the top-level
+    directory and make it non-enumerable)."""
+    from code_slayer.lease.manager import LeaseManager
+
+    _primary, handle, conn, task_id, executor, lease = job
+    executor.execute(
+        task_id, ToolRequest(tool="create_file", path=".gitignore", content=b"ignored.log\n"),
+    )
+    _to_ready_for_checkpoint(conn, task_id)
+    manager = CheckpointManager(
+        conn, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir, lease=lease,
+    )
+    checkpointed_result = manager.create(task_id)
+    assert checkpointed_result.operation_status == OperationStatus.SUCCEEDED
+    TaskStateMachine(conn).transition(
+        task_id, expected_state=TaskState.CHECKPOINTED, to_state=TaskState.COMPLETED,
+        reason="done", completion_decision=True,
+    )
+    LeaseManager(conn).release(lease)
+
+    nested = handle.path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    (nested / "ignored.log").write_text("nested, still real content\n")
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_dirty"
+    assert (nested / "ignored.log").exists()
+
+
+def _hook_before_removal_checks(monkeypatch, handle, callback):
+    """Patch the first Git-plumbing call `release_job_worktree()` makes
+    once its cleanup claim is durably committed (`jwg.staged_changes()`)
+    so `callback()` runs exactly inside that claimed-but-not-yet-removed
+    window, then delegates to the real implementation. This is how the
+    race tests below observe -- and prove closed -- the exact window the
+    Phase 7.7b finding #3 (check/delete race) is about, without needing
+    real concurrent threads/processes for what is fundamentally a
+    same-database serialization guarantee."""
+    import code_slayer.repo.job_worktree as job_worktree_module
+
+    real_staged_changes = job_worktree_module.jwg.staged_changes
+
+    def _wrapped(path):
+        callback()
+        return real_staged_changes(path)
+
+    monkeypatch.setattr(job_worktree_module.jwg, "staged_changes", _wrapped)
+
+
+def test_task_creation_blocked_while_cleanup_claim_is_held(checkpointed, monkeypatch):
+    """Regression test #10: a task creation attempt landing in the
+    window between cleanup's safety decision and the actual `git
+    worktree remove` must be refused, not silently allowed to proceed
+    against a worktree that is about to disappear."""
+    from code_slayer.store.task_repo import WorktreeCleanupInProgressError
+
+    primary, handle, conn = checkpointed
+    before_head = git(primary, "rev-parse", "HEAD")
+    attempts = []
+
+    def _race():
+        other_conn = connect(handle.db_path)
+        try:
+            try:
+                TaskRepo(other_conn).create(
+                    description="racing task", repo_root=str(handle.path),
+                    repo_id=handle.repo_id, worktree_id=handle.worktree_id,
+                )
+                attempts.append("unexpectedly_succeeded")
+            except WorktreeCleanupInProgressError:
+                attempts.append("blocked")
+        finally:
+            other_conn.close()
+
+    _hook_before_removal_checks(monkeypatch, handle, _race)
+
+    result = release_job_worktree(handle)
+    assert attempts == ["blocked"]
+    assert result.ok
+    assert result.reason == "removed"
+    assert not handle.path.exists()
+    assert TaskRepo(conn).get_active_for_worktree(handle.worktree_id) is None
+    assert git(primary, "rev-parse", "HEAD") == before_head  # primary untouched
+
+
+def test_lease_acquisition_blocked_while_cleanup_claim_is_held(checkpointed, monkeypatch):
+    """Regression test #11: a fresh lease acquisition landing in that
+    same window must be denied for the same reason -- the other half of
+    the ownership-establishment surface alongside task creation."""
+    from code_slayer.lease.manager import LeaseManager
+
+    primary, handle, conn = checkpointed
+    before_head = git(primary, "rev-parse", "HEAD")
+    attempts = []
+
+    def _race():
+        other_conn = connect(handle.db_path)
+        try:
+            outcome = LeaseManager(other_conn).acquire(
+                worktree_id=handle.worktree_id, task_id="racing-task-id",
+                worker_id="racer", worker_session_id="racer-session",
+            )
+            attempts.append(outcome)
+        finally:
+            other_conn.close()
+
+    _hook_before_removal_checks(monkeypatch, handle, _race)
+
+    result = release_job_worktree(handle)
+    assert len(attempts) == 1
+    assert attempts[0].decision == Decision.DENY
+    assert attempts[0].reason == "job_worktree_cleanup_in_progress"
+    assert attempts[0].handle is None
+    assert result.ok
+    assert result.reason == "removed"
+    assert not handle.path.exists()
+    assert _active_lease_or_none(conn, handle.worktree_id) is None
+    assert git(primary, "rev-parse", "HEAD") == before_head  # primary untouched
+
+
+def _active_lease_or_none(conn, worktree_id):
+    from code_slayer.store.lease_repo import LeaseRepo, LeaseStatus
+
+    lease = LeaseRepo(conn).get(worktree_id)
+    if lease is not None and lease.status in (LeaseStatus.ACTIVE, LeaseStatus.QUIESCING):
+        return lease
+    return None
+
+
+def test_no_new_operation_can_start_while_cleanup_claim_is_held(checkpointed, monkeypatch):
+    """Regression test #12: since a genuinely new operation can only ever
+    start under a freshly-granted, currently-current lease (`lease.
+    manager.LeaseManager.is_current()`'s fencing gate, unmodified by this
+    phase), and fresh-epoch grants are refused throughout the claimed
+    window (previous test), no unresolved operation can appear during
+    cleanup either. This test confirms the observable consequence: zero
+    `tool_operations` rows are added for this worktree while the claim is
+    held."""
+    from code_slayer.lease.manager import LeaseManager
+
+    _primary, handle, conn = checkpointed
+    before_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM tool_operations WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()["n"]
+    attempts = []
+
+    def _race():
+        other_conn = connect(handle.db_path)
+        try:
+            outcome = LeaseManager(other_conn).acquire(
+                worktree_id=handle.worktree_id, task_id="racing-task-id",
+                worker_id="racer", worker_session_id="racer-session",
+            )
+            attempts.append(outcome.decision)
+            # No valid handle was ever granted, so there is no lease to
+            # execute a tool call under -- ToolExecutor itself can never
+            # be reached with authority over this worktree in this window.
+        finally:
+            other_conn.close()
+
+    _hook_before_removal_checks(monkeypatch, handle, _race)
+
+    result = release_job_worktree(handle)
+    assert attempts == [Decision.DENY]
+    assert result.ok
+
+    after_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM tool_operations WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()["n"]
+    assert after_count == before_count
+
+
+def test_failed_git_removal_preserves_state_and_permits_safe_retry(checkpointed, monkeypatch):
+    """Regression tests #13 and #14: if `git worktree remove` itself
+    fails after the claim is recorded, durable lifecycle/evidence state
+    must not be lost, the worktree must not be marked released, and a
+    later call must be able to pick the removal back up safely."""
+    import code_slayer.repo.job_worktree as job_worktree_module
+    from code_slayer.repo.job_worktree_git import JobWorktreeGitError
+
+    _primary, handle, conn = checkpointed
+
+    def _boom(path, *, cwd, force=True):
+        raise JobWorktreeGitError("simulated git worktree remove failure")
+
+    monkeypatch.setattr(job_worktree_module.jwg, "remove_worktree", _boom)
+
+    result = release_job_worktree(handle)
+    assert not result.ok
+    assert result.reason == "git_worktree_remove_failed"
+    assert handle.path.exists()  # nothing lost
+    assert (handle.path / "checked.txt").read_bytes() == b"checkpoint me"
+
+    claim = conn.execute(
+        "SELECT * FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()
+    assert claim is not None
+    assert claim["status"] == "REMOVING"  # never silently marked released
+
+    failed_events = conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_events "
+        "WHERE event_type = 'JOB_WORKTREE_CLEANUP_REMOVAL_FAILED'"
+    ).fetchone()["n"]
+    assert failed_events == 1
+    released_events = conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_events WHERE event_type = 'JOB_WORKTREE_RELEASED'"
+    ).fetchone()["n"]
+    assert released_events == 0
+
+    # Durable checkpoint evidence is untouched by the failed attempt.
+    rows = conn.execute("SELECT status FROM checkpoints").fetchall()
+    assert [row["status"] for row in rows] == ["COMPLETE"]
+
+    # A new task still cannot be created while this failed claim stands.
+    from code_slayer.store.task_repo import WorktreeCleanupInProgressError
+
+    with pytest.raises(WorktreeCleanupInProgressError):
+        TaskRepo(conn).create(
+            description="should stay blocked", repo_root=str(handle.path),
+            repo_id=handle.repo_id, worktree_id=handle.worktree_id,
+        )
+
+    monkeypatch.undo()
+    retry = release_job_worktree(handle)
+    assert retry.ok
+    assert retry.reason == "removed"
+    assert not handle.path.exists()
+
+    claim_after = conn.execute(
+        "SELECT * FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()
+    assert claim_after is None
+    released_events_after = conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_events WHERE event_type = 'JOB_WORKTREE_RELEASED'"
+    ).fetchone()["n"]
+    assert released_events_after == 1
+
+
+def test_retry_recovers_when_git_removal_actually_succeeded_before_a_crash(
+    checkpointed, monkeypatch,
+):
+    """A stricter version of #14: the crash happens strictly *after* Git's
+    own removal genuinely succeeded (simulating a process crash between
+    `jwg.remove_worktree()` returning and this module recording that
+    fact) -- a naive retry must not treat "already gone" as a new
+    failure, and must not attempt to remove an already-removed path."""
+    import code_slayer.repo.job_worktree as job_worktree_module
+
+    _primary, handle, conn = checkpointed
+    real_remove = job_worktree_module.jwg.remove_worktree
+
+    def _remove_then_crash(path, *, cwd, force=True):
+        real_remove(path, cwd=cwd, force=force)
+        raise RuntimeError("simulated process crash after git worktree remove succeeded")
+
+    monkeypatch.setattr(job_worktree_module.jwg, "remove_worktree", _remove_then_crash)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        release_job_worktree(handle)
+    monkeypatch.undo()
+
+    assert not handle.path.exists()  # git's own removal really did complete
+    claim = conn.execute(
+        "SELECT * FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()
+    assert claim is not None
+    assert claim["status"] == "REMOVING"
+
+    retry = release_job_worktree(handle)
+    assert retry.ok
+    assert retry.reason == "removed"
+
+    claim_after = conn.execute(
+        "SELECT * FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+        (handle.worktree_id,),
+    ).fetchone()
+    assert claim_after is None
+    released_events = conn.execute(
+        "SELECT COUNT(*) AS n FROM audit_events WHERE event_type = 'JOB_WORKTREE_RELEASED'"
+    ).fetchone()["n"]
+    assert released_events == 1
+
+
+def test_race_test_primary_repository_remains_untouched(checkpointed, monkeypatch):
+    """Regression test #15, exercised specifically against the race/claim
+    machinery above (the ordinary cleanup paths already have their own
+    primary-isolation tests): none of cleanup's new claim/abort/retry
+    bookkeeping ever touches the primary repository."""
+    from code_slayer.store.task_repo import WorktreeCleanupInProgressError
+
+    primary, handle, _conn = checkpointed
+    before_head = git(primary, "rev-parse", "HEAD")
+    before_index = git(primary, "ls-files", "--stage")
+    before_snapshot = working_tree_snapshot(primary)
+
+    def _race():
+        other_conn = connect(handle.db_path)
+        try:
+            with pytest.raises(WorktreeCleanupInProgressError):
+                TaskRepo(other_conn).create(
+                    description="racing task", repo_root=str(handle.path),
+                    repo_id=handle.repo_id, worktree_id=handle.worktree_id,
+                )
+        finally:
+            other_conn.close()
+
+    _hook_before_removal_checks(monkeypatch, handle, _race)
+    result = release_job_worktree(handle)
+    assert result.ok
+
+    assert git(primary, "rev-parse", "HEAD") == before_head
+    assert git(primary, "ls-files", "--stage") == before_index
+    assert working_tree_snapshot(primary) == before_snapshot

@@ -102,31 +102,59 @@ registry (`.git/worktrees/`, `git worktree list`) is already independent,
 durable ground truth that it exists, no matter what Code Slayer's own
 bookkeeping managed to record.
 
-## Cleanup: conservative, refusal-first
+## Cleanup: conservative, refusal-first, and race-closed (Phase 7.7b)
 
 `release_job_worktree()` never deletes a job worktree unless it can
 positively confirm, from durable evidence, that doing so loses nothing:
 no active/quiescing lease, no unresolved (`STARTED`/`UNKNOWN`) tool
 operation, no non-terminal task, no task-owned path that was never
 covered by at least one durable checkpoint (Code-Slayer-owned
-bookkeeping) — **and**, independently, that the ACTUAL on-disk working
-tree exactly matches the latest checkpoint's tree (or the pinned
-`base_revision`, if none exists yet), via real Git plumbing
-(`job_worktree_git.worktree_status()`), never a filesystem diff this
-module invents. That last check is a deliberate, independent fail-safe:
-the bookkeeping checks alone only know what Code Slayer itself recorded
-as owned, so a human debugging the worktree, another process, or a
-future bug could otherwise leave a modified/deleted/staged/untracked
-change entirely invisible to them. Neither check is redundant with the
-other — see `release_job_worktree()`'s own docstring for the case each
-one catches that the other does not. Any refusal condition — or simply
-not yet being able to determine one safely (e.g. the job's own database
-was never successfully created, or the Git cleanliness check itself
-could not run) — is a refusal, not a best-effort guess. Even a
-successful cleanup only removes the disposable Git working tree itself
-(`job_worktree_git.remove_worktree()`); the job's own `state.db`/`blobs/`
-audit trail is deliberately left in place as a historical record, never
-deleted by this module.
+bookkeeping) — **and**, independently, that the ACTUAL on-disk state
+exactly matches the latest checkpoint's tree (or the pinned
+`base_revision`, if none exists yet), via real Git plumbing, never a
+filesystem diff this module invents:
+
+- `job_worktree_git.staged_changes()` — the job worktree's own REAL
+  index (`git diff --cached --name-only HEAD`), not a private temporary
+  one. A tracked file that was modified, staged, and then had its
+  working-tree bytes restored is invisible to any working-tree-only
+  comparison; the staged blob a later `git commit` would actually use is
+  not clean, and cleanup must see that.
+- `job_worktree_git.worktree_status()` — working tree vs. the checkpoint
+  tree, via a private temporary index, `--ignored` included. Being
+  ignored by `.gitignore` describes what a *commit* should skip, not
+  what is disposable: an ignored build artifact, cache file, or log that
+  physically exists is real content a `git worktree remove` would
+  destroy just the same as an untracked one, so it is never excluded
+  from this check.
+
+Both are independent fail-safes from the bookkeeping checks above and
+from each other — see `release_job_worktree()`'s own docstring for the
+case each one catches that the others do not.
+
+The decision to remove is also serialized against new ownership being
+granted for the same worktree while cleanup is deciding: cleanup first
+records a durable claim (`job_worktree_cleanup_claims`, Phase 7.7b's one
+new migration) inside a committed write transaction that has *just*
+re-verified the bookkeeping checks above, and `store.task_repo.TaskRepo.
+create()` / `lease.manager.LeaseManager`'s fresh-epoch grant both refuse
+to establish new ownership of a worktree a claim names — closing the
+window between "cleanup decided this was safe" and "the worktree is
+actually gone" that a single in-process check, unserialized against
+concurrent task/lease creation, could not. If `git worktree remove`
+itself then fails, the claim is deliberately left standing (still
+blocking new ownership) rather than either pretending success or losing
+track of the attempt; a later `release_job_worktree()` call safely
+resumes or retries. See `release_job_worktree()`'s own docstring for the
+full two-phase (claim, then verify-and-remove) protocol.
+
+Any refusal condition — or simply not yet being able to determine one
+safely (e.g. the job's own database was never successfully created, or a
+Git cleanliness check itself could not run) — is a refusal, not a
+best-effort guess. Even a successful cleanup only removes the disposable
+Git working tree itself (`job_worktree_git.remove_worktree()`); the
+job's own `state.db`/`blobs/` audit trail is deliberately left in place
+as a historical record, never deleted by this module.
 
 ## No promotion into the primary worktree
 
@@ -395,84 +423,235 @@ def _latest_checkpoint_tree(conn: sqlite3.Connection, worktree_id: str) -> str |
     return json.loads(row["verified_json"])["tree_sha"]
 
 
+def _bookkeeping_safety_check(conn: sqlite3.Connection, worktree_id: str) -> str | None:
+    """The Code-Slayer bookkeeping half of the cleanup safety decision: a
+    stable refusal reason, or `None` if this half raises no objection.
+    Always called fresh, inside the same write transaction that then
+    (re-)records the durable cleanup claim (`_claim_for_cleanup()`), so
+    the two can never be observed to disagree — the fix for the cleanup
+    check/delete race (Phase 7.7b)."""
+    lease = LeaseRepo(conn).get(worktree_id)
+    if lease is not None and lease.status in (LeaseStatus.ACTIVE, LeaseStatus.QUIESCING):
+        return "active_lease"
+    unresolved = conn.execute(
+        "SELECT 1 FROM tool_operations WHERE worktree_id = ? "
+        "AND status IN ('STARTED', 'UNKNOWN') LIMIT 1",
+        (worktree_id,),
+    ).fetchone()
+    if unresolved is not None:
+        return "unresolved_operations"
+    if TaskRepo(conn).get_active_for_worktree(worktree_id) is not None:
+        return "active_task"
+    if _has_uncheckpointed_ownership(conn, worktree_id):
+        return "uncheckpointed_changes"
+    return None
+
+
+def _get_cleanup_claim(conn: sqlite3.Connection, worktree_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM job_worktree_cleanup_claims WHERE worktree_id = ?", (worktree_id,),
+    ).fetchone()
+
+
+def _claim_for_cleanup(conn: sqlite3.Connection, handle: JobWorktree) -> CleanupResult:
+    """Phase 1 of cleanup's two-phase protocol: durably record, in one
+    committed `BEGIN IMMEDIATE` transaction, that this worktree has just
+    been freshly proven safe (its bookkeeping half, at least) to remove.
+
+    This is the serialization primitive that closes the check/delete
+    race: `store.task_repo.TaskRepo.create()` and `lease.manager.
+    LeaseManager`'s fresh-epoch grant both check `job_worktree_cleanup_
+    claims` inside their *own* write transaction before establishing new
+    ownership of a worktree, and SQLite's own write-lock discipline
+    (`store.db.transaction()`, `BEGIN IMMEDIATE`) totally orders this
+    transaction against theirs — whichever commits first is the one the
+    other observes. No filesystem lock is invented; the existing durable
+    transaction discipline already provides everything this needs.
+
+    Idempotent: resumes an existing claim on `handle.worktree_id` (left
+    behind by an earlier, interrupted `release_job_worktree()` call)
+    rather than creating a second one — a worktree_id can only ever have
+    one claim row. If the bookkeeping check now fails despite an existing
+    claim (state that should be impossible while a claim stands, since it
+    is exactly what the claim prevents — but never trusted blindly), the
+    stale claim is removed rather than left standing over a worktree
+    cleanup no longer believes is safe.
+    """
+    with transaction(conn):
+        existing = _get_cleanup_claim(conn, handle.worktree_id)
+        refusal = _bookkeeping_safety_check(conn, handle.worktree_id)
+        if refusal is not None:
+            if existing is not None:
+                conn.execute(
+                    "DELETE FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+                    (handle.worktree_id,),
+                )
+                _event(conn, EventType.JOB_WORKTREE_CLEANUP_ABORTED, {
+                    "repo_id": handle.repo_id, "worktree_id": handle.worktree_id,
+                    "reason": refusal,
+                })
+            return CleanupResult(False, refusal)
+        if existing is None:
+            token = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO job_worktree_cleanup_claims "
+                "(worktree_id, claim_token, claimed_at, status) VALUES (?, ?, ?, 'CLAIMED')",
+                (handle.worktree_id, token, utcnow_iso()),
+            )
+            _event(conn, EventType.JOB_WORKTREE_CLEANUP_CLAIMED, {
+                "repo_id": handle.repo_id, "worktree_id": handle.worktree_id,
+                "claim_token": token,
+            })
+    return CleanupResult(True, "claimed")
+
+
+def _abort_claim(conn: sqlite3.Connection, handle: JobWorktree, *, reason: str) -> None:
+    """Release the durable cleanup claim without removing anything —
+    cleanup decided, after all, not to proceed (a filesystem-level
+    safety check failed). Restores ordinary task/lease creation
+    eligibility for this worktree."""
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+            (handle.worktree_id,),
+        )
+        _event(conn, EventType.JOB_WORKTREE_CLEANUP_ABORTED, {
+            "repo_id": handle.repo_id, "worktree_id": handle.worktree_id, "reason": reason,
+        })
+
+
+def _finalize_removal(conn: sqlite3.Connection, handle: JobWorktree) -> CleanupResult:
+    """Phase 2's successful terminal step: the Git worktree is confirmed
+    gone, so the claim is released and the ordinary `JOB_WORKTREE_
+    RELEASED` event is recorded — exactly the event a pre-Phase-7.7b
+    cleanup already recorded on success, so existing audit consumers see
+    no new event shape for the success path."""
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+            (handle.worktree_id,),
+        )
+        _event(conn, EventType.JOB_WORKTREE_RELEASED, {
+            "repo_id": handle.repo_id, "worktree_id": handle.worktree_id,
+            "path": str(handle.path), "reason": "conservative_cleanup",
+        })
+    return CleanupResult(True, "removed")
+
+
 def release_job_worktree(handle: JobWorktree) -> CleanupResult:
     """Remove the disposable Git working tree at `handle.path` — never
     `handle.state_dir` itself (the `state.db`/`blobs/` audit trail is
     kept as a historical record) — but only once durable evidence
-    positively confirms it is safe:
+    positively confirms it is safe, and only by way of a fail-closed,
+    two-phase protocol (Phase 7.7b) rather than a single in-process check
+    that could go stale before removal actually happens:
 
-    - no active or quiescing lease for `handle.worktree_id`
-    - no unresolved (`STARTED`/`UNKNOWN`) tool operation for it
-    - no non-terminal task currently using it
-    - no task-owned path that was never covered by at least one durable
-      checkpoint (`_has_uncheckpointed_ownership()` — Code-Slayer-owned
-      bookkeeping)
-    - the ACTUAL, on-disk working tree exactly matches the most recent
-      durable checkpoint's tree (or, if none exists yet, `handle.
-      base_revision`) — `job_worktree_git.worktree_status()`, real Git
-      plumbing, never this module's own filesystem diff. This is an
-      *independent* fail-safe from the bookkeeping check above: it also
-      catches a modified/deleted tracked file, a staged change, or an
-      untracked file that arrived through any means other than
-      `ToolExecutor` — a human debugging the worktree, another process,
-      a future bug — regardless of whether `task_owned_paths` ever heard
-      about it. Neither check subsumes the other (see `docs/JOB_WORKTREES.md`
-      for the full picture): the bookkeeping check can refuse when Code
-      Slayer's own ownership record disagrees with a
-      now-clean working tree (e.g. externally deleted again), and the
-      Git check can refuse when the working tree disagrees with a
-      pristine bookkeeping record. Shared Git object/ref additions (a
-      checkpoint commit reachable only from its own dedicated ref) are
-      never on-disk working-tree files and therefore never count as
-      dirtiness here.
+    **Phase 1 — claim** (`_claim_for_cleanup()`): inside one committed
+    write transaction, freshly re-check every bookkeeping fact (no active
+    or quiescing lease; no unresolved `STARTED`/`UNKNOWN` tool operation;
+    no non-terminal task; no task-owned path uncovered by a durable
+    checkpoint — `_bookkeeping_safety_check()`) and, only if all pass,
+    durably record a cleanup claim on `handle.worktree_id`. From that
+    commit onward, `store.task_repo.TaskRepo.create()` and `lease.
+    manager.LeaseManager` both refuse to grant this worktree to anyone
+    new — closing the window between "cleanup decided this was safe" and
+    "the worktree is actually gone" that an unserialized check could not.
 
-    Any of those (or simply being unable to open the job's own database
-    at all, e.g. because setup never completed, or being unable to run
-    the Git cleanliness check at all) is a refusal
-    (`CleanupResult(ok=False, reason=...)`), never a best-effort deletion.
+    **Phase 2 — verify and remove**: with new ownership now provably
+    impossible, check that the ACTUAL, on-disk working tree exactly
+    matches the most recent durable checkpoint's tree (or, if none exists
+    yet, `handle.base_revision`) two independent ways — real Git plumbing
+    only, never this module's own filesystem diff: `job_worktree_git.
+    staged_changes()` (the job worktree's own real index — catches a
+    tracked change that was staged and then had its working-tree bytes
+    restored, invisible to a working-tree-only comparison) and
+    `job_worktree_git.worktree_status()` (working tree vs. the checkpoint
+    tree, `--ignored` included — an ignored-but-present file is real
+    content a removal would destroy and is never treated as disposable
+    here). Either finding anything releases the claim without removing
+    the worktree (`_abort_claim()`) and refuses. Only once both are clean
+    does `job_worktree_git.remove_worktree()` actually run.
+
+    **Failure during removal**: if `remove_worktree()` itself fails, the
+    claim is deliberately left in place (still blocking new ownership)
+    and a `JOB_WORKTREE_CLEANUP_REMOVAL_FAILED` event is recorded; no
+    `JOB_WORKTREE_RELEASED` event is ever written for an incomplete
+    removal. A later `release_job_worktree()` call for the same handle
+    safely resumes: it recognizes the standing claim, asks Git's own
+    worktree registry (`job_worktree_git.list_worktrees()`) whether the
+    removal actually completed before a crash prevented recording it,
+    and either finalizes (if so) or retries the removal (if not) —
+    without re-doing the filesystem checks, which the claim has already
+    made incapable of changing out from under it.
+
+    Any refusal (or simply being unable to open the job's own database at
+    all, e.g. because setup never completed) is `CleanupResult(ok=False,
+    reason=...)`, never a best-effort deletion. See `docs/JOB_WORKTREES.md`
+    for the full picture, including why the bookkeeping and Git-plumbing
+    checks are independent fail-safes for each other rather than either
+    one subsuming the other.
     """
     if not handle.db_path.exists():
         return CleanupResult(False, "state_incomplete_cannot_verify_safety")
 
     conn = db_module.connect(handle.db_path)
     try:
-        lease = LeaseRepo(conn).get(handle.worktree_id)
-        if lease is not None and lease.status in (LeaseStatus.ACTIVE, LeaseStatus.QUIESCING):
-            return CleanupResult(False, "active_lease")
+        claimed = _claim_for_cleanup(conn, handle)
+        if not claimed.ok:
+            return claimed
 
-        unresolved = conn.execute(
-            "SELECT 1 FROM tool_operations WHERE worktree_id = ? "
-            "AND status IN ('STARTED', 'UNKNOWN') LIMIT 1",
-            (handle.worktree_id,),
-        ).fetchone()
-        if unresolved is not None:
-            return CleanupResult(False, "unresolved_operations")
+        claim_row = _get_cleanup_claim(conn, handle.worktree_id)
+        resuming_removal = claim_row is not None and claim_row["status"] == "REMOVING"
 
-        active_task = TaskRepo(conn).get_active_for_worktree(handle.worktree_id)
-        if active_task is not None:
-            return CleanupResult(False, "active_task")
+        if resuming_removal:
+            # A previous attempt got at least as far as marking removal
+            # in progress before this call returned. Ask Git's own
+            # registry what actually happened rather than guessing:
+            # `remove_worktree()` may have succeeded and only the
+            # in-process recording of that fact was lost to a crash.
+            if str(handle.path) not in jwg.list_worktrees(cwd=handle.primary_repo_root):
+                return _finalize_removal(conn, handle)
+        else:
+            try:
+                staged = jwg.staged_changes(handle.path)
+            except jwg.JobWorktreeGitError:
+                _abort_claim(conn, handle, reason="git_staged_status_unavailable")
+                return CleanupResult(False, "git_staged_status_unavailable")
+            if staged:
+                _abort_claim(conn, handle, reason="git_worktree_staged_changes")
+                return CleanupResult(False, "git_worktree_staged_changes")
 
-        if _has_uncheckpointed_ownership(conn, handle.worktree_id):
-            return CleanupResult(False, "uncheckpointed_changes")
+            target = _latest_checkpoint_tree(conn, handle.worktree_id) or handle.base_revision
+            handle.tmp_dir.mkdir(parents=True, exist_ok=True)
+            index_path = handle.tmp_dir / f"cleanup-status-{uuid.uuid4().hex}"
+            try:
+                dirty = jwg.worktree_status(handle.path, against=target, index_path=index_path)
+            except jwg.JobWorktreeGitError:
+                _abort_claim(conn, handle, reason="git_worktree_status_unavailable")
+                return CleanupResult(False, "git_worktree_status_unavailable")
+            finally:
+                index_path.unlink(missing_ok=True)
+            if dirty:
+                _abort_claim(conn, handle, reason="git_worktree_dirty")
+                return CleanupResult(False, "git_worktree_dirty")
 
-        target = _latest_checkpoint_tree(conn, handle.worktree_id) or handle.base_revision
-        handle.tmp_dir.mkdir(parents=True, exist_ok=True)
-        index_path = handle.tmp_dir / f"cleanup-status-{uuid.uuid4().hex}"
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE job_worktree_cleanup_claims SET status = 'REMOVING' "
+                    "WHERE worktree_id = ?",
+                    (handle.worktree_id,),
+                )
+
         try:
-            dirty = jwg.worktree_status(handle.path, against=target, index_path=index_path)
-        except jwg.JobWorktreeGitError:
-            return CleanupResult(False, "git_worktree_status_unavailable")
-        finally:
-            index_path.unlink(missing_ok=True)
-        if dirty:
-            return CleanupResult(False, "git_worktree_dirty")
+            jwg.remove_worktree(handle.path, cwd=handle.primary_repo_root, force=True)
+        except jwg.JobWorktreeGitError as exc:
+            with transaction(conn):
+                _event(conn, EventType.JOB_WORKTREE_CLEANUP_REMOVAL_FAILED, {
+                    "repo_id": handle.repo_id, "worktree_id": handle.worktree_id,
+                    "path": str(handle.path), "error": str(exc),
+                })
+            return CleanupResult(False, "git_worktree_remove_failed")
 
-        jwg.remove_worktree(handle.path, cwd=handle.primary_repo_root, force=True)
-        with transaction(conn):
-            _event(conn, EventType.JOB_WORKTREE_RELEASED, {
-                "repo_id": handle.repo_id, "worktree_id": handle.worktree_id,
-                "path": str(handle.path), "reason": "conservative_cleanup",
-            })
+        return _finalize_removal(conn, handle)
     finally:
         conn.close()
-    return CleanupResult(True, "removed")

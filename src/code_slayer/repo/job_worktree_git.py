@@ -6,10 +6,13 @@ write) and `repo/checkpoint_git.py` (blob/tree/commit/ref plumbing that
 never touches a real branch, index, or working tree), this module
 performs the Git operations this phase needs that DO create/remove a real
 linked working tree, or read its actual on-disk state: `git worktree add
---detach`, `git worktree remove`, and (cleanup-hardening) a real-tree-vs-
-real-working-tree cleanliness check built the same way
-`checkpoint_git.build_tree()` builds a tree — a private, temporary index
-file, never the job worktree's own real `.git/index`. None of this ever
+--detach`, `git worktree remove`, a real-tree-vs-real-working-tree
+cleanliness check built the same way `checkpoint_git.build_tree()` builds
+a tree — a private, temporary index file, never the job worktree's own
+real `.git/index` — and (Phase 7.7b) `staged_changes()`, the one function
+here that DOES deliberately read the job worktree's own real `.git/index`
+(read-only, via `git diff --cached`) because a private, temporary index
+can never see content someone actually staged there. None of this ever
 touches the PRIMARY worktree's own HEAD, index, or working-tree files —
 only the primary repository's shared object/ref database (every linked
 worktree shares this) and the new linked worktree's own private git-dir
@@ -141,21 +144,34 @@ def worktree_status(path: Path, *, against: str, index_path: Path) -> tuple[str,
     (never a filesystem diff this module computes itself — Git's own
     `status --porcelain` is the sole authority) differs from the tree
     named by `against` (a commit-ish or tree-ish): a modified tracked
-    file, a deleted tracked file, or an untracked file. Empty means the
-    working tree exactly matches `against`.
+    file, a deleted tracked file, an untracked file, or — Phase 7.7b —
+    an *ignored* file that still physically exists. Empty means the
+    working tree exactly matches `against` and nothing removing it would
+    destroy.
+
+    Ignored content is included deliberately (`--ignored`, the
+    traditional per-file mode, never `--ignored=matching`, which would
+    collapse a whole ignored directory into one non-enumerable entry):
+    for Code Slayer's own cleanup purposes, "ignored by `.gitignore`"
+    describes what a *commit* should skip, not what is disposable —
+    `job_worktree.release_job_worktree()`'s own docstring states this
+    explicitly. A build artifact, a cache file, or a log file the job
+    itself produced is real filesystem content that `remove_worktree()`
+    would permanently destroy, ignored or not.
 
     Uses a private, temporary index file at `index_path` (created fresh
     here, overwritten if it already exists; the caller removes it when
     done) seeded from `against` via `git read-tree` — exactly the same
     pattern `checkpoint_git.build_tree()` already uses for a different
     purpose. The job worktree's own real `.git/index` and `HEAD` are
-    never read from or written to by this call, and `against` differing
-    from the job worktree's own (permanently base-revision-pinned) `HEAD`
-    is never itself reported as dirtiness — only the working tree
-    actually disagreeing with `against`'s own content is. A shared Git
-    object/ref addition (e.g. a checkpoint commit reachable only from its
-    own dedicated ref) is not an on-disk working-tree file and therefore
-    never appears here either.
+    never read from or written to by this call (see `staged_changes()`
+    for the check that *does* inspect the real index), and `against`
+    differing from the job worktree's own (permanently
+    base-revision-pinned) `HEAD` is never itself reported as dirtiness —
+    only the working tree actually disagreeing with `against`'s own
+    content is. A shared Git object/ref addition (e.g. a checkpoint
+    commit reachable only from its own dedicated ref) is not an on-disk
+    working-tree file and therefore never appears here either.
     """
     if index_path.exists():
         index_path.unlink()
@@ -163,7 +179,10 @@ def worktree_status(path: Path, *, against: str, index_path: Path) -> tuple[str,
     if read.returncode != 0:
         raise JobWorktreeGitError(f"cannot read tree {against!r} for cleanliness check")
     result = _run(
-        ["status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=all"],
+        [
+            "status", "--porcelain=v2", "--untracked-files=all",
+            "--ignore-submodules=all", "--ignored",
+        ],
         cwd=path, index_path=index_path,
     )
     if result.returncode != 0:
@@ -172,8 +191,12 @@ def worktree_status(path: Path, *, against: str, index_path: Path) -> tuple[str,
     for line in result.stdout.splitlines():
         if not line:
             continue
-        if line.startswith("? "):
-            dirty.append(line[len("? "):].strip())
+        if line.startswith(("? ", "! ")):
+            # Untracked ("?") and ignored-but-present ("!") content are
+            # both physical filesystem bytes `remove_worktree()` would
+            # destroy — see this function's own docstring on why ignored
+            # is never treated as disposable here.
+            dirty.append(line[2:].strip())
             continue
         if line.startswith("u "):
             # An unmerged/conflicted path is never clean, regardless of
@@ -206,3 +229,39 @@ def worktree_status(path: Path, *, against: str, index_path: Path) -> tuple[str,
 def is_worktree_clean(path: Path, *, against: str, index_path: Path) -> bool:
     """`True` if `worktree_status()` reports no differences at all."""
     return worktree_status(path, against=against, index_path=index_path) == ()
+
+
+def staged_changes(path: Path) -> tuple[str, ...]:
+    """Every path staged in `path`'s own REAL index (never the private,
+    temporary one `worktree_status()` seeds) that differs from its own
+    `HEAD` — Phase 7.7b's fix for the "staged-only state can be lost"
+    finding: a tracked file that was modified, `git add`ed, and then had
+    its working-tree bytes restored to match `HEAD`/the checkpoint tree
+    is invisible to a working-tree-vs-tree comparison (the bytes on disk
+    are clean) but the staged blob a later `git commit` would use is not
+    — cleanup must see that too.
+
+    `git diff --cached --name-only HEAD` is run with no `GIT_INDEX_FILE`
+    override, so it reads the job worktree's own genuine `.git/index` —
+    read-only; `git diff` never mutates the index it compares. This
+    reports staged modifications, staged additions, and staged deletions
+    alike (confirmed empirically: `git rm --cached` and a staged new file
+    both appear here exactly as a staged edit does). It deliberately
+    compares against `HEAD` specifically, not against `against`
+    (`worktree_status()`'s checkpoint-or-base-revision target): a job
+    worktree's `HEAD` never moves after `job_worktree_git.add_worktree()`
+    creates it (see `job_worktree.py`'s "Base revision: explicit, frozen,
+    detached"), and nothing in Code Slayer's own tool-execution path ever
+    legitimately stages anything, so ANY staged difference from that
+    permanently-fixed `HEAD` is unexplained, real index content that a
+    `git worktree remove` would discard.
+
+    Intent-to-add (`git add -N`) needs no special handling here: it is
+    invisible to `git diff --cached`, but the physically-existing file it
+    marks is already caught by `worktree_status()`'s own untracked-file
+    detection regardless of what the real index's intent-to-add bit says.
+    """
+    result = _run(["diff", "--cached", "--name-only", "HEAD"], cwd=path)
+    if result.returncode != 0:
+        raise JobWorktreeGitError("git diff --cached failed during cleanliness check")
+    return tuple(line for line in result.stdout.splitlines() if line)

@@ -300,8 +300,21 @@ class LeaseManager:
         self, worktree_id: str, task_id: str, worker_id: str, worker_session_id: str,
         expected: WorkerLease | None,
     ) -> LeaseResult:
+        """Grant a fresh ownership epoch — the one path that establishes
+        NEW ownership of a worktree, as opposed to `renew()`/`release()`
+        acting on one already held. Phase 7.7b: refuses (inside this same
+        write transaction) if `repo.job_worktree.release_job_worktree()`
+        currently holds a durable cleanup claim on `worktree_id` — the
+        other half of the check/delete race fix alongside `store.
+        task_repo.TaskRepo.create()`'s own guard."""
         now_iso = self._now_fn()
         with transaction(self._conn):
+            claimed = self._conn.execute(
+                "SELECT 1 FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+                (worktree_id,),
+            ).fetchone()
+            if claimed is not None:
+                return _deny("job_worktree_cleanup_in_progress")
             current = self._leases.get(worktree_id)
             if expected is None:
                 if current is not None:

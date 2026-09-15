@@ -31,6 +31,15 @@ class TaskAlreadyActiveError(RuntimeError):
     """A non-terminal task already exists for this worktree (INV-2)."""
 
 
+class WorktreeCleanupInProgressError(RuntimeError):
+    """`repo.job_worktree.release_job_worktree()` has durably claimed this
+    worktree as safe to remove (`job_worktree_cleanup_claims`) and no new
+    task may be created for it until that claim resolves — Phase 7.7b's
+    fix for the cleanup check/delete race: a task created after cleanup's
+    safety check but before the worktree is actually removed would have
+    its state destroyed out from under it."""
+
+
 class TaskRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -53,12 +62,25 @@ class TaskRepo:
 
         Raises `TaskAlreadyActiveError` if the worktree already has a
         non-terminal task (enforced by the database's own partial unique
-        index, not merely application discipline).
+        index, not merely application discipline). Raises
+        `WorktreeCleanupInProgressError` if `repo.job_worktree.
+        release_job_worktree()` currently holds a durable cleanup claim
+        on `worktree_id` (Phase 7.7b) — checked inside this same write
+        transaction, so it can never race a claim being recorded
+        concurrently.
         """
         task_id = task_id or str(uuid.uuid4())
         now = utcnow_iso()
         config_json = json.dumps(config or {})
         with transaction(self._conn):
+            claimed = self._conn.execute(
+                "SELECT 1 FROM job_worktree_cleanup_claims WHERE worktree_id = ?",
+                (worktree_id,),
+            ).fetchone()
+            if claimed is not None:
+                raise WorktreeCleanupInProgressError(
+                    f"worktree {worktree_id!r} is currently claimed for cleanup"
+                )
             try:
                 self._conn.execute(
                     "INSERT INTO tasks (task_id, description, repo_root, repo_id, "

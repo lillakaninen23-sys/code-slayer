@@ -61,6 +61,14 @@ class EventType(StrEnum):
     # system-level event with no task to attribute it to yet.
     JOB_WORKTREE_CREATED = "JOB_WORKTREE_CREATED"
     JOB_WORKTREE_RELEASED = "JOB_WORKTREE_RELEASED"
+    # Phase 7.7b: cleanup-authority claim/abort/failure bookkeeping
+    # (`repo.job_worktree.release_job_worktree()`) -- the minimal new
+    # events needed to audit the two-phase cleanup protocol's own
+    # decisions; JOB_WORKTREE_RELEASED above still covers the terminal
+    # success case, so no parallel "released" event is added here.
+    JOB_WORKTREE_CLEANUP_CLAIMED = "JOB_WORKTREE_CLEANUP_CLAIMED"
+    JOB_WORKTREE_CLEANUP_ABORTED = "JOB_WORKTREE_CLEANUP_ABORTED"
+    JOB_WORKTREE_CLEANUP_REMOVAL_FAILED = "JOB_WORKTREE_CLEANUP_REMOVAL_FAILED"
     # Phase 7.6: durable provenance for one Prompt Analyst / Question
     # Gate decision (`workers.prompt_provenance`) -- the small,
     # structured facts a later query needs (content hashes, the gate's

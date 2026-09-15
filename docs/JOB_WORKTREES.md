@@ -102,7 +102,7 @@ succeeds, `create_job_worktree()` raises
 `JobWorktreeSetupIncompleteError` and deliberately does **not** remove
 the worktree — recoverable, never silently discarded.
 
-## Cleanup: conservative, refusal-first
+## Cleanup: conservative, refusal-first, and race-closed
 
 `repo.job_worktree.release_job_worktree(handle)` never deletes a job
 worktree unless durable evidence positively confirms it is safe:
@@ -112,35 +112,78 @@ worktree unless durable evidence positively confirms it is safe:
 - no non-terminal task currently using it,
 - no task-owned path that was never covered by at least one durable
   checkpoint (Code-Slayer-owned bookkeeping: `task_owned_paths` /
-  `checkpoints`), and
-- **(cleanup-hardening follow-up)** the ACTUAL on-disk working tree
-  exactly matches the most recent durable checkpoint's tree — or, if
-  none exists yet, the pinned `base_revision` — checked with real Git
-  plumbing (`job_worktree_git.worktree_status()`, a `git read-tree` into
-  a private temporary index followed by `git status --porcelain=v2
-  --untracked-files=all`), never a filesystem diff this module invents.
+  `checkpoints`),
+- the ACTUAL on-disk working tree exactly matches the most recent
+  durable checkpoint's tree — or, if none exists yet, the pinned
+  `base_revision` — checked with real Git plumbing
+  (`job_worktree_git.worktree_status()`, a `git read-tree` into a
+  private temporary index followed by `git status --porcelain=v2
+  --untracked-files=all --ignored`), never a filesystem diff this module
+  invents, and
+- **(Phase 7.7b)** no staged difference in the job worktree's own REAL
+  index vs. its own (frozen, never-moving) `HEAD`
+  (`job_worktree_git.staged_changes()`, `git diff --cached --name-only
+  HEAD`) — a tracked file modified, staged, and then restored to its
+  original bytes is invisible to a working-tree-only comparison, but its
+  staged blob is not clean.
 
-The last check is a deliberate, independent fail-safe over the
-bookkeeping checks above it: `task_owned_paths` only knows what
+`worktree_status()`'s `--ignored` (Phase 7.7b) means content matched by
+`.gitignore` is never treated as disposable here: for cleanup's own
+purposes, "ignored" describes what a *commit* should skip, not what a
+`git worktree remove` may destroy — a build artifact, cache file, or log
+the job itself produced is real content either way.
+
+These Git-plumbing checks are a deliberate, independent fail-safe over
+the bookkeeping checks above them: `task_owned_paths` only knows what
 `ToolExecutor` itself recorded as owned, so a human debugging the
 worktree, another process, or a future bug could otherwise leave a
-modified file, a deleted file, a staged change, or an untracked file
-entirely invisible to the bookkeeping-only checks. Neither check
+modified, deleted, staged, untracked, or ignored-but-present change
+entirely invisible to the bookkeeping-only checks. Neither kind of check
 subsumes the other: the bookkeeping check can refuse when Code Slayer's
 own ownership record disagrees with an (again) clean working tree (e.g.
-externally created content later externally deleted), and the Git check
-can refuse when the actual working tree disagrees with an otherwise
-pristine bookkeeping record. A shared Git object/ref addition (a
-checkpoint commit reachable only from its own dedicated ref) is not an
-on-disk working-tree file and is never itself reported as dirtiness.
+externally created content later externally deleted), and the Git checks
+can refuse when the actual on-disk/index state disagrees with an
+otherwise pristine bookkeeping record. A shared Git object/ref addition
+(a checkpoint commit reachable only from its own dedicated ref) is not
+an on-disk working-tree file and is never itself reported as dirtiness.
 
-Any of those conditions — or simply being unable to open the job's own
-database at all (setup never completed), or being unable to run the Git
-cleanliness check at all — is a refusal
-(`CleanupResult(ok=False, reason=...)`), never a best-effort deletion.
-Even a successful cleanup only removes the disposable Git working tree
-itself; the job's own `state.db`/`blobs/` audit trail is deliberately
-left in place as a historical record.
+**The cleanup/delete race (Phase 7.7b).** All of the checks above answer
+"is this safe right now?" — none of them, by themselves, stay true
+across the gap between deciding and actually running `git worktree
+remove`. `release_job_worktree()` closes that gap with a two-phase,
+fail-closed protocol instead of pretending the decision and the removal
+are one atomic step:
+
+1. **Claim** — inside one committed write transaction, every bookkeeping
+   check above is freshly re-run and, only if all pass, a durable row is
+   recorded in `job_worktree_cleanup_claims` (schema v6). From that
+   commit on, `store.task_repo.TaskRepo.create()` and `lease.manager.
+   LeaseManager`'s fresh-epoch grant both refuse to establish new
+   ownership of a worktree a claim names — checked inside their own
+   write transaction, so SQLite's own write-lock discipline (`BEGIN
+   IMMEDIATE`) totally orders the claim against any concurrent attempt
+   to acquire a lease or create a task for the same worktree. No new
+   filesystem lock is invented.
+2. **Verify and remove** — with new ownership now provably impossible,
+   the two Git-plumbing checks above run, then (only if both are clean)
+   `job_worktree_git.remove_worktree()` actually runs. Either Git check
+   failing releases the claim without removing anything.
+
+If `remove_worktree()` itself fails, the claim is deliberately left
+standing (new ownership stays blocked) and a `JOB_WORKTREE_CLEANUP_
+REMOVAL_FAILED` event is recorded — no `JOB_WORKTREE_RELEASED` event is
+ever written for an incomplete removal. A later `release_job_worktree()`
+call for the same handle recognizes the standing claim and asks Git's
+own worktree registry (`list_worktrees()`) whether removal actually
+completed before a crash prevented recording it, so a safe retry never
+guesses either way.
+
+Any refusal condition — or simply being unable to open the job's own
+database at all (setup never completed), or being unable to run a Git
+check at all — is a refusal (`CleanupResult(ok=False, reason=...)`),
+never a best-effort deletion. Even a successful cleanup only removes the
+disposable Git working tree itself; the job's own `state.db`/`blobs/`
+audit trail is deliberately left in place as a historical record.
 
 ## No promotion into the primary worktree
 
@@ -186,3 +229,18 @@ proving the Git-level check is not redundant with the bookkeeping check;
 a refusal from either check leaves the worktree, its state directory,
 and its checkpoint evidence completely intact; and the primary
 repository's `HEAD`/index/working tree remain untouched throughout.
+
+Phase 7.7b adds: a staged modification whose working-tree bytes were
+restored, a staged new file, and a staged deletion (real-index-only
+differences a working-tree comparison alone cannot see) each refuse
+cleanup; an ignored file, including one nested several directories deep,
+refuses cleanup even though a plain (non-`--ignored`) status check
+cannot see it either; a task-creation or lease-acquisition attempt
+landing between cleanup's safety decision and the actual removal is
+refused rather than silently allowed to race ahead, and cleanup then
+proceeds to remove the worktree safely once that racing attempt has
+failed; a failed `git worktree remove` leaves the durable claim, the
+worktree, and all checkpoint/audit evidence intact and permits a later
+call to retry (including recognizing that removal actually already
+succeeded before an in-process crash); and none of this new claim/abort/
+retry machinery ever touches the primary repository.
