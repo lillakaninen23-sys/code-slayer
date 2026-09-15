@@ -475,6 +475,7 @@ def test_reads_do_not_write_or_call_runner_actions(setup):
 # --- Phase 8.1: repository intelligence API ---------------------------------
 
 def test_api_intelligence_status(setup):
+    (setup / "pyproject.toml").write_text('[project]\nname = "demo"\n[tool.pytest.ini_options]\n')
     client, _, _ = application(setup)
     status = client.get("/api/intelligence/status").json
     assert status["indexed"] is False
@@ -482,6 +483,8 @@ def test_api_intelligence_status(setup):
     assert refreshed["indexed"] is True and refreshed["current"] is True
     status = client.get("/api/intelligence/status").json
     assert status["snapshot_id"] == refreshed["snapshot_id"]
+    assert any(p["kind"] == "python" for p in status["projects"])
+    assert any(c["command"] == "pytest" for c in status["commands"])
 
 
 def test_api_intelligence_query(setup):

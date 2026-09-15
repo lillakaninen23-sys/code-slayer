@@ -35,8 +35,10 @@ from code_slayer.intelligence.limits import (
     MAX_QUERY_RESULTS,
 )
 from code_slayer.intelligence.models import (
+    CommandCandidate,
     ContextCandidate,
     ContextPack,
+    ProjectEvidence,
     Snapshot,
     snapshot_from_dict,
     snapshot_to_dict,
@@ -64,7 +66,8 @@ class Status:
     created_at: str | None
     file_count: int | None
     inventory_truncated: bool | None
-    projects: tuple[str, ...] = ()
+    projects: tuple[ProjectEvidence, ...] = ()
+    commands: tuple[CommandCandidate, ...] = ()
 
 
 class RepositoryIntelligenceService:
@@ -166,7 +169,7 @@ class RepositoryIntelligenceService:
             indexed=True, current=current, snapshot_id=row.snapshot_id, head_sha=row.head_sha,
             working_tree_dirty=row.working_tree_dirty, created_at=row.created_at,
             file_count=row.file_count, inventory_truncated=row.inventory_truncated,
-            projects=tuple(p.kind for p in snapshot.projects),
+            projects=snapshot.projects, commands=snapshot.commands,
         )
 
     def query(
