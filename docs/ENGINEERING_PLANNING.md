@@ -289,12 +289,62 @@ repository content (facts are cited by path/snapshot_id reference,
 never re-embedded as bytes). Training itself is out of scope for this
 phase.
 
+## Durable background jobs (Phase 8.2d)
+
+`POST /api/plans`/`POST /api/plans/{plan_id}/replan` no longer hold the
+HTTP connection for the whole planner turn — HTTP client lifetime has
+**zero authority** over whether a planning job continues. Each durably
+creates an `engineering_plans` `DRAFT` row (synchronously, no
+inference) plus a `planning_jobs` row (migration `0009`) and returns
+`202 Accepted` immediately with `{job_id, plan_id, state: "QUEUED",
+status_url}`. `planning.executor.PlanningJobExecutor` — one long-lived,
+process-owned background dispatcher, started once at server startup
+(`api.service.ApplicationService.__init__`), never per request — claims
+and executes it later. A disconnecting/backgrounded/suspended browser
+changes nothing about whether or when the job runs; only an explicit,
+future application-owned cancellation mechanism could ever cancel one
+(none exists yet — client disconnect is never inferred as
+cancellation).
+
+**Job state is a separate concern from plan state**
+(`planning.models.JobState`: `QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`,
+vs. `PlanState`): a job is `SUCCEEDED` whenever the planner turn itself
+produced genuine structured output — regardless of whether the
+resulting plan reached `READY`, `NEEDS_INPUT`, or even `DRAFT` because
+evidence validation rejected one of its claims. A job is `FAILED` only
+when the turn itself never produced valid structured output (a
+transport failure, a non-tool response, or a schema-invalid tool call —
+the same `PlannerFailureCategory` from Phase 8.2b, now the job's own
+`failure_category`) or an internal error interrupted execution.
+
+**Ownership/claim**: a job's `owner_pid`/`owner_pid_started_at`/
+`owner_generation` mirror `lease.manager`'s own fencing-token pattern at
+a much smaller scope — see `store.migrations.0009_planning_jobs`'s
+module comment and `EngineeringPlanningService.claim_job()` for the
+full safety argument (concurrent dispatchers, crash-then-restart,
+stale-owner refusal, terminal-job immutability), built on the same
+generic `lease.liveness.check_process_liveness()` Phase 6 already
+established — never a new liveness mechanism.
+
+`resume()` performs no model inference at all (it only re-evaluates the
+already-hardened Question Gate against durable resolutions), so
+`POST /api/plans/{plan_id}/resume` remains synchronous, `200 OK` — there
+is no long-running turn to move into a background job.
+
+**Server lifetime**: the executor's dispatcher thread is a daemon
+thread with no explicit shutdown hook — a hard process kill (or a
+graceful one) simply stops it, which is exactly the crash case its own
+recovery logic already handles correctly on the next start. This works
+unmodified under the existing systemd-hosted `codeslayer serve` process
+model; no second ad-hoc background-process architecture was introduced.
+
 ## HTTP API
 
 See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
 `GET/POST /api/plans`, `GET /api/plans/{plan_id}`, `POST /api/plans/
-{plan_id}/resume`, `POST /api/plans/{plan_id}/replan`, and `POST
-/api/plans/{plan_id}/resolutions`.
+{plan_id}/resume`, `POST /api/plans/{plan_id}/replan`, `POST
+/api/plans/{plan_id}/resolutions`, `GET /api/planning-jobs`, and
+`GET /api/planning-jobs/{job_id}`.
 
 ## Known limitations
 
@@ -306,21 +356,11 @@ See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
   Phase 8 slices) — this phase produces a plan, never a verified diff.
 - No execution path exists that consumes a `READY` plan; that is a
   deliberately separate, later decision.
-- **`POST /api/plans` is synchronous and tied to the HTTP request**
-  (Phase 8.2b): a real planner turn against a local model can take
-  tens of seconds to minutes, held entirely on that one HTTP
-  connection/thread for its whole duration. A client that disconnects
-  or is suspended mid-request (e.g. a mobile browser backgrounding the
-  tab, or Safari's own aggressive request suspension) loses its
-  response, even though the plan itself may still complete durably
-  server-side (the plan row/content already exists once `create()`
-  returns — a client can always `GET /api/plans/{plan_id}` afterward to
-  see the actual outcome). This phase deliberately does not solve
-  durable background execution — that is explicitly out of scope here.
-  A later, dedicated slice must make planning turns a server-owned,
-  durable job (create → return immediately with a job/plan id in a
-  pending state → poll or receive a durable status update) so a
-  disconnecting client never affects execution, mirroring how `runner.
-  local_worker_runner.LocalWorkerRunner`'s own `RUNNING`/resume model
-  already decouples a bounded worker turn from any one HTTP request's
-  lifetime.
+- No explicit, application-owned job-cancellation mechanism exists yet
+  — a `QUEUED`/`RUNNING` job always runs to completion once accepted.
+- The background executor defaults to exactly one concurrent worker.
+  Testing under real concurrency (`max_workers=2`) surfaced an
+  intermittent `git` index-lock race when two planning turns invoke
+  Repository Intelligence against the *same* working tree at the same
+  moment — evidence that safe parallelism here is not yet trivial, so
+  the conservative default is kept rather than raised speculatively.

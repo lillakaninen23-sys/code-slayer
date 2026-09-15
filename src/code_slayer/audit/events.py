@@ -129,3 +129,12 @@ class EventType(StrEnum):
     PLAN_RESUMED = "PLAN_RESUMED"
     PLAN_FINISHED = "PLAN_FINISHED"
     PLAN_SUPERSEDED = "PLAN_SUPERSEDED"
+    # Phase 8.2d: a background planning job's own execution-lifecycle
+    # events (`planning.service.EngineeringPlanningService`/`planning.
+    # executor.PlanningJobExecutor`) -- distinct from PLAN_* above, which
+    # record the plan CONTENT's own lifecycle; these record whether one
+    # execution ATTEMPT ran, and by whom. Never a mutation/execution
+    # event; never carries raw model output.
+    PLANNING_JOB_ACCEPTED = "PLANNING_JOB_ACCEPTED"
+    PLANNING_JOB_CLAIMED = "PLANNING_JOB_CLAIMED"
+    PLANNING_JOB_FINISHED = "PLANNING_JOB_FINISHED"

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
 from code_slayer.intelligence import RepositoryIntelligenceService
+from code_slayer.planning.executor import PlanningJobExecutor
 from code_slayer.planning.service import EngineeringPlanningService
 from code_slayer.repo import identity
 from code_slayer.runner import LocalWorkerRunner
@@ -32,6 +33,13 @@ class RuntimeBindings:
     analyst_factory: Callable[[], PromptAnalyst] | None = None
     adapter_factory: Callable[[str, str], WorkerAdapter | None] | None = None
     planner_factory: Callable[[], object] | None = None
+    # Background planning executor tuning (Phase 8.2d) -- server
+    # configuration only, never client-facing. Correctness over
+    # throughput: one worker by default (see `planning.executor`'s
+    # module docstring). A smaller poll interval is useful for tests;
+    # production has no reason to lower it below the default.
+    planning_max_workers: int = 1
+    planning_poll_interval_seconds: float = 2.0
 
 
 class ApplicationService:
@@ -43,6 +51,34 @@ class ApplicationService:
         with self.runner():
             pass
         self.identity = identity.resolve(self.repo_path, create=False)
+        # One long-lived background planning executor per process (Phase
+        # 8.2d) -- never one per HTTP request. Only constructed/started
+        # when a Planner is actually configured; when it is not, POST
+        # /api/plans fails explicitly (see `_require_planner_configured()`)
+        # rather than accepting a job nothing could ever execute.
+        self._planning_executor = None
+        if self.bindings.planner_factory is not None:
+            self._planning_executor = PlanningJobExecutor(
+                self.repo_path, planner_factory=self.bindings.planner_factory,
+                state_root_override=self.state_root,
+                max_workers=self.bindings.planning_max_workers,
+                poll_interval_seconds=self.bindings.planning_poll_interval_seconds,
+            )
+            self._planning_executor.start()
+
+    def close(self) -> None:
+        """Stop this instance's background planning executor, if one was
+        started. Production (`cli.main.serve`, run via `waitress`, itself
+        run under the existing systemd-hosted process) has no call site
+        for this -- the executor's dispatcher thread is a daemon thread
+        and simply exits with the process, which is exactly Case B's own
+        crash-safe recovery path exercised the ordinary way. This exists
+        so tests (and any embedding context that constructs many
+        short-lived `ApplicationService` instances in one process) can
+        avoid leaking an unbounded number of live background dispatcher
+        threads across a long-running test session."""
+        if self._planning_executor is not None:
+            self._planning_executor.stop()
 
     @contextmanager
     def runner(self):
@@ -158,10 +194,13 @@ class ApplicationService:
         # `planning.models`'s own StrEnum members; no custom encoder needed).
         return asdict(record)
 
-    def _planner(self):
+    @staticmethod
+    def _job_json(record):
+        return asdict(record) | {"status_url": f"/api/planning-jobs/{record.job_id}"}
+
+    def _require_planner_configured(self):
         if self.bindings.planner_factory is None:
             raise APIError("planner_not_configured", "Configure a server-side Planner.", 503)
-        return self.bindings.planner_factory()
 
     def list_plans(self, limit, offset):
         with self.planning() as service:
@@ -175,12 +214,22 @@ class ApplicationService:
                 raise APIError("not_found", "Plan not found.", 404) from None
 
     def create_plan(self, data):
-        planner = self._planner()
+        """Durably accepts a new planning job and returns immediately —
+        HTTP 202 (see `api.routes.create_plan`). No planner is ever
+        invoked on this request's own thread; `self._planning_executor`
+        (started once at process startup, never per request) claims and
+        executes it in the background."""
+        self._require_planner_configured()
         with self.planning() as service:
-            record = service.create(original_request=data["request"], planner=planner)
-        return self._plan_json(record)
+            job = service.create_job(original_request=data["request"])
+        self._planning_executor.notify()
+        return self._job_json(job)
 
     def resume_plan(self, plan_id):
+        """Synchronous: `EngineeringPlanningService.resume()` only
+        re-evaluates the already-hardened Question Gate against durable
+        resolutions — it never invokes a planner, so there is no
+        long-running inference here to move to a background job."""
         with self.planning() as service:
             try:
                 record = service.resume(plan_id)
@@ -189,15 +238,31 @@ class ApplicationService:
         return self._plan_json(record)
 
     def replan_plan(self, plan_id):
-        planner = self._planner()
+        """Durably accepts a replan job and returns immediately — HTTP
+        202, same as `create_plan()`. `replan()` (the synchronous,
+        planner-invoking equivalent) is never called from this path."""
+        self._require_planner_configured()
         with self.planning() as service:
             try:
-                record = service.replan(plan_id, planner=planner)
+                job = service.replan_job(plan_id)
             except KeyError:
                 raise APIError("not_found", "Plan not found.", 404) from None
             except ValueError as exc:
                 raise APIError("plan_superseded", str(exc), 409) from None
-        return self._plan_json(record)
+        self._planning_executor.notify()
+        return self._job_json(job)
+
+    def list_planning_jobs(self, limit, offset):
+        with self.planning() as service:
+            jobs = service.list_jobs(limit=limit, offset=offset)
+            return {"jobs": [self._job_json(j) for j in jobs]}
+
+    def get_planning_job(self, job_id):
+        with self.planning() as service:
+            try:
+                return self._job_json(service.get_job(job_id))
+            except KeyError:
+                raise APIError("not_found", "Planning job not found.", 404) from None
 
     def resolve_plan(self, plan_id, data):
         with self.planning() as service:

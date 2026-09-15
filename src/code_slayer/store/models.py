@@ -196,6 +196,35 @@ class RunnerHumanResolution:
 
 
 @dataclass(frozen=True)
+class PlanningJobRow:
+    """One durable, mutable background-planning-job record (Phase 8.2d —
+    `planning.service.EngineeringPlanningService`). A job's `state`
+    (QUEUED/RUNNING/SUCCEEDED/FAILED) is a distinct concern from the
+    `EngineeringPlanRow` it points at via `plan_id` — see
+    `store.migrations.0009_planning_jobs`'s module comment. Identity
+    fields locked at creation; ownership/outcome fields evolve as the
+    job progresses."""
+
+    job_id: str
+    plan_id: str
+    repo_id: str
+    worktree_id: str
+    created_at: str
+    updated_at: str
+    kind: str
+    state: str
+    attempt: int
+    owner_pid: int | None
+    owner_pid_started_at: str | None
+    owner_generation: int
+    started_at: str | None
+    finished_at: str | None
+    failure_category: str | None
+    failure_reason: str | None
+    predecessor_job_id: str | None
+
+
+@dataclass(frozen=True)
 class EngineeringPlanRow:
     """One durable, mutable engineering-plan revision record (Phase 8.2
     — `planning.service.EngineeringPlanningService`). Mirrors

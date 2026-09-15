@@ -59,6 +59,60 @@ class PlanState(StrEnum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class JobState(StrEnum):
+    """A background planning job's own execution-lifecycle state (Phase
+    8.2d) — a deliberately separate concern from `PlanState` (see this
+    module's own docstring and `store.migrations.
+    0009_planning_jobs`'s comment). A job describes whether *one
+    execution attempt* (a real planner turn, run on a background thread
+    the HTTP request never waits on) has completed; a plan describes
+    whether its *content* is valid.
+
+    `QUEUED` — durably accepted, not yet claimed by any executor.
+    `RUNNING` — claimed by exactly one owner (`owner_pid`/
+    `owner_pid_started_at`/`owner_generation`); see `planning.service.
+    EngineeringPlanningService.claim_job()`.
+    `SUCCEEDED` — the planner turn completed and produced genuine
+    structured output — regardless of what `PlanState` the resulting
+    plan reached (`READY`, `NEEDS_INPUT`, or even `DRAFT` because
+    evidence validation rejected one of the model's own claims: the
+    *turn itself* still succeeded).
+    `FAILED` — the planner turn itself never produced valid structured
+    output (a transport failure, a non-tool response, or a genuine tool
+    call whose params failed schema validation — see `planning.planner.
+    PlannerFailureCategory`), or an internal error interrupted
+    execution. Terminal, like `SUCCEEDED`: neither state machine trigger
+    (`0009_planning_jobs.sql`'s `planning_jobs_no_reopen_terminal`) ever
+    reopens a terminal job automatically.
+    """
+
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class PlanningJobRecord:
+    """A structured, HTTP/WebUI-safe view of one planning job — never
+    internal SQLite/connection details, and never raw planner output
+    (`failure_category`/`failure_reason` are the same small, coarse,
+    code-owned codes `EngineeringPlanContent`/`PlanRecord` already use;
+    full detail stays durable-internal-only via `planning.provenance`)."""
+
+    job_id: str
+    plan_id: str
+    kind: str
+    state: str
+    attempt: int
+    created_at: str
+    updated_at: str
+    started_at: str | None
+    finished_at: str | None
+    failure_category: str | None
+    failure_reason: str | None
+
+
 class AffectedFileAction(StrEnum):
     INSPECT = "inspect"
     MODIFY = "modify"

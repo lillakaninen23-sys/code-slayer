@@ -77,6 +77,7 @@ persisted from it.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -85,6 +86,7 @@ from pathlib import Path
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.intelligence.service import RepositoryIntelligenceService
+from code_slayer.lease.liveness import Liveness, check_process_liveness, process_start_time
 from code_slayer.planning import provenance
 from code_slayer.planning.evidence import validate_plan_against_intelligence
 from code_slayer.planning.limits import (
@@ -92,13 +94,20 @@ from code_slayer.planning.limits import (
     PLANNER_MAX_PER_FILE_BYTES,
     PLANNER_MAX_TOTAL_FILE_BYTES,
 )
-from code_slayer.planning.models import EngineeringPlanContent, OpenQuestion, PlanState
+from code_slayer.planning.models import (
+    EngineeringPlanContent,
+    JobState,
+    OpenQuestion,
+    PlanningJobRecord,
+    PlanState,
+)
 from code_slayer.planning.planner import Planner, PlannerOutcome, PlannerRequest, PlannerResponse
 from code_slayer.repo import identity
 from code_slayer.store import db as db_module
 from code_slayer.store import location
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import transaction, utcnow_iso
+from code_slayer.store.planning_jobs_repo import PlanningJobsRepo
 from code_slayer.store.planning_repo import PlanningRepo
 from code_slayer.workers.prompt_analysis import (
     Ambiguity,
@@ -205,15 +214,15 @@ class EngineeringPlanningService:
 
     # -- public API -------------------------------------------------------
 
-    def create(
-        self, *, original_request: str, planner: Planner, run_id: str | None = None,
-        resolutions: tuple[ResolutionEvidence, ...] = (),
-    ) -> PlanRecord:
-        """Create a new, revision-1 plan and carry it as far as it can
-        safely go in this same call: through Repository Intelligence
-        binding, the planner turn, evidence validation, and Question
-        Gate evaluation, to `DRAFT` (malformed output or an evidence
-        defect), `NEEDS_INPUT`, or `READY`."""
+    def _create_plan_row(self, original_request: str, run_id: str | None) -> str:
+        """Durably create a revision-1, `DRAFT` `engineering_plans` row
+        and its content-addressed original-request evidence — the part
+        of `create()` that performs no model inference and is always
+        safe to do synchronously, on the calling (HTTP request) thread.
+        Shared by the synchronous `create()` and the durable-job
+        `create_job()` (Phase 8.2d) so a job's `plan_id` is always real
+        and inspectable the instant a caller gets it back, even before
+        any planner turn has run."""
         if not isinstance(original_request, str) or not original_request.strip():
             raise TypeError("original_request must be a non-empty str")
         plan_id = uuid.uuid4().hex
@@ -230,6 +239,24 @@ class EngineeringPlanningService:
             self._audit(plan_id, EventType.PLAN_STARTED, {
                 "request_content_hash": request_blob.content_hash, "run_id": run_id,
             })
+        return plan_id
+
+    def create(
+        self, *, original_request: str, planner: Planner, run_id: str | None = None,
+        resolutions: tuple[ResolutionEvidence, ...] = (),
+    ) -> PlanRecord:
+        """Create a new, revision-1 plan and carry it as far as it can
+        safely go in this same call: through Repository Intelligence
+        binding, the planner turn, evidence validation, and Question
+        Gate evaluation, to `DRAFT` (malformed output or an evidence
+        defect), `NEEDS_INPUT`, or `READY`.
+
+        Synchronous — the caller's thread blocks for the whole planner
+        turn. Kept for tests and any caller that genuinely wants that;
+        `create_job()` (Phase 8.2d) is the durable, background-executed,
+        HTTP-facing equivalent — see the module docstring's "Durable
+        background jobs" section."""
+        plan_id = self._create_plan_row(original_request, run_id)
         return self._run_planning_attempt(plan_id, original_request, planner, resolutions)
 
     def resume(
@@ -256,16 +283,12 @@ class EngineeringPlanningService:
         self._audit(plan_id, EventType.PLAN_RESUMED, {"from_state": row.state})
         return self._evaluate_gate_and_finish(plan_id, original_request, content, resolutions)
 
-    def replan(
-        self, plan_id: str, *, planner: Planner, resolutions: tuple[ResolutionEvidence, ...] = (),
-    ) -> PlanRecord:
-        """Create a new revision over the *same* original request,
-        referencing `plan_id` as its predecessor, and mark `plan_id`
-        itself `SUPERSEDED` — never rewrites or deletes its content.
-        Always re-invokes the planner (unlike `resume()`): a stuck
-        `DRAFT` (malformed output or an evidence defect) or an outdated
-        `READY`/`NEEDS_INPUT` plan can only be corrected by a fresh
-        attempt, never a silent auto-repair of the old one."""
+    def _prepare_replan(self, plan_id: str) -> tuple[str, str]:
+        """Durably create the new revision's `DRAFT` row and mark
+        `plan_id` `SUPERSEDED` — the part of `replan()` that performs no
+        model inference. Returns `(new_plan_id, original_request)`.
+        Shared by the synchronous `replan()` and the durable-job
+        `replan_job()` (Phase 8.2d)."""
         old = PlanningRepo(self._conn).get(plan_id)
         if old.state == PlanState.SUPERSEDED.value:
             raise ValueError(f"plan {plan_id!r} is already superseded")
@@ -286,6 +309,22 @@ class EngineeringPlanningService:
                 reason="superseded_by_replan",
             )
             self._audit(old.plan_id, EventType.PLAN_SUPERSEDED, {"successor_plan_id": new_plan_id})
+        return new_plan_id, original_request
+
+    def replan(
+        self, plan_id: str, *, planner: Planner, resolutions: tuple[ResolutionEvidence, ...] = (),
+    ) -> PlanRecord:
+        """Create a new revision over the *same* original request,
+        referencing `plan_id` as its predecessor, and mark `plan_id`
+        itself `SUPERSEDED` — never rewrites or deletes its content.
+        Always re-invokes the planner (unlike `resume()`): a stuck
+        `DRAFT` (malformed output or an evidence defect) or an outdated
+        `READY`/`NEEDS_INPUT` plan can only be corrected by a fresh
+        attempt, never a silent auto-repair of the old one.
+
+        Synchronous — see `create()`'s own docstring; `replan_job()`
+        (Phase 8.2d) is the durable, background-executed equivalent."""
+        new_plan_id, original_request = self._prepare_replan(plan_id)
         return self._run_planning_attempt(new_plan_id, original_request, planner, resolutions)
 
     def record_user_resolution(
@@ -545,3 +584,174 @@ class EngineeringPlanningService:
             )
             self._audit(plan_id, EventType.PLAN_FINISHED, {"state": state.value, "reason": reason})
         return self.get(plan_id)
+
+    # -- durable background planning jobs (Phase 8.2d) -----------------------
+    #
+    # A job's own execution-lifecycle state (QUEUED/RUNNING/SUCCEEDED/
+    # FAILED) is tracked entirely separately from PlanState -- see the
+    # module docstring and `store.migrations.0009_planning_jobs`. HTTP
+    # routes call only create_job()/replan_job()/get_job()/list_jobs();
+    # claim_job()/execute_claimed_job() are for `planning.executor.
+    # PlanningJobExecutor` alone -- never for a request-handling thread.
+
+    def _job_audit(self, job_id: str, event_type: EventType, payload: dict) -> None:
+        AuditWriter(self._conn).append(
+            task_id=None, event_type=event_type, actor_type="system",
+            actor_id="engineering-planning-service", payload={"job_id": job_id, **payload},
+        )
+
+    @staticmethod
+    def _job_to_record(row) -> PlanningJobRecord:
+        return PlanningJobRecord(
+            job_id=row.job_id, plan_id=row.plan_id, kind=row.kind, state=row.state,
+            attempt=row.attempt, created_at=row.created_at, updated_at=row.updated_at,
+            started_at=row.started_at, finished_at=row.finished_at,
+            failure_category=row.failure_category, failure_reason=row.failure_reason,
+        )
+
+    def _create_job_row(self, *, plan_id: str, kind: str) -> PlanningJobRecord:
+        job_id = uuid.uuid4().hex
+        now = utcnow_iso()
+        with transaction(self._conn):
+            row = PlanningJobsRepo(self._conn).create_in_transaction(
+                job_id=job_id, plan_id=plan_id, repo_id=self._primary.repo_id,
+                worktree_id=self._primary.worktree_id, created_at=now, kind=kind,
+            )
+            self._job_audit(job_id, EventType.PLANNING_JOB_ACCEPTED, {
+                "plan_id": plan_id, "kind": kind,
+            })
+        return self._job_to_record(row)
+
+    def create_job(self, *, original_request: str, run_id: str | None = None) -> PlanningJobRecord:
+        """Durably accept a new planning request without ever invoking a
+        planner on this call's own thread — `plan_id` is real and
+        inspectable (still `DRAFT`) the instant this returns. A
+        `planning.executor.PlanningJobExecutor` claims and executes the
+        returned job later, in the background — this is the HTTP-facing
+        equivalent of `create()`, minus the blocking inference."""
+        plan_id = self._create_plan_row(original_request, run_id)
+        return self._create_job_row(plan_id=plan_id, kind="create")
+
+    def replan_job(self, plan_id: str) -> PlanningJobRecord:
+        """The durable-job equivalent of `replan()` — creates the new
+        revision and marks the predecessor `SUPERSEDED` synchronously
+        (no inference), then returns a `QUEUED` job for the background
+        executor to claim."""
+        new_plan_id, _original_request = self._prepare_replan(plan_id)
+        return self._create_job_row(plan_id=new_plan_id, kind="replan")
+
+    def get_job(self, job_id: str) -> PlanningJobRecord:
+        return self._job_to_record(PlanningJobsRepo(self._conn).get(job_id))
+
+    def list_jobs(self, *, limit: int = 50, offset: int = 0) -> list[PlanningJobRecord]:
+        rows = PlanningJobsRepo(self._conn).list_for_scope(
+            self._primary.repo_id, self._primary.worktree_id, limit=limit, offset=offset,
+        )
+        return [self._job_to_record(row) for row in rows]
+
+    def claimable_job_ids(self) -> list[str]:
+        """Every job a `PlanningJobExecutor` may currently claim: every
+        `QUEUED` job, plus every `RUNNING` job whose recorded owner
+        process is provably `GONE` (`lease.liveness.
+        check_process_liveness()`) — never one that is `ALIVE` or merely
+        `UNKNOWN`, matching Phase 6 lease quiescence's own fail-closed
+        posture (unproven liveness is never treated as death). Read-only;
+        performs no claim itself, so calling this repeatedly is always
+        safe and never contends with an actual claim's own transaction."""
+        claimable = []
+        for row in PlanningJobsRepo(self._conn).list_non_terminal(
+            self._primary.repo_id, self._primary.worktree_id,
+        ):
+            if row.state == JobState.QUEUED.value:
+                claimable.append(row.job_id)
+            elif row.state == JobState.RUNNING.value:
+                if check_process_liveness(row.owner_pid, row.owner_pid_started_at) == Liveness.GONE:
+                    claimable.append(row.job_id)
+        return claimable
+
+    def claim_job(self, job_id: str):
+        """Atomically claim `job_id` for this process (`os.getpid()`) —
+        legal only from `QUEUED`, or from `RUNNING` with a provably dead
+        prior owner. Returns the claimed `store.models.PlanningJobRow`
+        (an internal shape only `planning.executor` reads directly), or
+        `None` if the claim is not legal right now: already held by a
+        live/unproven-dead owner, already terminal, or lost a race to
+        another claimant. Safe under concurrent dispatchers: the read-
+        decide-write sequence runs inside one `store.db.transaction()`
+        (`BEGIN IMMEDIATE`), so SQLite itself serializes two concurrent
+        callers — the second always re-reads the first's committed
+        result before deciding, exactly the same guarantee `runner.
+        local_worker_runner.LocalWorkerRunner._claim_for_execution()`
+        already relies on for `READY -> RUNNING`."""
+        pid = os.getpid()
+        started_at = process_start_time(pid)
+        now = utcnow_iso()
+        with transaction(self._conn):
+            current = PlanningJobsRepo(self._conn).get_or_none(job_id)
+            if current is None:
+                return None
+            if current.state == JobState.QUEUED.value:
+                may_claim = True
+            elif current.state == JobState.RUNNING.value:
+                may_claim = (
+                    check_process_liveness(current.owner_pid, current.owner_pid_started_at)
+                    == Liveness.GONE
+                )
+            else:
+                may_claim = False
+            if not may_claim:
+                return None
+            claimed = PlanningJobsRepo(self._conn).claim_in_transaction(
+                job_id, owner_pid=pid, owner_pid_started_at=started_at, now=now,
+            )
+            self._job_audit(job_id, EventType.PLANNING_JOB_CLAIMED, {
+                "plan_id": claimed.plan_id, "attempt": claimed.attempt,
+                "owner_generation": claimed.owner_generation,
+            })
+        return claimed
+
+    def execute_claimed_job(self, job, planner: Planner) -> PlanningJobRecord:
+        """Run the one planner turn `job` (already claimed by this
+        process — `claim_job()`) represents, and durably finalize it.
+        Never called with an unclaimed job; `planning.executor.
+        PlanningJobExecutor` is the only intended caller. Any exception
+        escaping the planner turn itself is caught and recorded as a
+        `FAILED` job with an `internal_error` category — never left
+        `RUNNING` forever inside the very process that would otherwise
+        be the only one able to prove it dead."""
+        try:
+            plan_row = PlanningRepo(self._conn).get(job.plan_id)
+            original_request = provenance.read_request(
+                self._conn, self._blobs_dir, plan_row.request_content_hash,
+            )
+            record = self._run_planning_attempt(job.plan_id, original_request, planner, ())
+        except Exception as exc:  # noqa: BLE001 -- must always reach a terminal job state
+            return self._finish_job(
+                job, JobState.FAILED, failure_category="internal_error",
+                failure_reason=f"internal_error:{type(exc).__name__}",
+            )
+        if record.reason and record.reason.startswith("malformed_planner_output:"):
+            category = record.reason.rsplit(":", 1)[-1]
+            return self._finish_job(
+                job, JobState.FAILED, failure_category=category, failure_reason=record.reason,
+            )
+        return self._finish_job(job, JobState.SUCCEEDED, failure_category=None, failure_reason=None)
+
+    def _finish_job(
+        self, job, state: JobState, *, failure_category: str | None, failure_reason: str | None,
+    ) -> PlanningJobRecord:
+        now = utcnow_iso()
+        with transaction(self._conn):
+            finished = PlanningJobsRepo(self._conn).finish_in_transaction(
+                job.job_id, state=state.value, expected_generation=job.owner_generation, now=now,
+                failure_category=failure_category, failure_reason=failure_reason,
+            )
+            if finished is None:
+                # Ownership was taken over from under us between claim and
+                # finish -- should never happen with a single dispatcher,
+                # but never overwrite a newer owner's outcome if it did.
+                return self._job_to_record(PlanningJobsRepo(self._conn).get(job.job_id))
+            self._job_audit(job.job_id, EventType.PLANNING_JOB_FINISHED, {
+                "plan_id": job.plan_id, "state": state.value, "failure_category": failure_category,
+            })
+        return self._job_to_record(finished)

@@ -98,16 +98,26 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | `POST /api/intelligence/query` | `{text, limit?: 1-50}` → `{stale, candidates: [{path, score, reasons}]}`, ranked against the latest durable snapshot (never rebuilds) |
 | `POST /api/intelligence/context-pack` | `{text, max_files?, max_bytes?, per_file_bytes?}` → bounded selected-file content, project/command evidence, `omitted`, `budget_exhausted`, `stale`; `409` if nothing has ever been indexed |
 
-### Engineering planning (Phase 8.2)
+### Engineering planning (Phase 8.2 / 8.2d)
 
 | Method / path | Returns |
 | --- | --- |
 | `GET /api/plans?limit=100&offset=0` | `{plans: [...]}`; a plan summary/detail per entry (see below), newest first |
 | `GET /api/plans/{plan_id}` | Full plan detail: `state`, `effective_state` (`"STALE"` in place of `"READY"` when the repository has changed since binding), `reason`, revision/predecessor linkage, repository binding, `questions`, and full `content` |
-| `POST /api/plans` | `{request}` → 201 plan detail and `Location`; `503 planner_not_configured` if no server-side `Planner` is configured. **Synchronous, tied to this one HTTP request** for the whole planning turn (can take tens of seconds to minutes against a real local model) — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#known-limitations) |
-| `POST /api/plans/{plan_id}/resume` | `{}` → re-evaluates the Question Gate against durable resolutions; never re-invokes the planner |
-| `POST /api/plans/{plan_id}/replan` | `{}` → creates a new revision (predecessor recorded), supersedes the old one, re-invokes the planner |
+| `POST /api/plans` | `{request}` → **202** `{job_id, plan_id, state: "QUEUED", status_url}` immediately; `503 planner_not_configured` if no server-side `Planner` is configured. Durable, server-owned background execution — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#durable-background-jobs-phase-82d); HTTP client disconnect never cancels it |
+| `POST /api/plans/{plan_id}/resume` | `{}` → **200**, synchronous: re-evaluates the Question Gate against durable resolutions; never invokes the planner, so there is no long-running turn to background |
+| `POST /api/plans/{plan_id}/replan` | `{}` → **202**, same durable-job contract as `POST /api/plans` |
 | `POST /api/plans/{plan_id}/resolutions` | `{ambiguity_id, answer, resolution_kind: "FACT" or "AUTHORIZATION"}` → current plan detail through `record_user_resolution`; recording alone does not advance state — resume re-evaluates |
+| `GET /api/planning-jobs?limit=100&offset=0` | `{jobs: [...]}`; each with `job_id`, `plan_id`, `kind` (`"create"`/`"replan"`), `state` (`QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`), `attempt`, timestamps, `failure_category`/`failure_reason` |
+| `GET /api/planning-jobs/{job_id}` | One job's full durable status — poll this after a `202` until `state` is `SUCCEEDED`/`FAILED`, then read the plan via `plan_id` |
+
+A job's `state` is distinct from the plan's own `state`: `SUCCEEDED` means
+the planner turn itself completed and produced genuine structured output —
+the resulting plan may legitimately be `READY`, `NEEDS_INPUT`, or even
+`DRAFT` (evidence validation rejected a claim). `FAILED` means the turn
+itself never produced valid structured output; `failure_category` is one
+of the small, safe, code-owned `PlannerFailureCategory` values — never raw
+model text, which stays durable-internal-only.
 
 A plan's `content` (when not `None`) carries `goal`, `requirements`, `assumptions`,
 `affected_files` (each with `path`, `action`, `reason`, `exists_in_repository`,

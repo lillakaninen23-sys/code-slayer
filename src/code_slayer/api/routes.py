@@ -253,27 +253,42 @@ def plan_detail(plan_id):
 
 @api.post("/plans")
 def create_plan():
+    """Durably accepts a planning job and returns immediately -- Phase
+    8.2d: this request's own thread never invokes a planner. See
+    `GET /api/planning-jobs/{job_id}` for durable status; HTTP client
+    disconnect never cancels the accepted job."""
     data = body({"request": 32768}, ("request",))
-    response = jsonify(service().create_plan(data))
-    response.status_code = 201
-    response.headers["Location"] = "/api/plans/" + response.get_json()["plan_id"]
+    job = service().create_plan(data)
+    response = jsonify(job)
+    response.status_code = 202
+    response.headers["Location"] = job["status_url"]
     return response
 
 
 @api.post("/plans/<plan_id>/resume")
 def resume_plan(plan_id):
+    """Synchronous -- performs no model inference (see
+    `api.service.ApplicationService.resume_plan()`)."""
     body({})
     return jsonify(service().resume_plan(plan_id))
 
 
 @api.post("/plans/<plan_id>/replan")
 def replan_plan(plan_id):
+    """Durably accepts a replan job and returns immediately, same
+    contract as `POST /api/plans` above."""
     body({})
-    return jsonify(service().replan_plan(plan_id))
+    job = service().replan_plan(plan_id)
+    response = jsonify(job)
+    response.status_code = 202
+    response.headers["Location"] = job["status_url"]
+    return response
 
 
 @api.post("/plans/<plan_id>/resolutions")
 def resolve_plan(plan_id):
+    """A quick, durable write only -- records the answer; it never
+    invokes a planner or advances plan state itself (resume does)."""
     data = body(
         {"ambiguity_id": 200, "answer": 16384, "resolution_kind": 32},
         ("ambiguity_id", "answer", "resolution_kind"),
@@ -281,3 +296,14 @@ def resolve_plan(plan_id):
     if data["resolution_kind"] not in ("FACT", "AUTHORIZATION"):
         raise APIError("invalid_resolution_kind", "Choose FACT or explicit AUTHORIZATION.")
     return jsonify(service().resolve_plan(plan_id, data))
+
+
+@api.get("/planning-jobs")
+def planning_jobs():
+    limit, offset = page_args()
+    return jsonify(service().list_planning_jobs(limit, offset))
+
+
+@api.get("/planning-jobs/<job_id>")
+def planning_job_detail(job_id):
+    return jsonify(service().get_planning_job(job_id))
