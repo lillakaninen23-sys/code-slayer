@@ -98,6 +98,28 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | `POST /api/intelligence/query` | `{text, limit?: 1-50}` → `{stale, candidates: [{path, score, reasons}]}`, ranked against the latest durable snapshot (never rebuilds) |
 | `POST /api/intelligence/context-pack` | `{text, max_files?, max_bytes?, per_file_bytes?}` → bounded selected-file content, project/command evidence, `omitted`, `budget_exhausted`, `stale`; `409` if nothing has ever been indexed |
 
+### Engineering planning (Phase 8.2)
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/plans?limit=100&offset=0` | `{plans: [...]}`; a plan summary/detail per entry (see below), newest first |
+| `GET /api/plans/{plan_id}` | Full plan detail: `state`, `effective_state` (`"STALE"` in place of `"READY"` when the repository has changed since binding), `reason`, revision/predecessor linkage, repository binding, `questions`, and full `content` |
+| `POST /api/plans` | `{request}` → 201 plan detail and `Location`; `503 planner_not_configured` if no server-side `Planner` is configured |
+| `POST /api/plans/{plan_id}/resume` | `{}` → re-evaluates the Question Gate against durable resolutions; never re-invokes the planner |
+| `POST /api/plans/{plan_id}/replan` | `{}` → creates a new revision (predecessor recorded), supersedes the old one, re-invokes the planner |
+| `POST /api/plans/{plan_id}/resolutions` | `{ambiguity_id, answer, resolution_kind: "FACT" or "AUTHORIZATION"}` → current plan detail through `record_user_resolution`; recording alone does not advance state — resume re-evaluates |
+
+A plan's `content` (when not `None`) carries `goal`, `requirements`, `assumptions`,
+`affected_files` (each with `path`, `action`, `reason`, `exists_in_repository`,
+`evidence`), `planned_changes`, `dependencies`, `risks`, `verification_steps`,
+`discovered_commands`, `authority_requirements`, `open_questions`,
+`evidence_refs`, and `validation_issues`. `exists_in_repository` and `evidence`
+are set exclusively by evidence validation against authoritative Repository
+Intelligence — never accepted from a model's own claim. Planning is read-only
+with respect to the repository: no route here writes a repository file,
+executes a discovered command, creates a checkpoint, or grants any trust —
+see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md).
+
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
 `ambiguity_id`, `question`, `risk_class` and `answer_recorded`. Answers preserve the
@@ -132,11 +154,13 @@ execute shell, modify checkpoints or select arbitrary worktree/DB paths. This AP
 only offers the existing bounded read-only profile. It can display historical job
 worktree runs and their separate execution evidence; it never merges them.
 No AUTO or model mutation trust was added. The `/api/intelligence/*` routes
-(Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)) are the
-one addition since WebUI Foundation 1 — deterministic, read-only repository
-evidence only, never a filesystem/DB path from the client, never a new
+(Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)) and the
+`/api/plans*` routes (Phase 8.2, [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md))
+are the additions since WebUI Foundation 1 — deterministic, read-only repository
+evidence and planning only, never a filesystem/DB path from the client, never a new
 authority: a repository fact still cannot become trusted `ResolutionEvidence`
-except through the existing, unmodified application-owned authority path.
+except through the existing, unmodified application-owned authority path, and a
+`READY` plan authorizes no execution, no mutation, and no command.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens

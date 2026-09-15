@@ -123,6 +123,28 @@ class RepositoryIntelligenceService:
             and row.working_tree_fingerprint == probe.working_tree_fingerprint
         )
 
+    def is_identity_current(
+        self, head_sha: str | None, working_tree_fingerprint: str | None,
+    ) -> bool:
+        """Whether a previously-recorded `(head_sha,
+        working_tree_fingerprint)` binding — e.g. one durably captured by
+        a Phase 8.2 engineering plan at the moment it was built — still
+        matches the repository's real, current identity (Phase 8.2's own
+        "bind plans to the Phase 8.1 repository-intelligence identity...
+        do not duplicate the Phase 8.1 fingerprint implementation"
+        requirement). Reuses exactly the same `builder.probe_identity()`
+        call `.status()`/`.query()`/`.build_context_pack()` already make
+        internally (`_is_current()` above) — never recomputes or
+        duplicates the content-safe identity algorithm itself, and never
+        rebuilds a snapshot as a side effect of asking."""
+        probe = builder.probe_identity(
+            self._primary.repo_root, extra_excluded_root=self._extra_excluded_root(),
+        )
+        return (
+            head_sha == probe.head_sha
+            and working_tree_fingerprint == probe.working_tree_fingerprint
+        )
+
     # -- public API -------------------------------------------------------
 
     def inspect(self, *, force: bool = False) -> Snapshot:

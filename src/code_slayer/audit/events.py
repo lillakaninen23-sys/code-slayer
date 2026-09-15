@@ -117,3 +117,15 @@ class EventType(StrEnum):
     TASK_BLOCKED = "TASK_BLOCKED"
     TASK_FAILED = "TASK_FAILED"
     TASK_COMPLETED = "TASK_COMPLETED"
+    # Phase 8.2: the durable engineering-plan record's own lifecycle
+    # (`planning.service.EngineeringPlanningService`) -- planning only,
+    # never a mutation/execution event. `PLAN_FINISHED` covers every
+    # terminal-for-this-attempt outcome (READY, or DRAFT with a recorded
+    # evidence-validation failure) via its own `state`/`reason` payload
+    # fields, mirroring `RUN_FINISHED`'s own single-event convention.
+    PLAN_STARTED = "PLAN_STARTED"
+    PLAN_BLOCKED = "PLAN_BLOCKED"
+    PLAN_USER_RESOLUTION_RECORDED = "PLAN_USER_RESOLUTION_RECORDED"
+    PLAN_RESUMED = "PLAN_RESUMED"
+    PLAN_FINISHED = "PLAN_FINISHED"
+    PLAN_SUPERSEDED = "PLAN_SUPERSEDED"

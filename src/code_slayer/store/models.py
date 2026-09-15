@@ -196,6 +196,54 @@ class RunnerHumanResolution:
 
 
 @dataclass(frozen=True)
+class EngineeringPlanRow:
+    """One durable, mutable engineering-plan revision record (Phase 8.2
+    — `planning.service.EngineeringPlanningService`). Mirrors
+    `RunnerRun`'s own shape: identity fields locked at creation,
+    evolving orchestration fields (`state`, `reason`, repository binding,
+    every content-hash pointer, `questions_json`) updatable in place.
+    The actual planning content never lives in this row — see
+    `plan_content_hash`."""
+
+    plan_id: str
+    created_at: str
+    updated_at: str
+    schema_version: str
+    repo_id: str
+    worktree_id: str
+    run_id: str | None
+    request_content_hash: str
+    predecessor_plan_id: str | None
+    revision: int
+    state: str
+    reason: str | None
+    head_sha: str | None
+    working_tree_dirty: bool
+    working_tree_fingerprint: str | None
+    intelligence_snapshot_id: str | None
+    planner_input_content_hash: str | None
+    planner_output_content_hash: str | None
+    validation_content_hash: str | None
+    plan_content_hash: str | None
+    questions_json: str | None
+
+
+@dataclass(frozen=True)
+class EngineeringPlanHumanResolution:
+    """One durable, append-only human/application resolution answering
+    exactly one blocked planning ambiguity (Phase 8.2) — byte-for-byte
+    the same shape as `RunnerHumanResolution`."""
+
+    id: int
+    plan_id: str
+    ambiguity_id: str
+    source: str
+    resolution_kind: str
+    answer_content_hash: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class RepositoryIntelligenceSnapshotRow:
     """One durable, append-only repository-intelligence snapshot record
     (Phase 8.1) — small identity/pointer row only; the actual inventory/

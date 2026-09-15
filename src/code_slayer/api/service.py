@@ -11,9 +11,10 @@ from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
 from code_slayer.intelligence import RepositoryIntelligenceService
+from code_slayer.planning.service import EngineeringPlanningService
 from code_slayer.repo import identity
 from code_slayer.runner import LocalWorkerRunner
-from code_slayer.workers.prompt_analysis import PromptAnalyst
+from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalyst
 from code_slayer.workers.protocol import WorkerAdapter
 from code_slayer.workers.question_gate import ResolutionKind
 
@@ -30,6 +31,7 @@ class RuntimeBindings:
 
     analyst_factory: Callable[[], PromptAnalyst] | None = None
     adapter_factory: Callable[[str, str], WorkerAdapter | None] | None = None
+    planner_factory: Callable[[], object] | None = None
 
 
 class ApplicationService:
@@ -58,6 +60,14 @@ class ApplicationService:
     @contextmanager
     def intelligence(self):
         service = RepositoryIntelligenceService(self.repo_path, state_root_override=self.state_root)
+        try:
+            yield service
+        finally:
+            service.close()
+
+    @contextmanager
+    def planning(self):
+        service = EngineeringPlanningService(self.repo_path, state_root_override=self.state_root)
         try:
             yield service
         finally:
@@ -135,3 +145,75 @@ class ApplicationService:
         if pack is None:
             raise APIError("not_indexed", "Repository has not been indexed yet.", 409)
         return asdict(pack)
+
+    # -- engineering planning (Phase 8.2; planning only — never mutates,
+    # executes, or grants any trust/execution authority) ------------------
+
+    @staticmethod
+    def _plan_json(record):
+        # `asdict()` already recurses through `content` (an
+        # `EngineeringPlanContent | None`) into a plain, JSON-serializable
+        # dict/None — `PlanState`/`AffectedFileAction` StrEnum members
+        # serialize as their plain string value directly (see
+        # `planning.models`'s own StrEnum members; no custom encoder needed).
+        return asdict(record)
+
+    def _planner(self):
+        if self.bindings.planner_factory is None:
+            raise APIError("planner_not_configured", "Configure a server-side Planner.", 503)
+        return self.bindings.planner_factory()
+
+    def list_plans(self, limit, offset):
+        with self.planning() as service:
+            return {"plans": [self._plan_json(r) for r in service.list(limit=limit, offset=offset)]}
+
+    def get_plan(self, plan_id):
+        with self.planning() as service:
+            try:
+                return self._plan_json(service.get(plan_id))
+            except KeyError:
+                raise APIError("not_found", "Plan not found.", 404) from None
+
+    def create_plan(self, data):
+        planner = self._planner()
+        with self.planning() as service:
+            record = service.create(original_request=data["request"], planner=planner)
+        return self._plan_json(record)
+
+    def resume_plan(self, plan_id):
+        with self.planning() as service:
+            try:
+                record = service.resume(plan_id)
+            except KeyError:
+                raise APIError("not_found", "Plan not found.", 404) from None
+        return self._plan_json(record)
+
+    def replan_plan(self, plan_id):
+        planner = self._planner()
+        with self.planning() as service:
+            try:
+                record = service.replan(plan_id, planner=planner)
+            except KeyError:
+                raise APIError("not_found", "Plan not found.", 404) from None
+            except ValueError as exc:
+                raise APIError("plan_superseded", str(exc), 409) from None
+        return self._plan_json(record)
+
+    def resolve_plan(self, plan_id, data):
+        with self.planning() as service:
+            try:
+                record = service.get(plan_id)
+            except KeyError:
+                raise APIError("not_found", "Plan not found.", 404) from None
+            if record.state != "NEEDS_INPUT":
+                raise APIError("plan_not_blocked", "Plan is not waiting for answers.", 409)
+            if data["ambiguity_id"] not in {q["ambiguity_id"] for q in record.questions}:
+                raise APIError(
+                    "unknown_ambiguity", "Choose a current question from this plan.", 409,
+                )
+            service.record_user_resolution(
+                plan_id, data["ambiguity_id"], data["answer"],
+                resolution_kind=ResolutionKind(data["resolution_kind"]),
+                source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+            )
+            return self._plan_json(service.get(plan_id))

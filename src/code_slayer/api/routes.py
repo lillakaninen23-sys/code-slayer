@@ -73,6 +73,7 @@ def health():
             "actions": {
                 "start": service().bindings.analyst_factory is not None,
                 "execution_configured": service().bindings.adapter_factory is not None,
+                "planning_configured": service().bindings.planner_factory is not None,
             },
             "configuration_status": "ready"
             if service().bindings.analyst_factory
@@ -229,3 +230,54 @@ def intelligence_context_pack():
     return jsonify(service().intelligence_context_pack(
         data["text"], max_files=max_files, max_bytes=max_bytes, per_file_bytes=per_file_bytes,
     ))
+
+
+# -- engineering planning (Phase 8.2) -----------------------------------------
+#
+# Planning only: never accepts a filesystem/DB path, trust level, lease/
+# fencing field, checkpoint ref, worker authority, cloud authorization, or
+# raw command from the client -- every field below is a bounded string, and
+# the repository/planner are always the server's own configured project and
+# configured Planner, never something the client selects.
+
+@api.get("/plans")
+def plans():
+    limit, offset = page_args()
+    return jsonify(service().list_plans(limit, offset))
+
+
+@api.get("/plans/<plan_id>")
+def plan_detail(plan_id):
+    return jsonify(service().get_plan(plan_id))
+
+
+@api.post("/plans")
+def create_plan():
+    data = body({"request": 32768}, ("request",))
+    response = jsonify(service().create_plan(data))
+    response.status_code = 201
+    response.headers["Location"] = "/api/plans/" + response.get_json()["plan_id"]
+    return response
+
+
+@api.post("/plans/<plan_id>/resume")
+def resume_plan(plan_id):
+    body({})
+    return jsonify(service().resume_plan(plan_id))
+
+
+@api.post("/plans/<plan_id>/replan")
+def replan_plan(plan_id):
+    body({})
+    return jsonify(service().replan_plan(plan_id))
+
+
+@api.post("/plans/<plan_id>/resolutions")
+def resolve_plan(plan_id):
+    data = body(
+        {"ambiguity_id": 200, "answer": 16384, "resolution_kind": 32},
+        ("ambiguity_id", "answer", "resolution_kind"),
+    )
+    if data["resolution_kind"] not in ("FACT", "AUTHORIZATION"):
+        raise APIError("invalid_resolution_kind", "Choose FACT or explicit AUTHORIZATION.")
+    return jsonify(service().resolve_plan(plan_id, data))
