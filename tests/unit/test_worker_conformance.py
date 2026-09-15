@@ -1268,3 +1268,257 @@ def test_concurrent_promotion_exactly_one_winner(tmp_path):
     finally:
         conn_a.close()
         conn_b.close()
+
+
+# --- Phase 7.7c: atomic trust promotion / conformance freshness ------------
+#
+# The independent audit's exact reproduction: a promotion caller reads a
+# PASSED run and verifies it is fresh, then (before the trust write) a
+# concurrent connection downgrades the worker, then the stale run's
+# promotion resumes and durably re-promotes the worker straight back to
+# GUARDED. Fixed by making every evidence read and the trust write one
+# serialized `BEGIN IMMEDIATE` decision (`workers.promotion.
+# promote_from_conformance`, `workers.trust.WorkerTrustManager.
+# _transition_in_transaction`). These tests use two genuinely independent
+# SQLite connections and real threads -- never a single-connection stand-in
+# for concurrency, and never sleeps to force an ordering.
+
+def test_concurrent_downgrade_race_never_lets_a_stale_run_repromote(tmp_path):
+    """Regression tests #4 and #6: a run that only *looks* fresh relative
+    to the trust history a promotion caller observed before racing
+    against a concurrent downgrade must never be accepted, no matter
+    which of the two real threads happens to win the underlying SQLite
+    write-lock race.
+
+    Both possible orderings deny the promotion (for different, both
+    correct, reasons): if the promotion transaction runs first, the
+    worker is still `GUARDED` from the earlier promotion below, so it is
+    denied for not being eligible from `GUARDED` in the first place; if
+    the downgrade transaction commits first, the promotion transaction's
+    OWN fresh re-read of the latest trust event (inside its own
+    transaction, Phase 7.7c) sees the downgrade and denies the run as
+    stale. Neither ordering ever ends with the stale run's `GUARDED`
+    write landing — the exact outcome the independent audit reproduced.
+    """
+    from threading import Barrier, Thread
+
+    from code_slayer.audit.verify import verify_chain
+    from code_slayer.store.db import connect, migrate
+
+    db_path = tmp_path / "state.db"
+    setup = connect(db_path)
+    migrate(setup)
+    WorkersRepo(setup).register(worker_id="w1", kind="fake", network_class="local")
+
+    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
+    run_a = run_conformance_suite(
+        setup, FakeWorkerAdapter(_passing_responses()), worker_id="w1", role="coder",
+        now_fn=clock,
+    )
+    first = promote_from_conformance(
+        setup, worker_id="w1", role="coder", capability="read_file",
+        run_id=run_a.run_id, now_fn=clock,
+    )
+    assert first.ok  # worker is now GUARDED, trust event at "...00:00:00"
+
+    # A second, independently PASSED run -- fresh relative to the
+    # promotion above, but about to become stale the instant the
+    # concurrent downgrade below records its own (later, real-clock)
+    # trust event.
+    clock.now = "2026-01-01T01:00:00.000000Z"
+    run_b = run_conformance_suite(
+        setup, FakeWorkerAdapter(_passing_responses()), worker_id="w1", role="coder",
+        now_fn=clock,
+    )
+    assert run_b.status == ConformanceRunStatus.PASSED
+    setup.close()
+
+    barrier = Barrier(2)
+    outcomes = {}
+
+    def _promote():
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            outcomes["promotion"] = promote_from_conformance(
+                conn, worker_id="w1", role="coder", capability="read_file",
+                run_id=run_b.run_id,
+            )
+        finally:
+            conn.close()
+
+    def _downgrade():
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            outcomes["downgrade"] = WorkerTrustManager(conn).downgrade_to_locked(
+                worker_id="w1", role="coder", capability="read_file",
+                reason="malformed_tool_call",
+            )
+        finally:
+            conn.close()
+
+    threads = [Thread(target=_promote), Thread(target=_downgrade)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    assert not outcomes["promotion"].ok
+    assert outcomes["promotion"].reason in (
+        "run_stale_relative_to_latest_trust_event",
+        "trust_transition_not_eligible_from_guarded",
+    )
+    assert outcomes["downgrade"].ok  # always legal: the worker is GUARDED either way at that point
+
+    final = connect(db_path)
+    try:
+        manager = WorkerTrustManager(final)
+        assert manager.current_trust("w1", "coder", "read_file") == TrustLevel.LOCKED
+        history = manager.history("w1", "coder", "read_file")
+        assert [event.to_level for event in history] == ["GUARDED", "LOCKED"]
+        assert verify_chain(final, task_id=None).ok
+    finally:
+        final.close()
+
+
+def test_downgrade_blocked_during_promotion_commit_then_succeeds_after(tmp_path, monkeypatch):
+    """Regression test #5 (CASE B): when the promotion transaction wins
+    the race outright (a fresh, genuinely valid run; nothing stale about
+    it), it validates and commits `GUARDED` as one atomic unit, and only
+    once that transaction has released the write lock can a concurrently
+    attempted downgrade proceed — landing afterward and correctly
+    reverting to `LOCKED`.
+
+    Forces the interleaving deterministically without any sleep: a hook
+    on `WorkerTrustManager._transition_in_transaction` fires from
+    *inside* the promotion's still-open transaction (the real trust row
+    has been written, but `promote_from_conformance()`'s own `with
+    transaction(conn):` block has not yet exited/committed) and, from
+    there, starts the downgrade on a second real connection. A bounded
+    `join()` proves that downgrade cannot complete while the promotion
+    transaction remains open — genuine SQLite write-lock contention, not
+    an assumption.
+    """
+    from threading import Thread
+
+    import code_slayer.workers.trust as trust_module
+    from code_slayer.audit.verify import verify_chain
+    from code_slayer.store.db import connect, migrate
+
+    db_path = tmp_path / "state.db"
+    setup = connect(db_path)
+    migrate(setup)
+    WorkersRepo(setup).register(worker_id="w1", kind="fake", network_class="local")
+    run_fresh = run_conformance_suite(
+        setup, FakeWorkerAdapter(_passing_responses()), worker_id="w1", role="coder",
+    )
+    setup.close()
+
+    downgrade_result: dict = {}
+    downgrade_thread_holder: dict = {}
+
+    def _downgrade():
+        conn = connect(db_path)
+        try:
+            downgrade_result["result"] = WorkerTrustManager(conn).downgrade_to_locked(
+                worker_id="w1", role="coder", capability="read_file",
+                reason="operator_downgrade",
+            )
+        finally:
+            conn.close()
+
+    real_transition_in_transaction = trust_module.WorkerTrustManager._transition_in_transaction
+
+    def _hook(self, *args, **kwargs):
+        result = real_transition_in_transaction(self, *args, **kwargs)
+        if "thread" not in downgrade_thread_holder:
+            thread = Thread(target=_downgrade)
+            downgrade_thread_holder["thread"] = thread
+            thread.start()
+            thread.join(timeout=0.5)
+            assert thread.is_alive(), (
+                "concurrent downgrade completed before the promotion "
+                "transaction committed -- serialization broken"
+            )
+        return result
+
+    monkeypatch.setattr(trust_module.WorkerTrustManager, "_transition_in_transaction", _hook)
+
+    conn_p = connect(db_path)
+    try:
+        promo = promote_from_conformance(
+            conn_p, worker_id="w1", role="coder", capability="read_file",
+            run_id=run_fresh.run_id,
+        )
+    finally:
+        conn_p.close()
+
+    assert promo.ok
+    assert promo.level == TrustLevel.GUARDED
+
+    downgrade_thread_holder["thread"].join(timeout=10)
+    assert not downgrade_thread_holder["thread"].is_alive()
+    assert downgrade_result["result"].ok
+
+    final = connect(db_path)
+    try:
+        manager = WorkerTrustManager(final)
+        assert manager.current_trust("w1", "coder", "read_file") == TrustLevel.LOCKED
+        history = manager.history("w1", "coder", "read_file")
+        assert [event.to_level for event in history] == ["GUARDED", "LOCKED"]
+        assert verify_chain(final, task_id=None).ok
+    finally:
+        final.close()
+
+
+def test_concurrent_double_promotion_from_same_run_via_real_threads(tmp_path):
+    """Regression test #17, using genuinely independent connections and
+    real threads (rather than `test_concurrent_promotion_exactly_one_
+    winner`'s sequential two-connection form above): racing the exact
+    same evidence against itself can never create two upward trust
+    events or any other invalid history — exactly one winner, ever."""
+    from threading import Barrier, Thread
+
+    from code_slayer.store.db import connect, migrate
+
+    db_path = tmp_path / "state.db"
+    setup = connect(db_path)
+    migrate(setup)
+    WorkersRepo(setup).register(worker_id="w1", kind="fake", network_class="local")
+    run_result = _run_passing_suite(setup, "w1")
+    setup.close()
+
+    barrier = Barrier(2)
+    outcomes = {}
+
+    def _promote(key):
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            outcomes[key] = promote_from_conformance(
+                conn, worker_id="w1", role="coder", capability="read_file",
+                run_id=run_result.run_id,
+            )
+        finally:
+            conn.close()
+
+    threads = [Thread(target=_promote, args=("a",)), Thread(target=_promote, args=("b",))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    assert {outcomes["a"].ok, outcomes["b"].ok} == {True, False}
+
+    final = connect(db_path)
+    try:
+        manager = WorkerTrustManager(final)
+        history = manager.history("w1", "coder", "read_file")
+        assert len(history) == 1
+        assert history[0].to_level == "GUARDED"
+        assert manager.current_trust("w1", "coder", "read_file") == TrustLevel.GUARDED
+    finally:
+        final.close()

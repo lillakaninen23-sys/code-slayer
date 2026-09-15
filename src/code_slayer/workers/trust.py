@@ -188,38 +188,71 @@ class WorkerTrustManager:
         allowed_from: frozenset[TrustLevel], to_level: TrustLevel,
         reason: str, evidence_ref: str | None,
     ) -> TrustResult:
-        """Every actual write goes through here, inside one transaction:
-        `current_trust()` is re-read *fresh*, under the write lock, right
-        before writing — closing the gap between whatever a caller
-        observed before calling this method and the row this method is
-        about to append after. Two callers racing for the same scope can
+        """Open this connection's one write transaction and perform the
+        transition inside it. Two callers racing for the same scope can
         never both durably record the same upward transition; SQLite's
-        own write lock plus this re-check serializes them into exactly
-        one winner, mirroring `lease.manager.LeaseManager`'s pattern."""
+        own write lock plus `_transition_in_transaction()`'s fresh
+        re-check serializes them into exactly one winner, mirroring
+        `lease.manager.LeaseManager`'s pattern."""
         occurred_at = self._now_fn()
         with transaction(self._conn):
-            current = self.current_trust(worker_id, role, capability)
-            if current not in allowed_from:
-                return _deny(f"trust_transition_not_eligible_from_{current.value.lower()}")
-            if not _is_allowed_transition(current, to_level):
-                # Defense in depth: every caller above only ever reaches
-                # here with an (allowed_from, to_level) pair already
-                # present in _ALLOWED_TRANSITIONS, but this makes that an
-                # enforced invariant, not merely trusted caller discipline.
-                return _deny("transition_not_permitted_in_phase_7_2")
-            event = self._trust.append_in_transaction(
+            return self._transition_in_transaction(
                 worker_id=worker_id, role=role, capability=capability,
-                from_level=current.value, to_level=to_level.value,
+                allowed_from=allowed_from, to_level=to_level,
                 reason=reason, evidence_ref=evidence_ref, occurred_at=occurred_at,
             )
-            self._audit.append(
-                task_id=None, event_type=EventType.WORKER_TRUST_CHANGED,
-                actor_type="system", actor_id=worker_id,
-                payload={
-                    "worker_id": worker_id, "role": role, "capability": capability,
-                    "from_level": current.value, "to_level": to_level.value,
-                    "reason": reason, "evidence_ref": evidence_ref,
-                    "trust_event_id": event.id,
-                },
-            )
+
+    def _transition_in_transaction(
+        self, *, worker_id: str, role: str, capability: str | None,
+        allowed_from: frozenset[TrustLevel], to_level: TrustLevel,
+        reason: str, evidence_ref: str | None, occurred_at: str,
+    ) -> TrustResult:
+        """The write half of `_transition()`, usable by a caller that
+        already holds this connection's one open write transaction —
+        mirrors `store.task_repo.TaskRepo._record_transition_in_transaction`
+        / `core.state_machine.TaskStateMachine.transition_in_transaction`'s
+        established "composition point" pattern.
+
+        Phase 7.7c: `workers.promotion.promote_from_conformance()` calls
+        this directly so that re-reading the conformance run, re-reading
+        the latest trust event for freshness, and this trust write are
+        all one serialized control-plane decision — no freshness-
+        sensitive read the promotion decision depends on may be taken
+        before the write lock is acquired and then trusted afterward.
+        `current_trust()` here is what closes that gap: it is read fresh,
+        under the write lock this method requires already be open, right
+        before writing, so a concurrent downgrade that committed while a
+        caller was still validating other evidence is never missed.
+
+        Raises if no transaction is open on this connection — this method
+        never opens or commits one itself.
+        """
+        if not self._conn.in_transaction:
+            raise RuntimeError("trust transition requires an open write transaction")
+        if self._workers.get(worker_id) is None:
+            return _deny("unknown_worker")
+        current = self.current_trust(worker_id, role, capability)
+        if current not in allowed_from:
+            return _deny(f"trust_transition_not_eligible_from_{current.value.lower()}")
+        if not _is_allowed_transition(current, to_level):
+            # Defense in depth: every caller above only ever reaches
+            # here with an (allowed_from, to_level) pair already
+            # present in _ALLOWED_TRANSITIONS, but this makes that an
+            # enforced invariant, not merely trusted caller discipline.
+            return _deny("transition_not_permitted_in_phase_7_2")
+        event = self._trust.append_in_transaction(
+            worker_id=worker_id, role=role, capability=capability,
+            from_level=current.value, to_level=to_level.value,
+            reason=reason, evidence_ref=evidence_ref, occurred_at=occurred_at,
+        )
+        self._audit.append(
+            task_id=None, event_type=EventType.WORKER_TRUST_CHANGED,
+            actor_type="system", actor_id=worker_id,
+            payload={
+                "worker_id": worker_id, "role": role, "capability": capability,
+                "from_level": current.value, "to_level": to_level.value,
+                "reason": reason, "evidence_ref": evidence_ref,
+                "trust_event_id": event.id,
+            },
+        )
         return TrustResult(True, "trust_transition_recorded", level=to_level)
