@@ -31,6 +31,33 @@ truncation (`docs/CODE_SLAYER_VISION.md` §32, §59). This slice does not
 implement a Prompt Analyst; the field exists now so that when one is
 added later, nothing about this contract has to change to keep the
 original prompt authoritative alongside it.
+
+## Supplemental resolutions: authoritative context, never a rewrite (Phase 7.7d)
+
+`WorkerRequest.supplemental_resolutions` carries verified, durable human/
+application answers to previously-blocking ambiguities *alongside*
+`original_prompt` — never merged, concatenated, or substituted into it.
+`WorkerSupplementalResolution.kind`/`.source` deliberately mirror
+`workers.question_gate.ResolutionKind`/`workers.prompt_analysis.
+EvidenceSource`'s exact string vocabulary (`"FACT"`/`"AUTHORIZATION"`/
+`"SAFE_DEFAULT"`, `"ORIGINAL_PROMPT"`/`"REPOSITORY"`/`"RUNTIME"`/
+`"DURABLE_TASK_EVIDENCE"`) without importing either module here — this
+module stays free of any dependency on a specific analyst/gate phase,
+matching its own "provider-independent... and nothing else" boundary
+above. The one legitimate producer, `runner.local_worker_runner.
+LocalWorkerRunner`, constructs these exclusively from resolutions that
+already passed the hardened `workers.question_gate.QuestionGate` and are
+durably recorded (`runner_human_resolutions`) — never from a `PromptAnalyst`'s
+own advisory hints (`already_answered`, `evidence_keys`,
+`resolved_by_prompt_substring`), which can never become one of these.
+
+A `WorkerSupplementalResolution` is inert data: carrying `kind=
+AUTHORIZATION` here states only that a human explicitly authorized
+something — it grants no trust, bypasses no `policy.engine.PolicyEngine`
+check, and acquires no lease or tool capability by itself. Every actual
+mutation/tool-execution authority still comes entirely from `workers.
+trust.WorkerTrustManager`, `PolicyEngine`, and `tools.executor.
+ToolExecutor`, completely unaware that this field exists.
 """
 
 from __future__ import annotations
@@ -120,6 +147,62 @@ class WorkerToolResult:
     output_summary: str
 
 
+class WorkerSupplementalKind(StrEnum):
+    """What kind of trusted resolution one `WorkerSupplementalResolution`
+    represents — see the module docstring's "Supplemental resolutions"
+    section for why this mirrors, rather than imports,
+    `workers.question_gate.ResolutionKind`.
+
+    `FACT` — a deterministic fact that answers a question (e.g. "the
+    target module is billing.py") — never itself permission to do
+    anything destructive or externally consequential.
+    `AUTHORIZATION` — an explicit prior human decision authorizing a
+    specific destructive or externally-consequential action.
+    `SAFE_DEFAULT` — a code-owned, deterministic default Code Slayer
+    itself applied for a genuinely harmless choice.
+    """
+
+    FACT = "FACT"
+    AUTHORIZATION = "AUTHORIZATION"
+    SAFE_DEFAULT = "SAFE_DEFAULT"
+
+
+class WorkerSupplementalSource(StrEnum):
+    """Where one `WorkerSupplementalResolution` came from — mirrors
+    `workers.prompt_analysis.EvidenceSource`'s exact vocabulary; see the
+    module docstring's "Supplemental resolutions" section."""
+
+    ORIGINAL_PROMPT = "ORIGINAL_PROMPT"
+    REPOSITORY = "REPOSITORY"
+    RUNTIME = "RUNTIME"
+    DURABLE_TASK_EVIDENCE = "DURABLE_TASK_EVIDENCE"
+
+
+@dataclass(frozen=True)
+class WorkerSupplementalResolution:
+    """One verified, durable answer to a previously-blocking ambiguity —
+    supplemental authoritative context, never a modification to the
+    original prompt (see the module docstring). Bound to exactly one
+    `ambiguity_id`; a caller must never let one ambiguity's resolution
+    stand in for another's.
+
+    `content` is the exact durable answer text (already read back from
+    `store.content_store.ContentStore` and verified against
+    `content_hash` by the caller — this dataclass carries no verification
+    logic of its own, only the already-verified result). `content_hash`
+    is retained for provenance/audit even after the text has been read,
+    so a caller can always cite exactly which durable evidence this
+    resolution came from without re-embedding the hash into `content`
+    itself.
+    """
+
+    ambiguity_id: str
+    kind: WorkerSupplementalKind
+    source: WorkerSupplementalSource
+    content: str
+    content_hash: str
+
+
 @dataclass(frozen=True)
 class WorkerRequest:
     """One inference request for one task/role turn.
@@ -134,6 +217,14 @@ class WorkerRequest:
     `prior_tool_result`, when set, is the one immediately-preceding tool
     outcome this turn continues from — see `WorkerToolResult`.
 
+    `supplemental_resolutions`, when non-empty, carries verified, durable
+    human/application answers to ambiguities that were resolved before
+    this turn began — see `WorkerSupplementalResolution` and the module
+    docstring's "Supplemental resolutions" section. Ordered deterministically
+    by the caller (never left to incidental storage order); an adapter
+    renders each entry into its own provider input deterministically,
+    always distinguishable from `original_prompt` itself.
+
     `tool_requirement` (`ToolRequirement`, default `OPTIONAL`) is a
     separate, deliberately narrow signal from `allowed_tools`: having
     tools available (`allowed_tools` non-empty) never implies a demand
@@ -147,6 +238,7 @@ class WorkerRequest:
     allowed_tools: tuple[str, ...] | None = None
     prior_tool_result: WorkerToolResult | None = None
     tool_requirement: ToolRequirement = ToolRequirement.OPTIONAL
+    supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = ()
 
 
 @dataclass(frozen=True)

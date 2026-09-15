@@ -154,6 +154,7 @@ from code_slayer.workers.protocol import (
     WorkerAdapter,
     WorkerAdapterError,
     WorkerRequest,
+    WorkerSupplementalResolution,
     WorkerToolResult,
 )
 from code_slayer.workers.protocol_validation import ValidationOutcome, validate_response
@@ -248,6 +249,7 @@ def execute_guarded_turn(
     conn: sqlite3.Connection, adapter: WorkerAdapter, *, task_id: str, worker_id: str,
     role: str, original_prompt: str, lease: LeaseHandle, blobs_dir: Path | str,
     trust_conn: sqlite3.Connection | None = None,
+    supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = (),
 ) -> TurnOutcome:
     """Run one bounded turn: inference -> validation -> trust gate ->
     (at most one) real `ToolExecutor.execute()` -> verified content ->
@@ -257,6 +259,20 @@ def execute_guarded_turn(
     write in this turn — see the module docstring's "Control plane vs.
     execution plane" section; `conn` remains the execution-plane
     connection `ToolExecutor`/`AuditWriter` use regardless.
+
+    `supplemental_resolutions` (Phase 7.7d) is forwarded, unmodified and
+    verbatim, into every `WorkerRequest` this turn constructs — both the
+    initial request and the continuation after a tool call — so a
+    previously-blocking ambiguity's verified human answer remains
+    available as context for the whole bounded turn, not merely for
+    whichever single inference happened to occur right after it was
+    recorded. This function performs no verification of its own: the
+    caller (`runner.local_worker_runner.LocalWorkerRunner`) is the one
+    place authorized to construct these, already verified against durable
+    evidence (see `workers.protocol.WorkerSupplementalResolution`). Purely
+    additional context — never consulted by the trust gate, `PolicyEngine`,
+    or `ToolExecutor` below, all of which remain completely unaware this
+    parameter exists.
 
     Never executes a second tool request, never recurses, never parses
     or recovers leaked textual tool-call syntax -- that responsibility
@@ -282,6 +298,7 @@ def execute_guarded_turn(
     request = WorkerRequest(
         task_id=task_id, role=role, original_prompt=original_prompt,
         allowed_tools=_ALLOWED_TOOLS, tool_requirement=ToolRequirement.OPTIONAL,
+        supplemental_resolutions=supplemental_resolutions,
     )
     try:
         response = adapter.infer(request)
@@ -293,6 +310,12 @@ def execute_guarded_turn(
         "worker_id": worker_id, "role": role, "turn": "initial",
         "protocol_outcome": result.outcome.value, "reason": result.reason,
         "capability": result.tool_call.tool if result.tool_call is not None else None,
+        "supplemental_resolution_ambiguity_ids": [
+            item.ambiguity_id for item in supplemental_resolutions
+        ],
+        "supplemental_resolution_content_hashes": [
+            item.content_hash for item in supplemental_resolutions
+        ],
     })
 
     if result.outcome == ValidationOutcome.VALID_TEXT:
@@ -356,6 +379,7 @@ def execute_guarded_turn(
         task_id=task_id, role=role, original_prompt=original_prompt,
         allowed_tools=_ALLOWED_TOOLS, prior_tool_result=prior,
         tool_requirement=ToolRequirement.OPTIONAL,
+        supplemental_resolutions=supplemental_resolutions,
     )
     try:
         response2 = adapter.infer(request2)

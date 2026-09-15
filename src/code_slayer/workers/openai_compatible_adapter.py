@@ -208,6 +208,20 @@ class OpenAICompatibleAdapter:
 
     def _build_payload(self, request: WorkerRequest) -> dict:
         messages = [{"role": "user", "content": request.original_prompt}]
+        for item in request.supplemental_resolutions:
+            # A separate, clearly-labeled message -- never appended to or
+            # merged into the original-prompt message above, so a reader
+            # (human or model) can never mistake this for something the
+            # user's own original message said (see `workers.protocol`'s
+            # module docstring, "Supplemental resolutions").
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"(Trusted supplemental context -- ambiguity "
+                    f"'{item.ambiguity_id}', kind={item.kind.value}, "
+                    f"source={item.source.value}): {item.content}"
+                ),
+            })
         if request.prior_tool_result is not None:
             # Deliberately the smallest honest representation of "a tool
             # ran and here is what happened" — a plain follow-up user

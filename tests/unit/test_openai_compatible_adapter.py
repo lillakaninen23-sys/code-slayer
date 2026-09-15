@@ -26,6 +26,9 @@ from code_slayer.workers.protocol import (
     WorkerAdapterError,
     WorkerRequest,
     WorkerResponseKind,
+    WorkerSupplementalKind,
+    WorkerSupplementalResolution,
+    WorkerSupplementalSource,
     WorkerToolResult,
 )
 from code_slayer.workers.protocol_validation import ValidationOutcome, validate_response
@@ -279,7 +282,7 @@ def test_worker_request_has_no_endpoint_controlling_field():
     field_names = {f.name for f in fields(WorkerRequest)}
     assert field_names == {
         "task_id", "role", "original_prompt", "allowed_tools", "prior_tool_result",
-        "tool_requirement",
+        "tool_requirement", "supplemental_resolutions",
     }
 
 
@@ -455,3 +458,72 @@ def test_textual_function_leakage_remains_malformed_with_required_tool_requireme
     result = validate_response(request, response)
     assert result.outcome == ValidationOutcome.MALFORMED
     assert result.reason == "textual_tool_protocol_leakage"
+
+
+# --- Phase 7.7d: supplemental resolutions rendered deterministically -------
+
+def test_supplemental_resolution_rendered_as_separate_labeled_message(server):
+    """Item 22: the original prompt message is untouched, and each
+    supplemental resolution becomes its own clearly-labeled message --
+    never merged into, or mistaken for, the user's own original text."""
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    resolution = WorkerSupplementalResolution(
+        ambiguity_id="target-module", kind=WorkerSupplementalKind.FACT,
+        source=WorkerSupplementalSource.DURABLE_TASK_EVIDENCE,
+        content="billing.py", content_hash="deadbeef",
+    )
+    request = _request(
+        original_prompt="Refactor the ambiguous module.",
+        supplemental_resolutions=(resolution,),
+    )
+    OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    sent = json.loads(script.last_request_body)
+    messages = sent["messages"]
+    assert messages[0] == {"role": "user", "content": "Refactor the ambiguous module."}
+    assert len(messages) == 2
+    assert messages[1]["role"] == "user"
+    assert "billing.py" in messages[1]["content"]
+    assert "target-module" in messages[1]["content"]
+    assert "FACT" in messages[1]["content"]
+    assert messages[1]["content"] != "billing.py"  # never bare, unlabeled text
+
+
+def test_multiple_supplemental_resolutions_render_in_given_order(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    first = WorkerSupplementalResolution(
+        ambiguity_id="a", kind=WorkerSupplementalKind.FACT,
+        source=WorkerSupplementalSource.DURABLE_TASK_EVIDENCE,
+        content="first answer", content_hash="h1",
+    )
+    second = WorkerSupplementalResolution(
+        ambiguity_id="b", kind=WorkerSupplementalKind.AUTHORIZATION,
+        source=WorkerSupplementalSource.ORIGINAL_PROMPT,
+        content="yes, authorized", content_hash="h2",
+    )
+    request = _request(supplemental_resolutions=(first, second))
+    OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    sent = json.loads(script.last_request_body)
+    messages = sent["messages"]
+    assert "first answer" in messages[1]["content"]
+    assert "AUTHORIZATION" in messages[2]["content"]
+    assert "yes, authorized" in messages[2]["content"]
+
+
+def test_supplemental_resolutions_precede_prior_tool_result_message(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    resolution = WorkerSupplementalResolution(
+        ambiguity_id="a", kind=WorkerSupplementalKind.FACT,
+        source=WorkerSupplementalSource.DURABLE_TASK_EVIDENCE,
+        content="the answer", content_hash="h1",
+    )
+    prior = WorkerToolResult(tool="read_file", output_summary="file contents")
+    request = _request(supplemental_resolutions=(resolution,), prior_tool_result=prior)
+    OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    sent = json.loads(script.last_request_body)
+    messages = sent["messages"]
+    assert len(messages) == 3
+    assert "the answer" in messages[1]["content"]
+    assert "file contents" in messages[2]["content"]

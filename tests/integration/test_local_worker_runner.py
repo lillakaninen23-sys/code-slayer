@@ -1095,3 +1095,425 @@ def test_split_plane_finalization_crash_does_not_reoccupy_terminal_task(
             execution.close()
     finally:
         restarted.close()
+
+
+# --- Phase 7.7d: durable human resolution -> verified worker context -------
+#
+# The audit finding this section closes: a human answer durably unblocked
+# a run (QuestionGate SUPPRESS) but the worker itself only ever received
+# the original, still-ambiguous prompt. These tests prove the answer's
+# exact durable text -- not merely the fact that *some* resolution
+# existed -- reaches the worker as structurally separate, provenance-
+# preserving `WorkerSupplementalResolution` context, bound to the exact
+# ambiguity it resolves, verified against durable content-store evidence
+# before any inference call, and never derived from the Prompt Analyst's
+# own advisory hints.
+
+def test_fact_resolution_reaches_worker_as_supplemental_context(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.BLOCKED_ON_QUESTIONS
+
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    assert len(adapter.calls) == 1
+
+    request = adapter.calls[0]
+    assert request.original_prompt == prompt  # byte-for-byte, never rewritten
+    assert len(request.supplemental_resolutions) == 1
+    supplemental = request.supplemental_resolutions[0]
+    assert supplemental.ambiguity_id == "target-module"
+    assert supplemental.content == "billing.py"  # the actual durable answer, not just its id
+    assert supplemental.kind.value == "FACT"
+    assert supplemental.source.value == "DURABLE_TASK_EVIDENCE"
+    assert supplemental.content_hash  # provenance retained
+
+
+def test_authorization_resolution_reaches_worker_with_kind_preserved(runner):
+    prompt = "Delete old files."
+    ambiguity = Ambiguity(
+        id="delete-scope", question="Should this permanently delete files?",
+        rationale="Irreversible.", risk_class=AmbiguityRiskClass.DESTRUCTIVE,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "delete-scope", "Yes, delete permanently, I authorize it.",
+        resolution_kind=ResolutionKind.AUTHORIZATION, source=EvidenceSource.ORIGINAL_PROMPT,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    supplemental = adapter.calls[0].supplemental_resolutions[0]
+    assert supplemental.kind.value == "AUTHORIZATION"
+    assert supplemental.content == "Yes, delete permanently, I authorize it."
+    assert supplemental.source.value == "ORIGINAL_PROMPT"
+
+
+def test_resolution_survives_full_close_reopen_and_resume(primary):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    r1 = LocalWorkerRunner(primary)
+    WorkersRepo(r1._control_conn).register(worker_id=WORKER_ID, kind="fake", network_class="local")
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = r1.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.BLOCKED_ON_QUESTIONS
+    r1.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    r1.close()
+
+    # A completely fresh runner/connection -- no Python object memory
+    # from r1 survives.
+    r2 = LocalWorkerRunner(primary)
+    try:
+        adapter = FakeWorkerAdapter([_text("done")])
+        resumed = r2.resume(result.run_id, adapter=adapter)
+        assert resumed.status == RunStatus.COMPLETED
+        supplemental = adapter.calls[0].supplemental_resolutions[0]
+        assert supplemental.content == "billing.py"
+        assert supplemental.ambiguity_id == "target-module"
+    finally:
+        r2.close()
+
+
+def test_missing_resolution_blob_fails_closed_before_worker_inference(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    row = runner._control_conn.execute(
+        "SELECT answer_content_hash FROM runner_human_resolutions WHERE run_id = ?",
+        (result.run_id,),
+    ).fetchone()
+    content_hash = row["answer_content_hash"]
+    blob_path = runner._control_blobs_dir / content_hash[:2] / content_hash
+    blob_path.unlink()  # the metadata row still claims this evidence exists
+
+    adapter = FakeWorkerAdapter([_text("should never be reached")])
+    with pytest.raises(RuntimeError, match="unreadable"):
+        runner.resume(result.run_id, adapter=adapter)
+    assert not adapter.calls
+
+
+def test_corrupt_resolution_blob_fails_closed_before_worker_inference(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    row = runner._control_conn.execute(
+        "SELECT answer_content_hash FROM runner_human_resolutions WHERE run_id = ?",
+        (result.run_id,),
+    ).fetchone()
+    content_hash = row["answer_content_hash"]
+    blob_path = runner._control_blobs_dir / content_hash[:2] / content_hash
+    blob_path.chmod(0o644)
+    blob_path.write_bytes(b"tampered content, not what was actually recorded")
+    blob_path.chmod(0o444)
+
+    adapter = FakeWorkerAdapter([_text("should never be reached")])
+    with pytest.raises(RuntimeError, match="content hash mismatch"):
+        runner.resume(result.run_id, adapter=adapter)
+    assert not adapter.calls
+
+
+def test_resolution_for_ambiguity_a_does_not_leak_into_ambiguity_b(runner):
+    prompt = "Refactor and rename."
+    amb_a = Ambiguity(
+        id="a", question="Which module?", rationale="r", risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    amb_b = Ambiguity(
+        id="b", question="Which new name?", rationale="r", risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst(
+        [PromptAnalysis(original_prompt=prompt, ambiguities=(amb_a, amb_b))],
+    )
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.BLOCKED_ON_QUESTIONS
+    assert set(result.questions) == {amb_a.question, amb_b.question}
+
+    runner.record_user_resolution(
+        result.run_id, "a", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    still_blocked = runner.resume(result.run_id, adapter=FakeWorkerAdapter([]))
+    assert still_blocked.status == RunStatus.BLOCKED_ON_QUESTIONS
+    assert still_blocked.questions == (amb_b.question,)
+
+    runner.record_user_resolution(
+        result.run_id, "b", "new_billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    by_id = {s.ambiguity_id: s.content for s in adapter.calls[0].supplemental_resolutions}
+    assert by_id == {"a": "billing.py", "b": "new_billing.py"}  # never swapped/merged
+
+
+def test_unrelated_ambiguity_id_resolution_is_not_forwarded(runner):
+    prompt = "Refactor the module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    # A resolution for an ambiguity id that is not, and never was, part
+    # of this run's own current analysis -- must never be forwarded.
+    runner.record_user_resolution(
+        result.run_id, "totally-unrelated-id", "should never appear anywhere",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    still_blocked = runner.resume(result.run_id, adapter=FakeWorkerAdapter([]))
+    assert still_blocked.status == RunStatus.BLOCKED_ON_QUESTIONS  # the real ambiguity is untouched
+
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    ids = [s.ambiguity_id for s in adapter.calls[0].supplemental_resolutions]
+    assert ids == ["target-module"]
+
+
+def test_multiple_resolutions_ordered_by_ambiguity_order_not_insertion_order(runner):
+    prompt = "Do two things."
+    amb_a = Ambiguity(id="a", question="A?", rationale="r", risk_class=AmbiguityRiskClass.MATERIAL)
+    amb_b = Ambiguity(id="b", question="B?", rationale="r", risk_class=AmbiguityRiskClass.MATERIAL)
+    analyst = FakePromptAnalyst(
+        [PromptAnalysis(original_prompt=prompt, ambiguities=(amb_a, amb_b))],
+    )
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    # Recorded in reverse order (b before a) -- the output must still
+    # follow PromptAnalysis.ambiguities' own deterministic order.
+    runner.record_user_resolution(
+        result.run_id, "b", "answer-b",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    runner.record_user_resolution(
+        result.run_id, "a", "answer-a",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    ordered_ids = [s.ambiguity_id for s in adapter.calls[0].supplemental_resolutions]
+    assert ordered_ids == ["a", "b"]
+
+
+def test_revised_resolution_answer_wins_over_earlier_one(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "first-guess.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",  # a human revising their own earlier answer
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    supplemental = adapter.calls[0].supplemental_resolutions
+    assert len(supplemental) == 1
+    assert supplemental[0].content == "billing.py"  # RunnerRepo's own "most recent row wins" rule
+
+    # Both attempts remain durably preserved -- append-only, never overwritten.
+    raw_rows = runner._control_conn.execute(
+        "SELECT answer_content_hash FROM runner_human_resolutions WHERE run_id = ? ORDER BY id",
+        (result.run_id,),
+    ).fetchall()
+    assert len(raw_rows) == 2
+
+
+def test_analyst_hint_never_becomes_supplemental_context(runner):
+    prompt = "Delete the old database once the migration finishes."
+    ambiguity = Ambiguity(
+        id="which-database", question="Which database should be destroyed?",
+        rationale="Destroying the wrong database is catastrophic.",
+        risk_class=AmbiguityRiskClass.DESTRUCTIVE,
+        resolved_by_prompt_substring="the old database",
+        evidence_keys=("self-proposed-key",),
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.BLOCKED_ON_QUESTIONS  # the hint alone never suppresses
+
+    runner.record_user_resolution(
+        result.run_id, "which-database", "staging_db, I authorize deleting it",
+        resolution_kind=ResolutionKind.AUTHORIZATION, source=EvidenceSource.ORIGINAL_PROMPT,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    supplemental = adapter.calls[0].supplemental_resolutions
+    assert len(supplemental) == 1
+    assert supplemental[0].content == "staging_db, I authorize deleting it"
+    assert "self-proposed-key" not in supplemental[0].content
+    assert supplemental[0].content != "the old database"
+
+
+def test_authorization_resolution_does_not_grant_mutation_trust(guarded_runner):
+    """The human AUTHORIZATION only ever becomes inert context data --
+    it grants no trust, capability, or lease by itself. `guarded_runner`
+    holds real, conformance-earned GUARDED trust for `read_file` only;
+    `write_file`/mutation trust never exists, and an explicit human
+    authorization for a completely different ambiguity must never
+    change that."""
+    prompt = "Delete old files."
+    ambiguity = Ambiguity(
+        id="delete-scope", question="Should this permanently delete files?",
+        rationale="Irreversible.", risk_class=AmbiguityRiskClass.DESTRUCTIVE,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+        requires_mutation=True,
+    )
+    assert result.status == RunStatus.BLOCKED_ON_QUESTIONS
+    guarded_runner.record_user_resolution(
+        result.run_id, "delete-scope", "Yes, I authorize permanent deletion.",
+        resolution_kind=ResolutionKind.AUTHORIZATION, source=EvidenceSource.ORIGINAL_PROMPT,
+    )
+    adapter = FakeWorkerAdapter([])
+    resumed = guarded_runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.DENIED_TRUST
+    assert not adapter.calls
+    assert WorkerTrustManager(guarded_runner._control_conn).current_trust(
+        WORKER_ID, ROLE, "write_file",
+    ) == TrustLevel.LOCKED
+
+
+def test_supplemental_context_does_not_bypass_policy_engine(guarded_runner):
+    """A human FACT resolution claiming an out-of-scope/absolute path is
+    still just context data for the model to (mis)use -- `PolicyEngine`/
+    `ToolExecutor` still independently refuse the actual tool call."""
+    prompt = "Read a file."
+    ambiguity = Ambiguity(
+        id="path-choice", question="Which file?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    guarded_runner.record_user_resolution(
+        result.run_id, "path-choice", "/etc/passwd",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_read_call(path="/etc/passwd")])
+    resumed = guarded_runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status != RunStatus.COMPLETED  # the absolute path is still refused
+
+
+def test_resume_of_completed_resolved_run_does_not_repeat_inference(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+    assert len(adapter.calls) == 1
+
+    resumed_again = runner.resume(result.run_id, adapter=adapter)
+    assert resumed_again.status == RunStatus.COMPLETED
+    assert len(adapter.calls) == 1  # idempotent -- no new inference
+
+
+def test_audit_records_which_resolution_ids_informed_the_turn(runner):
+    prompt = "Refactor the ambiguous module."
+    ambiguity = Ambiguity(
+        id="target-module", question="Which module?", rationale="r",
+        risk_class=AmbiguityRiskClass.MATERIAL,
+    )
+    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt, ambiguities=(ambiguity,))])
+    result = runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    runner.record_user_resolution(
+        result.run_id, "target-module", "billing.py",
+        resolution_kind=ResolutionKind.FACT, source=EvidenceSource.DURABLE_TASK_EVIDENCE,
+    )
+    adapter = FakeWorkerAdapter([_text("done")])
+    resumed = runner.resume(result.run_id, adapter=adapter)
+    assert resumed.status == RunStatus.COMPLETED
+
+    import json as _json
+
+    row = runner._control_conn.execute(
+        "SELECT payload_json FROM audit_events WHERE event_type = 'WORKER_TOOL_CALL_EVALUATED' "
+        "ORDER BY id LIMIT 1",
+    ).fetchone()
+    payload = _json.loads(row["payload_json"])
+    assert payload["supplemental_resolution_ambiguity_ids"] == ["target-module"]
+    assert len(payload["supplemental_resolution_content_hashes"]) == 1
+    assert payload["supplemental_resolution_content_hashes"][0]  # a real, non-empty hash
+    # No raw answer text ever lands in the audit payload -- hash/id only.
+    assert "billing.py" not in _json.dumps(payload)

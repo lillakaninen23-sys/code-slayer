@@ -175,6 +175,7 @@ from code_slayer.store.models import RunnerRun
 from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.task_repo import TaskAlreadyActiveError, TaskRepo
 from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
+from code_slayer.tools import file_tools as files
 from code_slayer.workers.execution import execute_guarded_turn
 from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalysis, PromptAnalyst
 from code_slayer.workers.prompt_provenance import (
@@ -182,7 +183,12 @@ from code_slayer.workers.prompt_provenance import (
     read_prompt_analysis,
     record_prompt_analysis,
 )
-from code_slayer.workers.protocol import WorkerAdapter
+from code_slayer.workers.protocol import (
+    WorkerAdapter,
+    WorkerSupplementalKind,
+    WorkerSupplementalResolution,
+    WorkerSupplementalSource,
+)
 from code_slayer.workers.question_gate import (
     GateDecision,
     QuestionGate,
@@ -206,6 +212,22 @@ HUMAN_ANSWER_EVIDENCE_KIND = "runner_human_answer"
 _HUMAN_RESOLUTION_SOURCES = frozenset({
     EvidenceSource.ORIGINAL_PROMPT, EvidenceSource.DURABLE_TASK_EVIDENCE,
 })
+
+
+@dataclass(frozen=True)
+class _HumanResolution:
+    """One durable `runner_human_resolutions` row, reconstructed with its
+    identity/authority fields typed (Phase 7.7d) — the richer, in-process
+    counterpart `_load_durable_human_resolutions()` builds so both the
+    `QuestionGate` evidence view (`_resolutions_as_evidence()`) and the
+    worker-facing supplemental-context view (`_build_supplemental_
+    resolutions()`) are derived from exactly one durable read, never two
+    different reconstructions that could disagree."""
+
+    ambiguity_id: str
+    source: EvidenceSource
+    resolution_kind: ResolutionKind
+    answer_content_hash: str
 
 
 class RunStatus(StrEnum):
@@ -438,8 +460,9 @@ class LocalWorkerRunner:
         from `resume()` on a `BLOCKED_ON_QUESTIONS` run (the analyst is
         never re-invoked merely to continue). `resolutions` is combined
         with every durably recorded human resolution for this run — see
-        `_load_human_resolutions()`."""
-        all_resolutions = tuple(resolutions) + self._load_human_resolutions(run.run_id)
+        `_load_durable_human_resolutions()`."""
+        human_records = self._load_durable_human_resolutions(run.run_id)
+        all_resolutions = tuple(resolutions) + self._resolutions_as_evidence(human_records)
         gate_result = QuestionGate().evaluate(
             original_prompt=original_prompt, analysis=analysis, resolutions=all_resolutions,
         )
@@ -474,16 +497,152 @@ class LocalWorkerRunner:
             return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
         return self._proceed_to_execution(claimed, adapter)
 
-    def _load_human_resolutions(self, run_id: str) -> tuple[ResolutionEvidence, ...]:
+    def _load_durable_human_resolutions(self, run_id: str) -> tuple[_HumanResolution, ...]:
+        """Every distinct ambiguity this run has a durable human/
+        application resolution for — the single durable read both
+        `_evaluate_gate()` (via `_resolutions_as_evidence()`) and
+        `_execute_owned()` (via `_build_supplemental_resolutions()`) build
+        on, never two independent reconstructions of the same rows.
+        `RunnerRepo.latest_human_resolutions()` already resolves a
+        revised answer to exactly its most recent row per `ambiguity_id`
+        — this module invents no separate "latest wins" rule; it reuses
+        the one the durable schema already defines. Ordered by
+        `ambiguity_id` (that repo method's own `ORDER BY`), not
+        insertion order — callers that need this run's ambiguity order
+        instead use `PromptAnalysis.ambiguities`, never this tuple's own
+        order (see `_build_supplemental_resolutions()`)."""
         rows = RunnerRepo(self._control_conn).latest_human_resolutions(run_id)
         return tuple(
-            ResolutionEvidence(
-                key=f"human:{row.ambiguity_id}", source=EvidenceSource(row.source),
+            _HumanResolution(
+                ambiguity_id=row.ambiguity_id, source=EvidenceSource(row.source),
                 resolution_kind=ResolutionKind(row.resolution_kind),
-                resolves_ambiguity_ids=(row.ambiguity_id,),
+                answer_content_hash=row.answer_content_hash,
             )
             for row in rows
         )
+
+    @staticmethod
+    def _resolutions_as_evidence(
+        records: tuple[_HumanResolution, ...],
+    ) -> tuple[ResolutionEvidence, ...]:
+        """The `QuestionGate`-facing view of durable human resolutions —
+        authority metadata only (source/kind/which ambiguity), never the
+        answer text itself; `QuestionGate.evaluate()` needs nothing more
+        to decide SUPPRESS/ASK. See `_build_supplemental_resolutions()`
+        for the worker-facing view that *does* carry the verified answer."""
+        return tuple(
+            ResolutionEvidence(
+                key=f"human:{record.ambiguity_id}", source=record.source,
+                resolution_kind=record.resolution_kind,
+                resolves_ambiguity_ids=(record.ambiguity_id,),
+            )
+            for record in records
+        )
+
+    def _read_verified_human_answer(self, content_hash: str) -> str:
+        """Read back one durable human-resolution answer and verify its
+        content identity before ever letting it become worker-facing
+        context — the same fail-closed posture `workers.prompt_provenance.
+        read_original_prompt()` already uses for the original prompt, and
+        `workers.execution.evidence_content()` uses for tool-read
+        evidence. Raises (never returns an unverified fallback, never
+        silently substitutes the caller's own copy of anything) if the
+        blob is missing, misclassified, or its bytes do not hash to
+        `content_hash` — this must never be reached once a `WorkerRequest`
+        has already been built, only strictly before."""
+        store = ContentStore(self._control_conn, self._control_blobs_dir)
+        meta = store.get_meta(content_hash)
+        if meta is None or meta.source_kind != HUMAN_ANSWER_EVIDENCE_KIND:
+            raise RuntimeError(
+                f"no durable human-resolution answer evidence for {content_hash!r}"
+            )
+        try:
+            content = store.read(content_hash)
+        except OSError as exc:
+            raise RuntimeError(
+                f"human-resolution answer blob unreadable for {content_hash!r}"
+            ) from exc
+        if files.digest(content) != content_hash:
+            raise RuntimeError("human-resolution answer blob content hash mismatch")
+        return content.decode("utf-8")
+
+    def _build_supplemental_resolutions(
+        self, original_prompt: str, analysis: PromptAnalysis,
+        human_records: tuple[_HumanResolution, ...],
+    ) -> tuple[WorkerSupplementalResolution, ...]:
+        """The worker-facing view of durable human resolutions (Phase
+        7.7d): for each ambiguity in `analysis.ambiguities` — in that
+        exact, deterministic order, never storage/insertion order —
+        that a durable human resolution *by itself* (never combined with
+        any ephemeral, non-durable `resolutions` argument some caller
+        might also have supplied) suffices to resolve, verify and carry
+        forward its exact durable answer text.
+
+        Re-running `QuestionGate.evaluate()` here, against only the
+        durable evidence, is what makes this exact and safe rather than a
+        guess: `QuestionGateResult.evidence_refs` lines up positionally
+        with `analysis.ambiguities` **only** when the decision is
+        `SUPPRESS` (every ambiguity resolved) — which is also exactly
+        the one case where forwarding is meaningful at all. If durable
+        evidence alone would not suppress every ambiguity (some other,
+        non-durable resolution is what actually let this run proceed),
+        nothing is forwarded — this never guesses which subset the
+        durable evidence alone would have covered. A resolution's
+        `evidence_ref` is checked to actually start with this exact
+        ambiguity's own `human:<ambiguity_id>` key before it is trusted
+        for that ambiguity — the same binding discipline that stops one
+        ambiguity's resolution from ever being read as another's answer.
+        """
+        if not human_records or not analysis.ambiguities:
+            return ()
+        durable_evidence = self._resolutions_as_evidence(human_records)
+        durable_gate_result = QuestionGate().evaluate(
+            original_prompt=original_prompt, analysis=analysis, resolutions=durable_evidence,
+        )
+        if durable_gate_result.decision != GateDecision.SUPPRESS:
+            return ()
+        records_by_ambiguity_id = {record.ambiguity_id: record for record in human_records}
+        supplemental: list[WorkerSupplementalResolution] = []
+        for ambiguity, evidence_ref in zip(
+            analysis.ambiguities, durable_gate_result.evidence_refs, strict=True,
+        ):
+            record = records_by_ambiguity_id.get(ambiguity.id)
+            if record is None:
+                continue
+            expected_prefix = f"{record.source.value.lower()}:human:{ambiguity.id}:"
+            if not evidence_ref.startswith(expected_prefix):
+                # This ambiguity's evidence_ref names a different key --
+                # some other resolution actually resolved it, not this
+                # (possibly stale, wrong-kind) durable human record.
+                continue
+            content = self._read_verified_human_answer(record.answer_content_hash)
+            supplemental.append(WorkerSupplementalResolution(
+                ambiguity_id=ambiguity.id,
+                kind=WorkerSupplementalKind(record.resolution_kind.value),
+                source=WorkerSupplementalSource(record.source.value),
+                content=content, content_hash=record.answer_content_hash,
+            ))
+        return tuple(supplemental)
+
+    def _supplemental_resolutions_for_run(
+        self, run: RunnerRun, original_prompt: str,
+    ) -> tuple[WorkerSupplementalResolution, ...]:
+        """Reconstruct this run's worker-facing supplemental context
+        entirely from durable state (Phase 7.7d) — no in-memory shortcut:
+        this is called from `_execute_owned()`, reachable both directly
+        after `_evaluate_gate()`'s own SUPPRESS decision and, unchanged,
+        after a full process restart via `resume()`'s `RUNNING` recovery
+        path. `run.analysis_content_hash` is set by `_evaluate_gate()`
+        before a run ever reaches `READY`; `None` here (an execution path
+        reached with no analysis on record at all) yields no supplemental
+        context rather than guessing."""
+        if run.analysis_content_hash is None:
+            return ()
+        analysis = read_prompt_analysis(
+            self._control_conn, self._control_blobs_dir, run.analysis_content_hash,
+        )
+        human_records = self._load_durable_human_resolutions(run.run_id)
+        return self._build_supplemental_resolutions(original_prompt, analysis, human_records)
 
     # -- concurrency-safe claim ---------------------------------------------
 
@@ -656,10 +815,12 @@ class LocalWorkerRunner:
                     run, execution, lease, RunStatus.DENIED_TRUST,
                     f"denied_trust:{_MUTATION_PROBE_CAPABILITY}:{trust_level.value}",
                 )
+        supplemental_resolutions = self._supplemental_resolutions_for_run(run, original_prompt)
         outcome = execute_guarded_turn(
             execution.conn, adapter, task_id=execution.task.task_id, worker_id=run.worker_id,
             role=run.role, original_prompt=original_prompt, lease=lease,
             blobs_dir=execution.blobs_dir, trust_conn=self._control_conn,
+            supplemental_resolutions=supplemental_resolutions,
         )
         tool_operation_id = outcome.tool_result.operation_id if outcome.tool_result else None
         status = (
