@@ -25,6 +25,8 @@ worker trust, change leases, or create checkpoints: it touches only
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +36,7 @@ from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import transaction
-from code_slayer.workers.prompt_analysis import Ambiguity, PromptAnalysis
+from code_slayer.workers.prompt_analysis import Ambiguity, AmbiguityRiskClass, PromptAnalysis
 from code_slayer.workers.question_gate import QuestionGateResult
 
 # The `ContentStore.put(source_kind=...)` classifications this module
@@ -78,6 +80,73 @@ def _serialize_analysis(analysis: PromptAnalysis) -> bytes:
         "risk_points": list(analysis.risk_points),
     }
     return canonical_json(document).encode("utf-8")
+
+
+def read_original_prompt(
+    conn: sqlite3.Connection, blobs_dir: Path | str, original_prompt_hash: str,
+) -> str:
+    """Read back the exact original prompt text `record_prompt_analysis()`
+    persisted for `original_prompt_hash`. Fails closed (raises) rather
+    than guess if the blob is missing, wrongly classified, or corrupted
+    — the same posture `workers.execution.evidence_content()` already
+    uses for tool-read evidence."""
+    store = ContentStore(conn, blobs_dir)
+    meta = store.get_meta(original_prompt_hash)
+    if meta is None or meta.source_kind != PROMPT_EVIDENCE_KIND:
+        raise KeyError(f"no durable original-prompt evidence for {original_prompt_hash!r}")
+    content = store.read(original_prompt_hash)
+    if hashlib.sha256(content).hexdigest() != original_prompt_hash:
+        raise RuntimeError("original prompt blob content hash mismatch")
+    return content.decode("utf-8")
+
+
+def read_prompt_analysis(
+    conn: sqlite3.Connection, blobs_dir: Path | str, analysis_content_hash: str,
+) -> PromptAnalysis:
+    """The exact inverse of `_serialize_analysis()`, self-sufficient given
+    only `analysis_content_hash`: reads the analysis document, then reads
+    the original prompt text back (via the document's own
+    `original_prompt_hash`) to reconstruct a complete, real
+    `PromptAnalysis` — never a partial object missing its authoritative
+    `original_prompt`.
+
+    Used by `runner.local_worker_runner.LocalWorkerRunner.resume()` so a
+    blocked run's analysis never needs the Prompt Analyst re-invoked
+    merely to continue — the analysis itself is durable state, exactly
+    as durable as the original prompt it was built from. Fails closed
+    (raises) on any missing/corrupted/misclassified evidence.
+    """
+    store = ContentStore(conn, blobs_dir)
+    meta = store.get_meta(analysis_content_hash)
+    if meta is None or meta.source_kind != ANALYSIS_EVIDENCE_KIND:
+        raise KeyError(f"no durable prompt-analysis evidence for {analysis_content_hash!r}")
+    document = json.loads(store.read(analysis_content_hash))
+    original_prompt = read_original_prompt(conn, blobs_dir, document["original_prompt_hash"])
+    ambiguities = tuple(
+        Ambiguity(
+            id=a["id"], question=a["question"], rationale=a["rationale"],
+            risk_class=AmbiguityRiskClass(a["risk_class"]),
+            evidence_keys=tuple(a["evidence_keys"]),
+            resolved_by_prompt_substring=a["resolved_by_prompt_substring"],
+        )
+        for a in document["ambiguities"]
+    )
+    analysis = PromptAnalysis(
+        original_prompt=original_prompt,
+        goals=tuple(document["goals"]),
+        explicit_requirements=tuple(document["explicit_requirements"]),
+        constraints=tuple(document["constraints"]),
+        already_answered=tuple(document["already_answered"]),
+        ambiguities=ambiguities, risk_points=tuple(document["risk_points"]),
+    )
+    if analysis.original_prompt_hash != document["original_prompt_hash"]:
+        # Unreachable in practice -- content-addressing already
+        # guarantees this -- but fail closed rather than trust a broken
+        # invariant if that ever changes.
+        raise RuntimeError(
+            "reconstructed analysis disagrees with its own stored original_prompt_hash"
+        )
+    return analysis
 
 
 def record_prompt_analysis(

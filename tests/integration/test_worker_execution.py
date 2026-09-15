@@ -229,13 +229,13 @@ def test_corrupted_durable_evidence_fails_closed(db_conn, turn_context, monkeypa
 def test_evidence_content_accepted_regardless_of_preexisting_blob_classification(
     db_conn, turn_context,
 ):
-    """`_evidence_content()` does not gate on `source_kind`: what
+    """`evidence_content()` does not gate on `source_kind`: what
     establishes trust is that `expected_hash` itself came from the one
     real, already-authorized `ToolExecutor.execute()` call, not the
     label on whichever blob dedup happened to land on (see
     `test_read_file_reuses_preexisting_blob_under_a_different_
     classification`)."""
-    from code_slayer.workers.execution import _evidence_content
+    from code_slayer.workers.execution import evidence_content
 
     _root, _task_id, _lease, directory = turn_context
     content = b"hello\n"
@@ -244,7 +244,7 @@ def test_evidence_content_accepted_regardless_of_preexisting_blob_classification
         content, media_type="application/octet-stream", source_kind="command_output",
         exportable=False,
     )
-    assert _evidence_content(db_conn, directory, content_hash) == content
+    assert evidence_content(db_conn, directory, content_hash) == content
 
 
 def test_continuation_receives_the_real_tool_result(db_conn, turn_context):

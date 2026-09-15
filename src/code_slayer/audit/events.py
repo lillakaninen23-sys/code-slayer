@@ -70,6 +70,18 @@ class EventType(StrEnum):
     # task formally exists.
     PROMPT_ANALYSIS_RECORDED = "PROMPT_ANALYSIS_RECORDED"
     QUESTION_GATE_DECISION = "QUESTION_GATE_DECISION"
+    # Phase 7.7: the application-level run record's own lifecycle
+    # (`runner.local_worker_runner.LocalWorkerRunner`) -- always
+    # recorded in the control-plane database, `task_id` set only once an
+    # execution-plane task exists for this run. RUN_FINISHED covers every
+    # terminal outcome (COMPLETED/DENIED_TRUST/FAILED/
+    # INTERRUPTED_RESUMABLE) via its own `status` payload field, rather
+    # than one EventType member per outcome.
+    RUN_STARTED = "RUN_STARTED"
+    RUN_BLOCKED = "RUN_BLOCKED"
+    RUN_USER_RESOLUTION_RECORDED = "RUN_USER_RESOLUTION_RECORDED"
+    RUN_RESUMED = "RUN_RESUMED"
+    RUN_FINISHED = "RUN_FINISHED"
     LEASE_ACQUIRED = "LEASE_ACQUIRED"
     LEASE_RENEWED = "LEASE_RENEWED"
     LEASE_QUIESCING = "LEASE_QUIESCING"

@@ -55,12 +55,12 @@ a `read_file` operation's exact bytes are now persisted into the same
 content-addressed `ContentStore` every other piece of durable evidence
 already lives in, classified `source_kind="tool_read_output"`, under
 the exact digest `ToolResult.output_hash` already carries. The
-`_evidence_content()` helper below retrieves that already-persisted
+`evidence_content()` helper below retrieves that already-persisted
 blob by that hash — it never touches the repository a second time, and
 it is not a second, independent trust decision: every actual
 authorization (lease, policy, ownership, baseline, scope) already came
 from the one real `ToolExecutor.execute()` call that produced this
-evidence. `_evidence_content()` still recomputes and compares the
+evidence. `evidence_content()` still recomputes and compares the
 retrieved bytes' own digest against the expected hash before ever
 handing anything to the model — fail closed
 (`evidence_verification_failed`) on a missing blob, a read error
@@ -103,6 +103,23 @@ shape like `no_choices_in_response` says nothing about the worker's own
 behavior), and `UNAUTHORIZED_CAPABILITY` (a well-formed request for a
 tool that was simply never offered) does not either — that is normal,
 expected containment, not evidence of a broken worker.
+
+## Control plane vs. execution plane (Phase 7.7)
+
+`trust_conn` (default: `conn`, unchanged single-connection behavior)
+lets a caller supply the exact `(worker_id, role, capability)` trust
+history from a *different* database than the one `ToolExecutor`/
+`AuditWriter` write execution evidence into — `runner.
+local_worker_runner.LocalWorkerRunner`'s own control-plane/execution-
+plane separation: durable worker trust is control-plane evidence (Phase
+7.2/7.3) that must survive independently of whichever disposable job
+worktree a given turn's execution happens to use, so it is never copied
+into that job worktree's own database. `current_trust()` and
+`downgrade_to_locked()` both read/write `trust_conn` exclusively; every
+other call in this module (`ToolExecutor`, `AuditWriter`) still uses
+`conn`. Passing the same connection for both (the default) reproduces
+Phase 7.5a/7.5b's original, still fully supported, single-database
+behavior exactly.
 
 ## Durable evidence
 
@@ -187,7 +204,7 @@ def _emit(conn: sqlite3.Connection, task_id: str, worker_id: str, event_type, pa
     )
 
 
-def _evidence_content(
+def evidence_content(
     conn: sqlite3.Connection, blobs_dir: Path | str, expected_hash: str | None,
 ) -> bytes | None:
     """Fetch the exact bytes the real `ToolExecutor.execute()` call
@@ -196,6 +213,12 @@ def _evidence_content(
     reopens the repository file: this is a lookup against the same
     content-addressed `ContentStore` `ToolExecutor` itself just wrote
     the evidence into, not a second, independent trust decision.
+
+    Public (Phase 7.7): `runner.local_worker_runner.LocalWorkerRunner`'s
+    mid-turn crash-recovery path reuses this exact same lookup to
+    reconstruct a prior turn's `WorkerToolResult` from durable evidence
+    alone, never by re-deriving it a different way — one evidence
+    boundary, one implementation.
 
     `None` on any failure -- no such blob, an unreadable/corrupted blob
     file, or a digest mismatch -- fail closed, never a guess, and never a
@@ -224,16 +247,22 @@ def _evidence_content(
 def execute_guarded_turn(
     conn: sqlite3.Connection, adapter: WorkerAdapter, *, task_id: str, worker_id: str,
     role: str, original_prompt: str, lease: LeaseHandle, blobs_dir: Path | str,
+    trust_conn: sqlite3.Connection | None = None,
 ) -> TurnOutcome:
     """Run one bounded turn: inference -> validation -> trust gate ->
     (at most one) real `ToolExecutor.execute()` -> verified content ->
     one continuation inference -> a final validated non-tool response.
 
+    `trust_conn` (default `conn`) is consulted for every trust read/
+    write in this turn — see the module docstring's "Control plane vs.
+    execution plane" section; `conn` remains the execution-plane
+    connection `ToolExecutor`/`AuditWriter` use regardless.
+
     Never executes a second tool request, never recurses, never parses
     or recovers leaked textual tool-call syntax -- that responsibility
     stays entirely with the already-existing, unmodified
     `protocol_validation.validate_response()`."""
-    trust = WorkerTrustManager(conn)
+    trust = WorkerTrustManager(trust_conn if trust_conn is not None else conn)
 
     def _downgrade(capability: str, reason: str) -> bool:
         return trust.downgrade_to_locked(
@@ -308,7 +337,7 @@ def execute_guarded_turn(
             reason=tool_result.reason,
         )
 
-    content = _evidence_content(conn, blobs_dir, tool_result.output_hash)
+    content = evidence_content(conn, blobs_dir, tool_result.output_hash)
     if content is None:
         return _finish(
             "evidence_verification_failed",

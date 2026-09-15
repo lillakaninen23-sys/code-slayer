@@ -30,7 +30,7 @@ from code_slayer.tools.registry import CAPABILITIES
 # operation's exact bytes (§Phase 7.5b) -- never `"command_output"`,
 # which is reserved for a real subprocess's captured stdout/stderr. A
 # caller that already holds this operation's `ToolResult.output_hash`
-# (`workers.execution._evidence_content()`, today) retrieves the
+# (`workers.execution.evidence_content()`, today) retrieves the
 # identical bytes this classification names, never a second read of the
 # repository file itself.
 READ_EVIDENCE_KIND = "tool_read_output"

@@ -152,3 +152,44 @@ class WorkerConformanceResult:
     reason: str
     detail_content_hash: str | None
     occurred_at: str
+
+
+@dataclass(frozen=True)
+class RunnerRun:
+    """One durable application-level run record (Phase 7.7 —
+    `runner.local_worker_runner.LocalWorkerRunner`). Always lives in the
+    control database; `status` is an application-level `RunStatus`, never
+    a `core.states.TaskState`."""
+
+    run_id: str
+    created_at: str
+    updated_at: str
+    repo_id: str
+    primary_worktree_id: str
+    original_prompt_hash: str
+    worker_id: str
+    role: str
+    requires_mutation: bool
+    status: str
+    task_id: str | None
+    execution_worktree_id: str | None
+    job_worktree_path: str | None
+    analysis_content_hash: str | None
+    final_text_content_hash: str | None
+    tool_operation_id: str | None
+    questions_json: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class RunnerHumanResolution:
+    """One durable, append-only human/application resolution answering
+    exactly one blocked ambiguity (Phase 7.7)."""
+
+    id: int
+    run_id: str
+    ambiguity_id: str
+    source: str
+    resolution_kind: str
+    answer_content_hash: str
+    created_at: str
