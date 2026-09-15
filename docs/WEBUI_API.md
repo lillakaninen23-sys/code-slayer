@@ -93,6 +93,10 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | `GET /api/workers/{id}/trust` | Exact scopes, current level from WorkerTrustManager, last 100 events per scope, truncation flag, unrecorded scope level |
 | `GET /api/workers/{id}/conformance` | Current suite version and newest 20 conformance runs with case results |
 | `GET /api/runs/{id}/audit?limit=100` | Newest bounded events from control/execution databases, chronological presentation, association and plane labels |
+| `GET /api/intelligence/status` | Whether the repository has been indexed, whether that snapshot is still current, snapshot id/HEAD/created-at, file count, detected project kinds |
+| `POST /api/intelligence/refresh` | `{}` → forces a fresh, full, deterministic `RepositoryIntelligenceService.inspect()`; returns the same shape as `status` |
+| `POST /api/intelligence/query` | `{text, limit?: 1-50}` → `{stale, candidates: [{path, score, reasons}]}`, ranked against the latest durable snapshot (never rebuilds) |
+| `POST /api/intelligence/context-pack` | `{text, max_files?, max_bytes?, per_file_bytes?}` → bounded selected-file content, project/command evidence, `omitted`, `budget_exhausted`, `stale`; `409` if nothing has ever been indexed |
 
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
@@ -127,7 +131,12 @@ create leases, choose fencing/session IDs, edit runner rows, invoke ToolExecutor
 execute shell, modify checkpoints or select arbitrary worktree/DB paths. This API
 only offers the existing bounded read-only profile. It can display historical job
 worktree runs and their separate execution evidence; it never merges them.
-No AUTO, model mutation trust, or Phase-8 intelligence was added.
+No AUTO or model mutation trust was added. The `/api/intelligence/*` routes
+(Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)) are the
+one addition since WebUI Foundation 1 — deterministic, read-only repository
+evidence only, never a filesystem/DB path from the client, never a new
+authority: a repository fact still cannot become trusted `ResolutionEvidence`
+except through the existing, unmodified application-owned authority path.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens

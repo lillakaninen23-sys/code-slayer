@@ -18,6 +18,7 @@ from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.prompt_analysis import Ambiguity, AmbiguityRiskClass, PromptAnalysis
 from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
 from code_slayer.workers.question_gate import ResolutionKind
+from tests.repo_helpers import git
 
 PROMPT = "Read README.md."
 WORKER = "test-worker"
@@ -100,7 +101,7 @@ def start(client, **extra):
 def test_health_project_list_and_unknown(setup):
     client, _, _ = application(setup)
     health = client.get("/api/health").json
-    assert health["status"] == "ok" and health["schema_version"] == 6
+    assert health["status"] == "ok" and health["schema_version"] == health["known_schema_version"]
     project = client.get("/api/project").json
     assert project["repository_path"] == str(setup)
     assert len(project["head"]) == 40 and project["repo_id"] and project["worktree_id"]
@@ -468,4 +469,97 @@ def test_reads_do_not_write_or_call_runner_actions(setup):
         ):
             assert client.get(path).status_code == 200
     assert runner._control_conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == before
+    runner.close()
+
+
+# --- Phase 8.1: repository intelligence API ---------------------------------
+
+def test_api_intelligence_status(setup):
+    client, _, _ = application(setup)
+    status = client.get("/api/intelligence/status").json
+    assert status["indexed"] is False
+    refreshed = client.post("/api/intelligence/refresh", json={}).json
+    assert refreshed["indexed"] is True and refreshed["current"] is True
+    status = client.get("/api/intelligence/status").json
+    assert status["snapshot_id"] == refreshed["snapshot_id"]
+
+
+def test_api_intelligence_query(setup):
+    (setup / "billing.py").write_text("def charge_customer():\n    pass\n")
+    client, _, _ = application(setup)
+    client.post("/api/intelligence/refresh", json={})
+    result = client.post(
+        "/api/intelligence/query", json={"text": "please update charge_customer"},
+    ).json
+    assert result["stale"] is False
+    assert any(c["path"] == "billing.py" for c in result["candidates"])
+    assert all(c["reasons"] for c in result["candidates"])
+
+
+def test_api_intelligence_context_pack(setup):
+    (setup / "billing.py").write_text("def charge_customer():\n    pass\n")
+    client, _, _ = application(setup)
+    client.post("/api/intelligence/refresh", json={})
+    pack = client.post(
+        "/api/intelligence/context-pack",
+        json={"text": "charge_customer", "max_files": 1, "max_bytes": 5000},
+    ).json
+    assert pack["files"] and pack["files"][0]["path"] == "billing.py"
+    assert pack["stale"] is False
+
+
+def test_api_intelligence_before_indexing_returns_explicit_state(setup):
+    client, _, _ = application(setup)
+    assert client.get("/api/intelligence/status").json["indexed"] is False
+    assert client.post("/api/intelligence/query", json={"text": "anything"}).json == {
+        "stale": False, "candidates": [],
+    }
+    response = client.post("/api/intelligence/context-pack", json={"text": "anything"})
+    assert response.status_code == 409
+
+
+@pytest.mark.parametrize("field", ["repo_path", "db_path", "root", "state_root", "path"])
+def test_api_rejects_arbitrary_path_override(setup, field):
+    client, _, _ = application(setup)
+    assert client.post(
+        "/api/intelligence/query", json={"text": "anything", field: "/etc"},
+    ).status_code == 400
+    assert client.post(
+        "/api/intelligence/context-pack", json={"text": "anything", field: "/etc"},
+    ).status_code == 400
+    assert client.post(
+        "/api/intelligence/refresh", json={field: "/etc"},
+    ).status_code == 400
+
+
+def test_api_intelligence_query_rejects_malformed_input(setup):
+    client, _, _ = application(setup)
+    assert client.post("/api/intelligence/query", json={}).status_code == 400
+    assert client.post("/api/intelligence/query", json={"text": ""}).status_code == 400
+    assert client.post(
+        "/api/intelligence/query", json={"text": "x", "limit": 0},
+    ).status_code == 400
+    assert client.post(
+        "/api/intelligence/query", json={"text": "x", "limit": "10"},
+    ).status_code == 400
+    assert client.post(
+        "/api/intelligence/query", json={"text": "x", "limit": 10_000},
+    ).status_code == 400
+
+
+def test_api_intelligence_never_executes_or_mutates(setup):
+    """Repository intelligence over HTTP is read-only end to end: no
+    audit events are produced by it, and the primary repository is
+    untouched."""
+    runner = LocalWorkerRunner(setup)
+    before_audit = runner._control_conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    before_head = git(setup, "rev-parse", "HEAD")
+    client, _, _ = application(setup)
+    client.post("/api/intelligence/refresh", json={})
+    client.post("/api/intelligence/query", json={"text": "anything"})
+    client.post("/api/intelligence/context-pack", json={"text": "anything"})
+    client.get("/api/intelligence/status")
+    assert git(setup, "rev-parse", "HEAD") == before_head
+    after_audit = runner._control_conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    assert after_audit == before_audit
     runner.close()

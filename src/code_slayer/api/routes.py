@@ -7,6 +7,16 @@ from flask import Blueprint, current_app, jsonify, request
 from code_slayer import __version__
 from code_slayer.api.reads import ResourceNotFound, reason_code
 from code_slayer.api.service import APIError
+from code_slayer.intelligence.limits import (
+    DEFAULT_CONTEXT_PACK_MAX_BYTES,
+    DEFAULT_CONTEXT_PACK_MAX_FILES,
+    DEFAULT_CONTEXT_PACK_PER_FILE_BYTES,
+    DEFAULT_QUERY_RESULTS,
+    MAX_CONTEXT_PACK_MAX_BYTES,
+    MAX_CONTEXT_PACK_MAX_FILES,
+    MAX_CONTEXT_PACK_PER_FILE_BYTES,
+    MAX_QUERY_RESULTS,
+)
 from code_slayer.store.db import known_schema_version
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -154,3 +164,68 @@ def audit(run_id):
     limit, _ = page_args()
     with service().reads() as reads:
         return jsonify(reads.audit(run_id, limit))
+
+
+# -- repository intelligence (Phase 8.1) -------------------------------------
+#
+# Read-only, and never accepts a filesystem root, DB path, trust, or tool
+# permission from the client -- the repository is always the server's own
+# configured project (`service().repo_path`); every field below is a query
+# string and small, explicitly bounded integers only.
+
+def _bounded_int(data, key, default, maximum):
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+        raise APIError("invalid_input", f"{key} must be an integer between 1 and {maximum}.")
+    return value
+
+
+def _intelligence_query_body(*, int_fields):
+    if not request.is_json:
+        raise APIError("json_required", "Send an application/json object.", 415)
+    data = request.get_json()
+    allowed = {"text", *int_fields}
+    if not isinstance(data, dict) or set(data) - allowed or "text" not in data:
+        raise APIError("invalid_fields", "Request has missing or unsupported fields.")
+    text = data["text"]
+    if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+        raise APIError("invalid_input", "text must be a non-empty string up to 4096 characters.")
+    return data
+
+
+@api.get("/intelligence/status")
+def intelligence_status():
+    return jsonify(service().intelligence_status())
+
+
+@api.post("/intelligence/refresh")
+def intelligence_refresh():
+    body({})
+    return jsonify(service().intelligence_refresh())
+
+
+@api.post("/intelligence/query")
+def intelligence_query():
+    data = _intelligence_query_body(int_fields=("limit",))
+    limit = _bounded_int(data, "limit", DEFAULT_QUERY_RESULTS, MAX_QUERY_RESULTS)
+    return jsonify(service().intelligence_query(data["text"], limit))
+
+
+@api.post("/intelligence/context-pack")
+def intelligence_context_pack():
+    data = _intelligence_query_body(int_fields=("max_files", "max_bytes", "per_file_bytes"))
+    max_files = _bounded_int(
+        data, "max_files", DEFAULT_CONTEXT_PACK_MAX_FILES, MAX_CONTEXT_PACK_MAX_FILES,
+    )
+    max_bytes = _bounded_int(
+        data, "max_bytes", DEFAULT_CONTEXT_PACK_MAX_BYTES, MAX_CONTEXT_PACK_MAX_BYTES,
+    )
+    per_file_bytes = _bounded_int(
+        data, "per_file_bytes", DEFAULT_CONTEXT_PACK_PER_FILE_BYTES,
+        MAX_CONTEXT_PACK_PER_FILE_BYTES,
+    )
+    return jsonify(service().intelligence_context_pack(
+        data["text"], max_files=max_files, max_bytes=max_bytes, per_file_bytes=per_file_bytes,
+    ))

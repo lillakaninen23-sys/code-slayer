@@ -193,3 +193,23 @@ class RunnerHumanResolution:
     resolution_kind: str
     answer_content_hash: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class RepositoryIntelligenceSnapshotRow:
+    """One durable, append-only repository-intelligence snapshot record
+    (Phase 8.1) — small identity/pointer row only; the actual inventory/
+    project/command/symbol/graph content lives content-addressed in
+    `content_blobs`, referenced by `snapshot_content_hash`."""
+
+    snapshot_id: str
+    repo_id: str
+    worktree_id: str
+    head_sha: str | None
+    working_tree_dirty: bool
+    working_tree_fingerprint: str
+    index_version: str
+    created_at: str
+    snapshot_content_hash: str
+    file_count: int
+    inventory_truncated: bool

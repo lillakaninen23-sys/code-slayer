@@ -6,10 +6,11 @@ its connections and adapters; no SQLite connection crosses a server thread.
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
+from code_slayer.intelligence import RepositoryIntelligenceService
 from code_slayer.repo import identity
 from code_slayer.runner import LocalWorkerRunner
 from code_slayer.workers.prompt_analysis import PromptAnalyst
@@ -53,6 +54,14 @@ class ApplicationService:
     def reads(self):
         with ReadModels(self.identity, self.state_root) as reads:
             yield reads
+
+    @contextmanager
+    def intelligence(self):
+        service = RepositoryIntelligenceService(self.repo_path, state_root_override=self.state_root)
+        try:
+            yield service
+        finally:
+            service.close()
 
     def adapter(self, worker_id, role):
         factory = self.bindings.adapter_factory
@@ -101,3 +110,28 @@ class ApplicationService:
                 resolution_kind=ResolutionKind(data["resolution_kind"]),
             )
             return runner.status(run_id)
+
+    # -- repository intelligence (Phase 8.1; read-only, never executes anything) --
+
+    def intelligence_status(self):
+        with self.intelligence() as service:
+            return asdict(service.status())
+
+    def intelligence_refresh(self):
+        with self.intelligence() as service:
+            service.inspect(force=True)
+            return asdict(service.status())
+
+    def intelligence_query(self, text, limit):
+        with self.intelligence() as service:
+            candidates, stale = service.query(text, limit=limit)
+            return {"stale": stale, "candidates": [asdict(c) for c in candidates]}
+
+    def intelligence_context_pack(self, text, *, max_files, max_bytes, per_file_bytes):
+        with self.intelligence() as service:
+            pack = service.build_context_pack(
+                text, max_files=max_files, max_bytes=max_bytes, per_file_bytes=per_file_bytes,
+            )
+        if pack is None:
+            raise APIError("not_indexed", "Repository has not been indexed yet.", 409)
+        return asdict(pack)
