@@ -16,7 +16,6 @@ from code_slayer.store.task_repo import TaskRepo
 from code_slayer.workers.prompt_analysis import (
     Ambiguity,
     AmbiguityRiskClass,
-    EvidenceItem,
     EvidenceSource,
     PromptAnalysis,
 )
@@ -26,7 +25,13 @@ from code_slayer.workers.prompt_provenance import (
     PromptProvenance,
     record_prompt_analysis,
 )
-from code_slayer.workers.question_gate import GateDecision, QuestionGate, QuestionGateResult
+from code_slayer.workers.question_gate import (
+    GateDecision,
+    QuestionGate,
+    QuestionGateResult,
+    ResolutionEvidence,
+    ResolutionKind,
+)
 
 PROMPT = "Add a health check endpoint to the API."
 
@@ -70,7 +75,7 @@ def test_original_prompt_and_analysis_persisted_as_content_addressed_evidence(
 ):
     analysis = _suppress_analysis()
     gate_result = QuestionGate().evaluate(
-        original_prompt=PROMPT, analysis=analysis, evidence={},
+        original_prompt=PROMPT, analysis=analysis, resolutions=(),
     )
     provenance = record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
@@ -98,7 +103,7 @@ def test_original_prompt_and_analysis_persisted_as_content_addressed_evidence(
 
 def test_original_prompt_hash_matches_analysis_hash(db_conn, blobs_dir):
     analysis = _suppress_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     provenance = record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
     )
@@ -107,7 +112,7 @@ def test_original_prompt_hash_matches_analysis_hash(db_conn, blobs_dir):
 
 def test_audit_events_recorded_with_small_structured_payload_not_raw_prompt(db_conn, blobs_dir):
     analysis = _ask_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     assert gate_result.decision == GateDecision.ASK
     provenance = record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
@@ -137,7 +142,7 @@ def test_audit_events_recorded_with_small_structured_payload_not_raw_prompt(db_c
 
 def test_works_with_task_id_none(db_conn, blobs_dir):
     analysis = _suppress_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     provenance = record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
     )
@@ -150,7 +155,7 @@ def test_works_with_a_real_task_id(db_conn, blobs_dir):
         worktree_id="wt-1",
     )
     analysis = _suppress_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     record_prompt_analysis(
         db_conn, blobs_dir, task_id=task.task_id, analysis=analysis, gate_result=gate_result,
     )
@@ -172,7 +177,7 @@ def test_recording_does_not_change_task_state(db_conn, blobs_dir):
     )
     before = TaskRepo(db_conn).get(task.task_id)
     analysis = _ask_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     record_prompt_analysis(
         db_conn, blobs_dir, task_id=task.task_id, analysis=analysis, gate_result=gate_result,
     )
@@ -194,7 +199,7 @@ def test_normal_state_transitions_still_work_after_recording(db_conn, blobs_dir)
         worktree_id="wt-1",
     )
     analysis = _suppress_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     record_prompt_analysis(
         db_conn, blobs_dir, task_id=task.task_id, analysis=analysis, gate_result=gate_result,
     )
@@ -211,7 +216,7 @@ def test_recording_grants_no_trust_lease_or_checkpoint_authority(db_conn, blobs_
     before = {t: [dict(r) for r in db_conn.execute(f"SELECT * FROM {t}")] for t in tables}
 
     analysis = _ask_analysis()
-    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, evidence={})
+    gate_result = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis, resolutions=())
     record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
     )
@@ -246,8 +251,8 @@ def test_repeated_recording_of_identical_prompt_dedups_the_prompt_blob(db_conn, 
     analysis_2 = _ask_analysis()
     assert analysis_1.original_prompt_hash == analysis_2.original_prompt_hash
 
-    gate_1 = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis_1, evidence={})
-    gate_2 = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis_2, evidence={})
+    gate_1 = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis_1, resolutions=())
+    gate_2 = QuestionGate().evaluate(original_prompt=PROMPT, analysis=analysis_2, resolutions=())
     provenance_1 = record_prompt_analysis(
         db_conn, blobs_dir, task_id=None, analysis=analysis_1, gate_result=gate_1,
     )
@@ -265,8 +270,46 @@ def test_repeated_recording_of_identical_prompt_dedups_the_prompt_blob(db_conn, 
     assert blob_count == 1
 
 
+def test_analyst_self_resolution_attempt_is_durably_recorded_as_ask(db_conn, blobs_dir):
+    """An analyst that proposes an ambiguity AND proposes the very
+    substring/evidence key that would resolve it, with no independently
+    supplied `ResolutionEvidence`, must be durably recorded as ASK --
+    never silently accepted as SUPPRESS."""
+    prompt = "Delete the old database once the migration finishes."
+    analysis = PromptAnalysis(
+        original_prompt=prompt,
+        ambiguities=(
+            Ambiguity(
+                id="which-database", question="Which database should be destroyed?",
+                rationale="Destroying the wrong database is catastrophic.",
+                risk_class=AmbiguityRiskClass.DESTRUCTIVE,
+                resolved_by_prompt_substring="the",  # trivially present, proves nothing
+                evidence_keys=("self-proposed-key",),
+            ),
+        ),
+    )
+    gate_result = QuestionGate().evaluate(
+        original_prompt=prompt, analysis=analysis, resolutions=(),
+    )
+    assert gate_result.decision == GateDecision.ASK
+
+    record_prompt_analysis(
+        db_conn, blobs_dir, task_id=None, analysis=analysis, gate_result=gate_result,
+    )
+    decision_row = db_conn.execute(
+        "SELECT payload_json FROM audit_events WHERE event_type = 'QUESTION_GATE_DECISION' "
+        "ORDER BY seq DESC LIMIT 1",
+    ).fetchone()
+    payload = json.loads(decision_row["payload_json"])
+    assert payload["decision"] == "ASK"
+    assert payload["questions"] == ["Which database should be destroyed?"]
+    assert payload["evidence_refs"] == []
+
+
 def test_full_flow_with_authoritative_evidence_end_to_end(db_conn, blobs_dir):
-    """analyst -> gate -> provenance, using real deterministic evidence."""
+    """analyst -> gate -> provenance, using real, independently supplied
+    trusted resolution evidence -- never anything the analyst itself
+    asserted (Phase 7.6 question-gate hardening)."""
     prompt = "Add a script for the project's package manager."
     analysis = PromptAnalysis(
         original_prompt=prompt,
@@ -275,17 +318,22 @@ def test_full_flow_with_authoritative_evidence_end_to_end(db_conn, blobs_dir):
                 id="package-manager", question="Which package manager?",
                 rationale="Wrong choice could conflict with the existing lockfile.",
                 risk_class=AmbiguityRiskClass.MATERIAL,
-                evidence_keys=("repo:package_manager",),
+                evidence_keys=("repo:package_manager",),  # analyst's own non-binding hint
             ),
         ),
     )
-    evidence = {
-        "repo:package_manager": EvidenceItem(
-            source=EvidenceSource.REPOSITORY, value="npm", detail="package-lock.json present",
+    # Independently supplied by the caller (Code Slayer's own repository
+    # inspection) -- never derived from the analysis above, and
+    # explicitly bound to the exact ambiguity id it resolves.
+    resolutions = (
+        ResolutionEvidence(
+            key="repo.package_manager", source=EvidenceSource.REPOSITORY,
+            resolution_kind=ResolutionKind.FACT, resolves_ambiguity_ids=("package-manager",),
+            detail="package-lock.json present",
         ),
-    }
+    )
     gate_result = QuestionGate().evaluate(
-        original_prompt=prompt, analysis=analysis, evidence=evidence,
+        original_prompt=prompt, analysis=analysis, resolutions=resolutions,
     )
     assert gate_result.decision == GateDecision.SUPPRESS
 
@@ -298,5 +346,5 @@ def test_full_flow_with_authoritative_evidence_end_to_end(db_conn, blobs_dir):
     ).fetchone()
     payload = json.loads(decision_row["payload_json"])
     assert payload["decision"] == "SUPPRESS"
-    assert payload["evidence_refs"] == ["repository:repo:package_manager"]
+    assert payload["evidence_refs"] == ["repository:repo.package_manager:fact"]
     assert payload["analysis_content_hash"] == provenance.analysis_content_hash

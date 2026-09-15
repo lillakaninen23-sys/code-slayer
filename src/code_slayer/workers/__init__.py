@@ -52,14 +52,22 @@ Analyst (`workers.prompt_analysis`) and Question Gate (`workers.
 question_gate`): a provider-neutral, deterministic-first structured
 analysis of the original user prompt, and a pure `SUPPRESS`/`ASK`
 decision built only from the exact original prompt, that analysis, and
-explicit deterministic evidence — never from a model's own claim or
-model consensus. `workers.prompt_provenance` durably records a decision
-already made, reusing `ContentStore`/`AuditWriter`, no schema migration.
-Neither component can mutate files, execute tools, bypass `PolicyEngine`,
-or grant trust; this phase does not yet wire either into a real task
-runner (`docs/ROADMAP.md`'s Local Worker Runtime stage, step 5) — that
-integration, along with `AUTO` trust and mutation-capability trust, is
-still deferred."""
+independently supplied `ResolutionEvidence` — never from a model's own
+claim, model consensus, or an analyst self-resolving its own proposed
+ambiguity. A same-phase hardening follow-up closed exactly that
+loophole: `Ambiguity.evidence_keys`/`resolved_by_prompt_substring`/
+`risk_class` are analyst-supplied hints only, never themselves
+sufficient to suppress a question, and `DESTRUCTIVE`/
+`EXTERNAL_SIDE_EFFECT` ambiguities require an explicit `AUTHORIZATION`-
+kind resolution from `ORIGINAL_PROMPT`/`DURABLE_TASK_EVIDENCE` — a
+repository/runtime fact alone is never authorization; see `workers.
+question_gate`'s module docstring. `workers.prompt_provenance` durably
+records a decision already made, reusing `ContentStore`/`AuditWriter`,
+no schema migration. Neither component can mutate files, execute tools,
+bypass `PolicyEngine`, or grant trust; this phase does not yet wire
+either into a real task runner (`docs/ROADMAP.md`'s Local Worker Runtime
+stage, step 5) — that integration, along with `AUTO` trust and
+mutation-capability trust, is still deferred."""
 
 from code_slayer.store.conformance_repo import ConformanceRunStatus
 from code_slayer.store.worker_trust_repo import TrustLevel
@@ -105,7 +113,13 @@ from code_slayer.workers.protocol_validation import (
     ValidationResult,
     validate_response,
 )
-from code_slayer.workers.question_gate import GateDecision, QuestionGate, QuestionGateResult
+from code_slayer.workers.question_gate import (
+    GateDecision,
+    QuestionGate,
+    QuestionGateResult,
+    ResolutionEvidence,
+    ResolutionKind,
+)
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
 
 __all__ = [
@@ -129,6 +143,8 @@ __all__ = [
     "PromptProvenance",
     "QuestionGate",
     "QuestionGateResult",
+    "ResolutionEvidence",
+    "ResolutionKind",
     "ToolRequirement",
     "TrustLevel",
     "TrustResult",

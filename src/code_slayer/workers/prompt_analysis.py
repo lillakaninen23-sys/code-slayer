@@ -45,21 +45,31 @@ and a read-only `EvidenceContext` — never a database connection, a
 `ToolExecutor`, a lease, or any other mutating capability (see this
 module's "Security" note below).
 
-## No model-consensus evidence
+## No model-consensus evidence, and no analyst self-resolution either
 
 `EvidenceSource` intentionally has no "the analyst/model said so" member.
 Every source in it is something Code Slayer itself deterministically
 established — the original prompt's own text, real repository state,
 real runtime state, or prior durable task evidence
-(`docs/CODE_SLAYER_VISION.md` §34's authority model). An `Ambiguity`'s
-own `resolved_by_prompt_substring`/`evidence_keys` are the *analyst's*
-proposal of what kind of fact would resolve its question — never treated
-as already-resolved by this module alone. `workers.question_gate.
-QuestionGate` is what independently re-checks a proposed prompt
-substring against the real prompt text, and a proposed evidence key
-against a real, authoritatively-sourced `EvidenceContext` entry, before
-ever suppressing a question. Nothing here can turn "two models agree" or
-"an analyst asserts X" into evidence by itself.
+(`docs/CODE_SLAYER_VISION.md` §34's authority model).
+
+An `Ambiguity`'s own `resolved_by_prompt_substring`/`evidence_keys` are
+the *analyst's own, non-binding hints* about what might resolve its
+question — never proof that it already is resolved, and never
+sufficient by themselves to suppress anything. The self-resolution
+problem this guards against: an analyst that proposes an ambiguity *and*
+proposes the very thing that resolves it would otherwise be able to
+suppress its own question merely by asserting both halves. Resolving an
+ambiguity is `workers.question_gate.ResolutionEvidence`'s job — a
+structure the analyst cannot construct, mutate, or influence at all
+(nothing in this module imports `workers.question_gate`, and a
+`PromptAnalyst` never receives it). `QuestionGate.evaluate()` requires an
+independently supplied `ResolutionEvidence` that *explicitly* names the
+exact ambiguity id it resolves; an analyst's hint at most tells a caller
+what evidence might be worth gathering, never that gathering it is
+unnecessary. Nothing here can turn "two models agree," "an analyst
+asserts X," or "the analyst also happened to name the evidence that
+would answer its own question" into an actual resolution.
 
 ## Security
 
@@ -120,10 +130,15 @@ class EvidenceItem:
     detail: str = ""
 
 
-# A read-only bag of deterministic facts, keyed by a short stable name an
-# `Ambiguity.evidence_keys` entry can reference (e.g. "repo:package_manager",
-# "runtime:current_branch"). Never constructed from an analyst's own
-# output — only from something Code Slayer itself established.
+# A read-only bag of deterministic facts a caller gives `PromptAnalyst.
+# analyze()` to inform its own reasoning, keyed by a short stable name
+# (e.g. "repo:package_manager", "runtime:current_branch") an `Ambiguity.
+# evidence_keys` entry may later reference as a hint. Never constructed
+# from an analyst's own output — only from something Code Slayer itself
+# established. This context is informational input to the analyst only:
+# `workers.question_gate.QuestionGate` does not accept it and never
+# resolves an ambiguity merely because a same-named entry exists here —
+# see `workers.question_gate.ResolutionEvidence` for what actually does.
 EvidenceContext = Mapping[str, EvidenceItem]
 
 
@@ -166,18 +181,23 @@ class Ambiguity:
     `workers.prompt_provenance`) — never regenerated per analysis run for
     the same underlying question.
 
-    `resolved_by_prompt_substring`, when not `None`, is the analyst's own
-    claim that this *exact* substring, verbatim, already appears in the
-    original prompt and answers the question. `QuestionGate` independently
-    re-checks that the substring genuinely occurs in the real original
-    prompt text before ever trusting it — never taken on the analyst's
-    word alone.
-
-    `evidence_keys` names the `EvidenceContext` keys that, if present and
-    carrying an authoritative `EvidenceSource`, deterministically resolve
-    this ambiguity. The analyst proposes *what kind* of fact would answer
-    its own question; only `QuestionGate`, checking the real
-    `EvidenceContext`, decides whether that fact is actually available.
+    `resolved_by_prompt_substring` and `evidence_keys` are the analyst's
+    own **non-binding hints** — advisory provenance about what it *thinks*
+    might already answer this question, never proof that it does.
+    `resolved_by_prompt_substring`, when not `None`, is the analyst's
+    claim that this exact substring, verbatim, appears in the original
+    prompt and answers the question; `evidence_keys` names
+    `EvidenceContext` keys the analyst thinks are relevant. Neither field
+    is ever, by itself, sufficient for `workers.question_gate.
+    QuestionGate` to suppress this ambiguity — an analyst that proposes
+    both an ambiguity *and* the thing that supposedly resolves it must
+    never be able to suppress its own question merely by asserting both
+    halves. A caller may still find these hints useful for deciding what
+    to inspect, but actually resolving the ambiguity requires an
+    independently supplied `workers.question_gate.ResolutionEvidence`
+    that explicitly names this ambiguity's `id` — a structure the analyst
+    can never construct, mutate, or see (see `workers.question_gate`'s
+    module docstring).
     """
 
     id: str
