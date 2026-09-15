@@ -76,5 +76,48 @@ def serve(repo, webui_dir, host, port, trusted_host, runtime_factory):
     wsgi_serve(app, host=host, port=port, threads=4, max_request_body_size=65536)
 
 
+@cli.command("permission-request-demo")
+@click.option("--repo", default=".", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--permission-key", default="network.discovery.local", show_default=True,
+    help="Must name a registered code-owned permission definition.",
+)
+@click.option("--semantic-version", default="1", show_default=True)
+@click.option(
+    "--purpose", default="Manual acceptance testing of the consent UI.", show_default=True,
+)
+def permission_request_demo(repo, permission_key, semantic_version, purpose):
+    """DIAGNOSTIC / DEVELOPER-ONLY. Durably creates one real PENDING
+    permission request so the WebUI consent flow can be exercised by
+    hand.
+
+    This is never called by production feature code and grants no
+    authority by itself -- it only creates a request a human must still
+    explicitly ALLOW or DENY through the WebUI/API, exactly like any
+    other permission request. There is no equivalent HTTP endpoint: the
+    browser can never mint a permission request (see
+    `docs/PERMISSIONS_MODEL.md`); this command exists solely because a
+    trusted, explicitly-invoked, developer-only CLI action is the
+    sanctioned way to demonstrate the consent flow without fabricating
+    production data or adding a public request-minting endpoint.
+    """
+    from code_slayer.permissions.service import PermissionEngineError, PermissionService
+
+    service = PermissionService(repo)
+    try:
+        record = service.request(
+            permission_key=permission_key, semantic_version=semantic_version, resource=None,
+            purpose=purpose, requesting_subsystem="cli-diagnostic",
+        )
+    except PermissionEngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        service.close()
+    click.echo(f"request_id:  {record.request_id}")
+    click.echo(f"permission:  {record.permission_key}:{record.semantic_version}")
+    click.echo(f"state:       {record.state}")
+    click.echo("Open the WebUI's Privacy & Security view to Allow or Deny it.")
+
+
 if __name__ == "__main__":
     cli()

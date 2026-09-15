@@ -225,6 +225,70 @@ class PlanningJobRow:
 
 
 @dataclass(frozen=True)
+class PermissionRequestRow:
+    """One durable, immutable permission-request record (CSLR Governance
+    Foundation, slice G2 — `permissions.service.PermissionService`).
+    Created only by trusted backend code
+    (`PermissionService.request()`) — never from an HTTP body, model
+    output, or planner output. `permission_key`/`semantic_version` name
+    an entry in the code-owned `permissions.definitions.
+    PERMISSION_DEFINITIONS` registry; this row never carries the
+    definition's own explanation metadata, only the identity of which
+    definition was requested."""
+
+    request_id: str
+    created_at: str
+    repo_id: str
+    worktree_id: str
+    permission_key: str
+    semantic_version: str
+    resource: str | None
+    purpose: str
+    requesting_subsystem: str
+
+
+@dataclass(frozen=True)
+class PermissionDecisionRow:
+    """One durable, immutable decision on exactly one request — append-
+    only, and unique per `request_id` (migration 0010's own DB
+    constraint, not merely an application-level check)."""
+
+    id: int
+    request_id: str
+    decision: str
+    decided_at: str
+
+
+@dataclass(frozen=True)
+class PermissionGrantRow:
+    """One durable, immutable grant, created only alongside an ALLOW
+    decision. `authority_origin` is always `USER_EXPLICIT` in this
+    phase — see `permissions.definitions.AuthorityOrigin`. Whether this
+    grant is currently active is never stored here; it is derived by
+    checking `permission_revocations` and `expiry` at read time
+    (`permissions.service.PermissionService`)."""
+
+    grant_id: str
+    request_id: str
+    permission_key: str
+    semantic_version: str
+    resource: str | None
+    authority_origin: str
+    granted_at: str
+    expiry: str | None
+
+
+@dataclass(frozen=True)
+class PermissionRevocationRow:
+    """One durable, immutable revocation of exactly one grant — append-
+    only, and unique per `grant_id`."""
+
+    id: int
+    grant_id: str
+    revoked_at: str
+
+
+@dataclass(frozen=True)
 class EngineeringPlanRow:
     """One durable, mutable engineering-plan revision record (Phase 8.2
     — `planning.service.EngineeringPlanningService`). Mirrors

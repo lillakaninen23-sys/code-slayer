@@ -138,3 +138,15 @@ class EventType(StrEnum):
     PLANNING_JOB_ACCEPTED = "PLANNING_JOB_ACCEPTED"
     PLANNING_JOB_CLAIMED = "PLANNING_JOB_CLAIMED"
     PLANNING_JOB_FINISHED = "PLANNING_JOB_FINISHED"
+    # CSLR Governance Foundation, slice G2: the Permission Engine's own
+    # durable request/decision/revocation lifecycle
+    # (`permissions.service.PermissionService`). Never carries secrets;
+    # never carries raw model output. A successful `check()` is
+    # deliberately never audited (it is side-effect free and would flood
+    # the log for every harmless repeated check) -- only the
+    # security-relevant outcomes below are.
+    PERMISSION_REQUESTED = "PERMISSION_REQUESTED"
+    PERMISSION_ALLOWED = "PERMISSION_ALLOWED"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    PERMISSION_REVOKED = "PERMISSION_REVOKED"
+    PERMISSION_CHECK_DENIED = "PERMISSION_CHECK_DENIED"

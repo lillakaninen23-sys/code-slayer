@@ -1,15 +1,16 @@
 # Permissions Model
 
 **Status:** authoritative governance specification (Governance Foundation,
-slice G1). Defines the *vocabulary and semantics* a future machine-enforced
-Permission Engine MUST implement. **No Permission Engine runtime exists
-yet** — this document specifies what it must mean once built; it does not
-implement tables, an API, or enforcement code.
+slice G1), with a **real, machine-enforced first implementation as of slice
+G2** — `permissions.service.PermissionService` (see
+[Implementation status](#implementation-status) below). Defines the
+*vocabulary and semantics* the Permission Engine MUST implement; this
+document remains the authority when the two disagree.
 **Relationship to other documents:** [`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](SECURITY_PRIVACY_ARCHITECTURE.md)
 establishes *why* (local-first, consent-before-discovery, non-transitive
 consent, fail-closed, revocation); this document establishes the *shape*
-those invariants are expressed through once implemented. Today's real,
-already-implemented authorization mechanism remains
+those invariants are expressed through. Today's other real,
+already-implemented authorization mechanisms remain
 `policy.engine.PolicyEngine` (`docs/TOOLS_AND_POLICY.md`) plus
 `workers.trust.WorkerTrustManager` (`CODE_SLAYER_VISION.md`§42) — this
 document does not replace either; a future Permission Engine governs a
@@ -197,12 +198,70 @@ Non-negotiable UX constraints:
   unrelated functionality, nag on every subsequent screen, or be treated
   as a lesser-supported path than accepting.
 
+## Implementation status (slice G2)
+
+**Current implementation.** `permissions.service.PermissionService` is a
+real, machine-enforced Permission Engine — the first system to actually
+hold `no permission -> no authority` at runtime, not only on paper:
+
+- **Definitions** (§1) live in code only —
+  `permissions.definitions.PERMISSION_DEFINITIONS`, keyed by exact
+  `(permission_key, semantic_version)`. One real definition is
+  registered: `network.discovery.local` version `"1"`
+  (`resource_type="none"`). **Registering this definition does not
+  implement network discovery** — nothing in this package opens a
+  socket, resolves a hostname, or makes any network call; see
+  `tests/unit/test_permissions.py`'s own no-network regression test.
+- **Durable append-only history** (schema v10, migration `0010`):
+  `permission_requests` / `permission_decisions` / `permission_grants` /
+  `permission_revocations` — four INSERT-only tables (DB triggers refuse
+  UPDATE/DELETE unconditionally), never a single mutable "permission"
+  row. Effective state (PENDING/ALLOWED/DENIED, ACTIVE/REVOKED/EXPIRED)
+  is always derived by reading this history, never stored as a status
+  column.
+- **`PermissionService.request()`/`.check()`/`.require()`/`.decide()`/
+  `.revoke()`/`.pending()`/`.grants()`** are the only entry points;
+  `check()` is side-effect free (no writes, no audit) and exact-match
+  only — no wildcard, no implicit parent-scope authority. `request()` is
+  callable only by trusted backend Python code; **there is no HTTP route
+  that lets a browser create a permission request** (`GET/POST
+  /api/permissions*` — see [`docs/WEBUI_API.md`](WEBUI_API.md)).
+- **Authority origin**: every grant's `authority_origin` is
+  `USER_EXPLICIT` — the *only* value `permissions.definitions.
+  AuthorityOrigin` defines. `MODEL`/`PLANNER`/`WORKER` are not members of
+  that enum at all; nothing in `permissions.service` imports
+  `planning.*` or `workers.protocol`, so no model/planner/worker output
+  has a code path into a decision (`docs/SECURITY_PRIVACY_ARCHITECTURE.md`§10).
+- **Concurrency safety** is a DB constraint, not only an application
+  check: `permission_decisions.request_id` and
+  `permission_revocations.grant_id` are both `UNIQUE` — a second,
+  racing, or duplicate decide()/revoke() call always observes the one
+  already-committed outcome, never creates a conflicting second row.
+- **WebUI**: a real "Privacy & Security" view renders pending requests,
+  active/revoked grants, and the full progressive-disclosure explanation
+  from `PermissionDefinitionView` — see
+  [`docs/WEBUI_API.md`](WEBUI_API.md#permissions-cslr-governance-foundation-slice-g2).
+
+**Still required future behavior, not built in slice G2:** hierarchical/
+wildcard scopes (§2's illustrative vocabulary beyond
+`network.discovery.local` is not registered — no `storage.*`/`ai.*`/
+`models.*`/etc. definitions exist yet); user-selectable scope at decision
+time (`user_selectable_scope` exists on `PermissionDefinition` but no
+registered definition sets it `True` yet); non-`USER_EXPLICIT` authority
+origins; expiry actually being *set* by any current caller (the
+expiry-checking mechanism itself works and is tested, but `request()`/
+`decide()` never populate a non-`None` expiry today); and, critically,
+**every feature this Engine exists to gate — network/LAN discovery, NAS
+integration, AI-server discovery, model downloads — remains
+unimplemented**. Building any of those without calling
+`PermissionService.require()` first would defeat the entire point of
+this slice.
+
 ## 7. What this document does not do
 
-Consistent with [`SECURITY_PRIVACY_ARCHITECTURE.md`§13](SECURITY_PRIVACY_ARCHITECTURE.md#13-boundaries-this-document-intentionally-does-not-cross),
-this document does not implement a permissions table, a permissions API,
-a storage schema, or enforcement code. It fixes the vocabulary and
-semantics so that whichever future slice actually builds the Permission
-Engine has an unambiguous specification to build against, and so that
-"does this new scope collapse two things that must stay separate" has an
-answer before code is written, not after.
+This document is the vocabulary/semantics specification;
+`permissions.service`/`permissions.definitions` (slice G2, see above) are
+its first real implementation. Neither this document nor that
+implementation builds network discovery, NAS integration, AI-server
+discovery, model downloading, an updater, or a credentials vault — see
+[`SECURITY_PRIVACY_ARCHITECTURE.md`§13](SECURITY_PRIVACY_ARCHITECTURE.md#13-boundaries-this-document-intentionally-does-not-cross).

@@ -156,6 +156,12 @@ operation actually being performed.
 than guessing (`docs/TOOLS_AND_POLICY.md`); `lease.manager.LeaseManager`
 and `workers.question_gate.QuestionGate` follow the identical posture
 (`docs/LEASES_AND_RECOVERY.md`; `CODE_SLAYER_VISION.md`§34).
+`permissions.service.PermissionService.check()` (Governance Foundation
+slice G2 — [`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)) is the
+newest instance of this same posture, applied to the permission scopes
+this document specifies: an unknown definition, a version mismatch, an
+ambiguous resource, a missing/revoked/expired grant all deny, and
+`check()` never raises or guesses — it returns `False`.
 
 If CSLR cannot prove authority for an action, it MUST do nothing.
 
@@ -276,6 +282,13 @@ already establish in general:
   (`planning.service`'s own module docstring: "nothing in this module's
   import graph is even capable of it") generalizes to every future
   subsystem.
+- **Current implementation** (Governance Foundation slice G2):
+  `permissions.definitions.AuthorityOrigin` has exactly one member,
+  `USER_EXPLICIT` — there is no `MODEL`/`PLANNER`/`WORKER` origin to
+  even construct, and `permissions.service` imports neither
+  `planning.*` nor `workers.protocol`, so a `PlannerStructuredOutput`
+  field or a `WorkerToolCall`'s params have no code path into a
+  permission decision at all (`docs/PERMISSIONS_MODEL.md`).
 
 ## 11. Transparency
 

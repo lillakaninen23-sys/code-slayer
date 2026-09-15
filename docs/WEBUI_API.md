@@ -130,6 +130,27 @@ with respect to the repository: no route here writes a repository file,
 executes a discovered command, creates a checkpoint, or grants any trust —
 see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md).
 
+### Permissions (CSLR Governance Foundation, slice G2)
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/permissions` | `{definitions: [...]}` — every registered `PermissionDefinition`'s full explanation metadata (`permission_key`, `semantic_version`, `action`, `resource_type`, `sensitivity`, `user_title`, `user_summary`, `what_it_does`, `what_it_does_not_do`, `data_observed`, `data_retained`, `data_transmitted`, `revocable`, `technical_details`, `implementation_reference`, `user_selectable_scope`). Read-only, code-owned; safe to expose in full. |
+| `GET /api/permissions/requests?limit=100&offset=0` | `{requests: [...]}`, newest first; each with `state` (`PENDING`/`ALLOWED`/`DENIED`, derived — never a stored status column) and its embedded `definition`. |
+| `GET /api/permissions/requests/{request_id}` | One request's full detail. |
+| `POST /api/permissions/requests/{request_id}/decision` | `{decision: "ALLOW" or "DENY"}` → current request detail. **No other field is accepted** — a client can never change `permission_key`/`semantic_version`/`resource`/`scope` for an existing request; those are already durably fixed server-side by `request_id`. |
+| `GET /api/permissions/grants?limit=100&offset=0` | `{grants: [...]}`, newest first; each with `state` (`ACTIVE`/`REVOKED`/`EXPIRED`, derived). |
+| `POST /api/permissions/grants/{grant_id}/revoke` | `{}` → current grant detail, `state: "REVOKED"`. Idempotent; revoking twice is a safe no-op, never a second revocation record. |
+
+**There is deliberately no `POST /api/permissions/requests`.** A browser can
+never mint its own permission request — only a trusted backend subsystem,
+through `permissions.service.PermissionService.request()` (Python-level
+only), creates one. A `POST` to that path returns `404`/`405`.
+`authority_origin` on every grant is always `USER_EXPLICIT` — an explicit
+human `ALLOW` decision is the only way a grant exists; nothing a model,
+planner, or worker outputs can create or influence one. See
+[`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md) for the full
+specification and current-vs-future implementation status.
+
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
 `ambiguity_id`, `question`, `risk_class` and `answer_recorded`. Answers preserve the
@@ -164,13 +185,19 @@ execute shell, modify checkpoints or select arbitrary worktree/DB paths. This AP
 only offers the existing bounded read-only profile. It can display historical job
 worktree runs and their separate execution evidence; it never merges them.
 No AUTO or model mutation trust was added. The `/api/intelligence/*` routes
-(Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)) and the
-`/api/plans*` routes (Phase 8.2, [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md))
-are the additions since WebUI Foundation 1 — deterministic, read-only repository
-evidence and planning only, never a filesystem/DB path from the client, never a new
-authority: a repository fact still cannot become trusted `ResolutionEvidence`
-except through the existing, unmodified application-owned authority path, and a
-`READY` plan authorizes no execution, no mutation, and no command.
+(Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)), the
+`/api/plans*` routes (Phase 8.2, [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md)),
+and the `/api/permissions*` routes (Governance Foundation slice G2,
+[`PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)) are the additions since WebUI
+Foundation 1 — deterministic, read-only repository evidence, planning, and
+now permission consent/revocation, never a filesystem/DB path from the
+client, never a new authority: a repository fact still cannot become trusted
+`ResolutionEvidence` except through the existing, unmodified
+application-owned authority path, a `READY` plan authorizes no execution, no
+mutation, and no command, and `/api/permissions*` can only decide on or
+revoke a permission request/grant a trusted backend subsystem already
+created — never mint one, and never accept anything beyond `{decision}` /
+`{}` in a mutating body.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens

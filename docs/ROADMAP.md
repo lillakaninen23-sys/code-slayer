@@ -258,10 +258,12 @@ Cross-compilation, QEMU-based boot/runtime testing, and eventually kernel and co
 ## Security & Privacy / Operations (future track)
 
 **Status: governance specification complete (Governance Foundation, slice
-G1); no runtime implementation exists yet.** This is a **cross-cutting
-track**, not a Phase-8 sub-stage — it does not appear in the dependency
-diagram above because it is a prerequisite *constraint* on several later
-stages, not a rung in the capability ladder itself.
+G1); stage 1 (Permission Engine) implemented as of slice G2 — see
+[`docs/PERMISSIONS_MODEL.md`'s Implementation status](PERMISSIONS_MODEL.md#implementation-status-slice-g2).**
+This is a **cross-cutting track**, not a Phase-8 sub-stage — it does not
+appear in the dependency diagram above because it is a prerequisite
+*constraint* on several later stages, not a rung in the capability
+ladder itself.
 
 The governance documents this track specifies are authoritative today
 even though their runtime enforcement is not yet built:
@@ -275,14 +277,23 @@ vocabulary and consent-UX rules a future Permission Engine must implement),
 target). See [`AGENTS.md`](../AGENTS.md) for the rule that every future
 change must preserve their invariants.
 
-This track's own future implementation sub-stages, in dependency order:
+This track's own implementation sub-stages, in dependency order:
 
-1. **Permission Engine.** The machine-enforced runtime for the scope
-   vocabulary in `PERMISSIONS_MODEL.md` — durable grant/revocation
-   records, fail-closed evaluation, versioned scope semantics.
-2. **Consent UX.** The user-facing request/explanation/technical-detail/
-   denial/revocation flow `PERMISSIONS_MODEL.md`§6 specifies, wired to
-   the Permission Engine.
+1. **Permission Engine — implemented (slice G2).**
+   `permissions.service.PermissionService`: durable, append-only
+   request/decision/grant/revocation history (schema v10), exact-match
+   fail-closed authorization checks, versioned scope semantics, and a
+   structural (not merely conventional) model/planner/worker authority
+   boundary. One real permission definition is registered
+   (`network.discovery.local` v1) — registering it implements no
+   discovery. See `docs/PERMISSIONS_MODEL.md`'s Implementation status
+   section for exactly what is, and is not, built.
+2. **Consent UX — implemented (slice G2).** The first real "Privacy &
+   Security" WebUI view: pending requests, active/revoked grants,
+   progressive-disclosure explanation (simple / explanation /
+   technical), Allow/Deny/Revoke actions. The broader planned visual
+   redesign is explicitly deferred; this slice preserves the existing
+   visual language.
 3. **Secrets/Credential Storage.** A dedicated, purpose-scoped secret
    store satisfying `SECURITY_PRIVACY_ARCHITECTURE.md`§7 — explicitly not
    designed or implemented yet.
@@ -298,12 +309,13 @@ This track's own future implementation sub-stages, in dependency order:
 
 **Depends on:** nothing below it in this list requires a specific
 capability stage above to exist first — the Permission Engine and Consent
-UX are foundational and can be designed against today's codebase.
+UX were foundational and are now built directly against today's codebase.
 
-**This track's stages 1–2 (Permission Engine, Consent UX) MUST be
-implemented, and demonstrated to actually enforce the invariants in
-`SECURITY_PRIVACY_ARCHITECTURE.md`, *before* any of the following are
-built:**
+**This track's stages 1–2 (Permission Engine, Consent UX) are now
+implemented. They MUST still be demonstrated to actually gate real
+authority — i.e., a future feature below MUST call
+`PermissionService.require()` before acting, not merely have the Engine
+exist alongside it unused — *before* any of the following are built:**
 
 - automatic LAN discovery (any form);
 - NAS/storage integration;

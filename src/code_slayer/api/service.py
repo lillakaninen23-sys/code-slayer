@@ -11,6 +11,7 @@ from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
 from code_slayer.intelligence import RepositoryIntelligenceService
+from code_slayer.permissions.service import PermissionService
 from code_slayer.planning.executor import PlanningJobExecutor
 from code_slayer.planning.service import EngineeringPlanningService
 from code_slayer.repo import identity
@@ -104,6 +105,14 @@ class ApplicationService:
     @contextmanager
     def planning(self):
         service = EngineeringPlanningService(self.repo_path, state_root_override=self.state_root)
+        try:
+            yield service
+        finally:
+            service.close()
+
+    @contextmanager
+    def permissions(self):
+        service = PermissionService(self.repo_path, state_root_override=self.state_root)
         try:
             yield service
         finally:
@@ -282,3 +291,63 @@ class ApplicationService:
                 source=EvidenceSource.DURABLE_TASK_EVIDENCE,
             )
             return self._plan_json(service.get(plan_id))
+
+    # -- CSLR Permission Engine (Governance Foundation, slice G2) -----------
+    #
+    # Read-only definitions plus a narrow decision/revocation surface only.
+    # There is deliberately no "POST /api/permissions/requests" here: a
+    # permission request is created exclusively by trusted backend code
+    # (see `permissions.service.PermissionService.request()`), never by an
+    # HTTP client -- see `docs/PERMISSIONS_MODEL.md`.
+
+    @staticmethod
+    def _permission_definition_json(view):
+        return asdict(view)
+
+    @staticmethod
+    def _permission_request_json(record):
+        return asdict(record)
+
+    @staticmethod
+    def _permission_grant_json(record):
+        return asdict(record)
+
+    def list_permission_definitions(self):
+        with self.permissions() as service:
+            definitions = service.definitions()
+            return {"definitions": [self._permission_definition_json(d) for d in definitions]}
+
+    def list_permission_requests(self, limit, offset):
+        with self.permissions() as service:
+            requests = service.list_requests(limit=limit, offset=offset)
+            return {"requests": [self._permission_request_json(r) for r in requests]}
+
+    def get_permission_request(self, request_id):
+        with self.permissions() as service:
+            try:
+                return self._permission_request_json(service.get_request(request_id))
+            except KeyError:
+                raise APIError("not_found", "Permission request not found.", 404) from None
+
+    def decide_permission_request(self, request_id, data):
+        with self.permissions() as service:
+            try:
+                record = service.decide(request_id, data["decision"])
+            except KeyError:
+                raise APIError("not_found", "Permission request not found.", 404) from None
+            except ValueError as exc:
+                raise APIError("invalid_decision", str(exc), 400) from None
+            return self._permission_request_json(record)
+
+    def list_permission_grants(self, limit, offset):
+        with self.permissions() as service:
+            grants = service.grants(limit=limit, offset=offset)
+            return {"grants": [self._permission_grant_json(g) for g in grants]}
+
+    def revoke_permission_grant(self, grant_id):
+        with self.permissions() as service:
+            try:
+                record = service.revoke(grant_id)
+            except KeyError:
+                raise APIError("not_found", "Permission grant not found.", 404) from None
+            return self._permission_grant_json(record)

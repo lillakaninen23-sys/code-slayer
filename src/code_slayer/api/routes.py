@@ -307,3 +307,50 @@ def planning_jobs():
 @api.get("/planning-jobs/<job_id>")
 def planning_job_detail(job_id):
     return jsonify(service().get_planning_job(job_id))
+
+
+# -- CSLR Permission Engine (Governance Foundation, slice G2) -----------------
+#
+# Read-only definitions/requests/grants, plus a narrow decision/revoke
+# surface. There is deliberately NO `POST /api/permissions/requests`: a
+# browser can never mint its own permission request, only decide on one a
+# trusted backend subsystem already created. The decision body accepts
+# exactly one field (`decision`) -- never permission_key/semantic_version/
+# resource/scope -- so a client can never widen, narrow, or redirect what
+# is actually being decided; the request_id already durably fixes all of
+# that server-side.
+
+@api.get("/permissions")
+def permission_definitions():
+    return jsonify(service().list_permission_definitions())
+
+
+@api.get("/permissions/requests")
+def permission_requests():
+    limit, offset = page_args()
+    return jsonify(service().list_permission_requests(limit, offset))
+
+
+@api.get("/permissions/requests/<request_id>")
+def permission_request_detail(request_id):
+    return jsonify(service().get_permission_request(request_id))
+
+
+@api.post("/permissions/requests/<request_id>/decision")
+def permission_request_decision(request_id):
+    data = body({"decision": 16}, ("decision",))
+    if data["decision"] not in ("ALLOW", "DENY"):
+        raise APIError("invalid_decision", "Choose exactly ALLOW or DENY.")
+    return jsonify(service().decide_permission_request(request_id, data))
+
+
+@api.get("/permissions/grants")
+def permission_grants():
+    limit, offset = page_args()
+    return jsonify(service().list_permission_grants(limit, offset))
+
+
+@api.post("/permissions/grants/<grant_id>/revoke")
+def permission_grant_revoke(grant_id):
+    body({})
+    return jsonify(service().revoke_permission_grant(grant_id))
