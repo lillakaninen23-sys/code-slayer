@@ -9,7 +9,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
-## Status: Phase 6 — durable leases and fencing
+## Status: Phase 7 / Local Worker Runtime — VERIFIED / ACCEPTED
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:
 
@@ -59,8 +59,15 @@ never guessing an outcome from a stale epoch or a vanished process. See
 [`docs/LEASES_AND_RECOVERY.md`](docs/LEASES_AND_RECOVERY.md) for the
 lease/fencing model, expiry-vs-fencing distinction, and known limitations.
 
-There is **no** agent loop, model integration, scheduler, or daemon yet.
-See the ADRs and the Foundation Plan for what comes after Phase 1.
+Phase 7 adds the persistent LocalWorkerRunner, a real local model adapter, exact
+conformance-backed read-only trust, QuestionGate and human resolutions, isolated
+job worktrees, and explicit cloud transport authorization.
+
+WebUI Foundation 1 adds `codeslayer serve`: a loopback HTTP/application API that
+serves the existing sidecar and delegates actions to LocalWorkerRunner. See
+[`docs/WEBUI_API.md`](docs/WEBUI_API.md) for startup, runtime wiring, JSON contract
+and safety boundaries. No Phase-8 intelligence, AUTO, mutation trust, or worktree
+promotion is enabled.
 
 ## Development
 

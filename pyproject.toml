@@ -11,6 +11,8 @@ requires-python = ">=3.12"
 license = { text = "Proprietary" }
 dependencies = [
     "click>=8.1",
+    "Flask>=3.1,<4",
+    "waitress>=3,<4",
 ]
 
 [project.scripts]

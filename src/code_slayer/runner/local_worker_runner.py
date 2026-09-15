@@ -500,7 +500,7 @@ class LocalWorkerRunner:
         )
         provenance = record_prompt_analysis(
             self._control_conn, self._control_blobs_dir, task_id=run.task_id,
-            analysis=analysis, gate_result=gate_result,
+            analysis=analysis, gate_result=gate_result, run_id=run.run_id,
         )
         now = utcnow_iso()
         if gate_result.decision == GateDecision.ASK:

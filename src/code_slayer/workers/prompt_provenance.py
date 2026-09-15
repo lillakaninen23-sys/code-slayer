@@ -152,6 +152,7 @@ def read_prompt_analysis(
 def record_prompt_analysis(
     conn: sqlite3.Connection, blobs_dir: Path | str, *,
     task_id: str | None, analysis: PromptAnalysis, gate_result: QuestionGateResult,
+    run_id: str | None = None,
 ) -> PromptProvenance:
     """Durably persist the original prompt and the full structured
     analysis as content-addressed evidence, then append one
@@ -198,6 +199,8 @@ def record_prompt_analysis(
             "original_prompt_hash": analysis.original_prompt_hash,
             "analysis_content_hash": analysis_blob.content_hash,
         }
+        if run_id is not None:
+            common["run_id"] = run_id
         audit.append(
             task_id=task_id, event_type=EventType.PROMPT_ANALYSIS_RECORDED,
             actor_type="system", actor_id="prompt-analyst",
