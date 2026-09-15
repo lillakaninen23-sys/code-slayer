@@ -162,6 +162,14 @@ class ToolOperationsRepo:
             raise KeyError(operation_id)
         return _row_to_operation(row)
 
+    def list_for_task(self, task_id: str) -> list[ToolOperation]:
+        """All attempts, including terminal failures: none imply safe turn replay."""
+        rows = self._conn.execute(
+            "SELECT * FROM tool_operations WHERE task_id = ? ORDER BY started_at, operation_id",
+            (task_id,),
+        ).fetchall()
+        return [_row_to_operation(row) for row in rows]
+
     def list_unresolved(self, *, task_id: str | None = None) -> list[ToolOperation]:
         """STARTED or UNKNOWN rows — candidates for crash reconciliation
         (Foundation Plan §15)."""

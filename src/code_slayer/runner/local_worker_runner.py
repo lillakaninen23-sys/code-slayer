@@ -98,8 +98,31 @@ The Prompt Analyst may only ever *suggest* — `Ambiguity.evidence_keys`/
 `resolved_by_prompt_substring` — never manufacture. This module never
 promotes an analyst's own hint into `ResolutionEvidence` on its behalf.
 
+## Ownership and terminal lifecycle (Phase 7.7a)
+
+`READY -> RUNNING` is an atomic claim. RUNNING is owned, not evidence of a
+crash. Every executing invocation acquires a fresh lease session; a resume
+caller never reconstructs or renews another caller's handle. Takeover uses
+Phase-6 TTL, quiescence, process identity and child liveness unchanged.
+Only after acquiring a new epoch does recovery inspect ALL task operations
+and task state. Any operation, even FAILED or SUCCEEDED with no runner-side
+operation id, prevents replay of the bounded turn.
+
+Ordinary bounded read-only completions use the state machine's conditional
+`IMPLEMENTING -> COMPLETED` edge, explicitly marked in task configuration
+and guarded by a resolved, read-only journal. Failure/denial uses FAILED.
+Task terminalization, fenced release, runner result and audit commit in one
+transaction for ordinary runs. A separate job database commits its task and
+release first; interruption before control bookkeeping is fail-closed and
+never acquires a lease again for that terminal task. No checkpoint or
+primary promotion is fabricated to finish a read-only turn.
+
 ## Known limitations (see also `docs/ROADMAP.md`'s Phase 7/8 boundary)
 
+- A crash before a durable task/lease ownership link requires explicit
+  reconciliation. A concurrent caller cannot distinguish that crash from
+  live bootstrap, so it returns RUNNING without executing or changing the
+  owner's record. ALIVE/UNKNOWN liveness similarly refuses takeover.
 - **Mid-turn crash recovery is fail-closed, not fully automatic.** If a
   process crashes after `ToolExecutor` durably recorded `SUCCEEDED` but
   before the worker's continuation completed, `resume()` recovers
@@ -129,6 +152,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -136,7 +160,8 @@ from pathlib import Path
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.core import TaskState, TaskStateMachine
-from code_slayer.lease.manager import LeaseHandle, LeaseManager
+from code_slayer.core.transitions import TransitionRequest
+from code_slayer.lease.manager import LeaseManager
 from code_slayer.policy.engine import Decision
 from code_slayer.repo import identity
 from code_slayer.repo import job_worktree as job_worktree_module
@@ -149,7 +174,7 @@ from code_slayer.store.lease_repo import LeaseRepo, LeaseStatus
 from code_slayer.store.models import RunnerRun
 from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.task_repo import TaskAlreadyActiveError, TaskRepo
-from code_slayer.store.tool_operations_repo import ToolOperationsRepo
+from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
 from code_slayer.workers.execution import execute_guarded_turn
 from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalysis, PromptAnalyst
 from code_slayer.workers.prompt_provenance import (
@@ -466,9 +491,8 @@ class LocalWorkerRunner:
         """Atomically transition `READY -> RUNNING` inside one `BEGIN
         IMMEDIATE` transaction. `None` if the run was not (or no longer)
         `READY` — a concurrent caller already claimed it, or it moved on
-        its own. This is the entire concurrency-safety mechanism for
-        `resume()`: SQLite's own write-transaction serialization, not a
-        second, invented lock."""
+        its own. RUNNING recovery additionally requires a fresh Phase-6
+        lease epoch; it must never reconstruct the active owner's handle."""
         with transaction(self._control_conn):
             current = RunnerRepo(self._control_conn).get_or_none(run_id)
             if current is None or current.status != RunStatus.READY.value:
@@ -501,7 +525,10 @@ class LocalWorkerRunner:
         task = TaskRepo(conn).create(
             description=f"runner run {run.run_id}", repo_root=repo_root,
             repo_id=self._primary.repo_id, worktree_id=execution_worktree_id,
-            task_id=run.run_id, config={"tool_policy": {"scope": ["."]}},
+            task_id=run.run_id, config={
+                "tool_policy": {"scope": ["."]},
+                "execution_kind": "bounded_read_only_turn" if not run.requires_mutation else "job",
+            },
         )
         service = InspectionService(conn, blobs_dir=blobs_dir)
         service.start(task.task_id)
@@ -550,30 +577,21 @@ class LocalWorkerRunner:
         task = TaskRepo(conn).get(run.task_id)
         return _ExecutionPlane(conn=conn, blobs_dir=blobs_dir, task=task, _owns_conn=owns_conn)
 
-    def _acquire_or_renew_lease(self, conn: sqlite3.Connection, task, run_id: str, worker_id: str):
-        manager = LeaseManager(conn)
-        current = LeaseRepo(conn).get(task.worktree_id)
-        if (
-            current is not None
-            and (current.worker_id, current.worker_session_id) == (worker_id, run_id)
-            and current.status in (LeaseStatus.ACTIVE, LeaseStatus.QUIESCING)
-        ):
-            handle = LeaseHandle(
-                task.worktree_id, task.task_id, worker_id, run_id, current.generation,
-                current.acquired_at,
-            )
-            return manager.renew(handle)
-        return manager.acquire(
-            worktree_id=task.worktree_id, task_id=task.task_id, worker_id=worker_id,
-            worker_session_id=run_id,
+    def _acquire_lease(self, execution: _ExecutionPlane, run: RunnerRun):
+        # Session identity belongs to this invocation, never to the durable run.
+        # Only the returned handle confers ownership; resume cannot renew an
+        # epoch reconstructed from a row belonging to another caller.
+        return LeaseManager(execution.conn).acquire(
+            worktree_id=execution.task.worktree_id, task_id=execution.task.task_id,
+            worker_id=run.worker_id, worker_session_id=uuid.uuid4().hex,
         )
 
     def _proceed_to_execution(self, run: RunnerRun, adapter: WorkerAdapter | None) -> RunResult:
         """`run.status` is already `RUNNING` (claimed) here. Sets up (or
-        reuses) the execution plane, checks control-plane trust for a
-        mutating run before ever attempting inference, acquires/renews
-        the task lease, and runs exactly one bounded `execute_guarded_
-        turn()` call. If `adapter` is `None`, rolls the claim back to
+        reuses) the execution plane, acquires a fresh task lease, checks
+        control-plane trust for a mutating run before inference, and runs
+        exactly one bounded `execute_guarded_turn()` call. If `adapter` is
+        `None`, rolls the claim back to
         `READY` without spending any inference — a caller may legitimately
         want to stop there."""
         if adapter is None:
@@ -601,85 +619,151 @@ class LocalWorkerRunner:
                 run, RunStatus.INTERRUPTED_RESUMABLE, f"execution_plane_unavailable:{exc}",
             )
         try:
-            if run.requires_mutation:
-                trust_level = WorkerTrustManager(self._control_conn).current_trust(
-                    run.worker_id, run.role, _MUTATION_PROBE_CAPABILITY,
-                )
-                if trust_level not in (TrustLevel.GUARDED, TrustLevel.AUTO):
-                    return self._finish(
-                        run, RunStatus.DENIED_TRUST,
-                        f"denied_trust:{_MUTATION_PROBE_CAPABILITY}:{trust_level.value}",
-                    )
-
-            lease_result = self._acquire_or_renew_lease(
-                execution.conn, execution.task, run.run_id, run.worker_id,
-            )
+            run = RunnerRepo(self._control_conn).get(run.run_id)
+            lease_result = self._acquire_lease(execution, run)
             if lease_result.decision != Decision.ALLOW:
                 return self._finish(
                     run, RunStatus.INTERRUPTED_RESUMABLE,
                     f"lease_unavailable:{lease_result.reason}",
                 )
-
-            outcome = execute_guarded_turn(
-                execution.conn, adapter, task_id=execution.task.task_id, worker_id=run.worker_id,
-                role=run.role, original_prompt=original_prompt, lease=lease_result.handle,
-                blobs_dir=execution.blobs_dir, trust_conn=self._control_conn,
+            return self._execute_owned(
+                run, execution, lease_result.handle, adapter, original_prompt,
             )
         finally:
             execution.close()
 
+    def _execute_owned(self, run, execution, lease, adapter, original_prompt) -> RunResult:
+        # Apply the journal veto to every entry path, including a READY row
+        # that unexpectedly already has execution evidence. The runner's own
+        # status and nullable operation pointer are never replay authority.
+        operations = ToolOperationsRepo(execution.conn).list_for_task(run.task_id)
+        task = TaskRepo(execution.conn).get(run.task_id)
+        reason = None
+        if any(op.status in OperationStatus.UNRESOLVED for op in operations):
+            reason = "unresolved_tool_operation_requires_reconciliation"
+        elif operations or run.tool_operation_id is not None:
+            reason = "mid_turn_recovery_not_supported_tool_already_executed"
+        elif task.state != TaskState.IMPLEMENTING.value:
+            reason = "execution_task_requires_reconciliation"
+        if reason is not None:
+            return self._finish(run, RunStatus.INTERRUPTED_RESUMABLE, reason)
+        if run.requires_mutation:
+            trust_level = WorkerTrustManager(self._control_conn).current_trust(
+                run.worker_id, run.role, _MUTATION_PROBE_CAPABILITY,
+            )
+            if trust_level not in (TrustLevel.GUARDED, TrustLevel.AUTO):
+                return self._finish_owned(
+                    run, execution, lease, RunStatus.DENIED_TRUST,
+                    f"denied_trust:{_MUTATION_PROBE_CAPABILITY}:{trust_level.value}",
+                )
+        outcome = execute_guarded_turn(
+            execution.conn, adapter, task_id=execution.task.task_id, worker_id=run.worker_id,
+            role=run.role, original_prompt=original_prompt, lease=lease,
+            blobs_dir=execution.blobs_dir, trust_conn=self._control_conn,
+        )
         tool_operation_id = outcome.tool_result.operation_id if outcome.tool_result else None
-        if outcome.ok:
-            return self._finish(
-                run, RunStatus.COMPLETED, outcome.reason,
-                final_text=outcome.final_text or "", tool_operation_id=tool_operation_id,
-            )
-        if outcome.reason.startswith("trust_denied"):
-            return self._finish(
-                run, RunStatus.DENIED_TRUST, outcome.reason, tool_operation_id=tool_operation_id,
-            )
-        return self._finish(
-            run, RunStatus.FAILED, outcome.reason, tool_operation_id=tool_operation_id,
+        status = (
+            RunStatus.COMPLETED if outcome.ok else
+            RunStatus.DENIED_TRUST if outcome.reason.startswith("trust_denied")
+            else RunStatus.FAILED
+        )
+        return self._finish_owned(
+            run, execution, lease, status, outcome.reason,
+            final_text=(outcome.final_text or "") if outcome.ok else None,
+            tool_operation_id=tool_operation_id,
         )
 
+    def _finish_owned(self, run, execution, lease, status, reason, **kwargs) -> RunResult:
+        """Terminalize and release atomically, only with this caller's real handle.
+
+        Unknown effects keep the non-terminal task and lease occupied. Execution
+        finalization precedes control bookkeeping: a crash between the databases
+        leaves a terminal task that recovery will never execute again.
+        """
+        manager = LeaseManager(execution.conn)
+        with transaction(execution.conn):
+            current = LeaseRepo(execution.conn).get(lease.worktree_id)
+            if (
+                current is None or current.task_id != run.task_id
+                or (current.worker_id, current.worker_session_id, current.generation)
+                != (lease.worker_id, lease.worker_session_id, lease.generation)
+                or current.status not in (LeaseStatus.ACTIVE, LeaseStatus.QUIESCING)
+            ):
+                # Losing authority also forbids overwriting the new owner's run result.
+                return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
+            if ToolOperationsRepo(execution.conn).list_unresolved(task_id=run.task_id):
+                status = RunStatus.INTERRUPTED_RESUMABLE
+                reason = "unresolved_tool_operation_requires_reconciliation"
+            else:
+                task = TaskRepo(execution.conn).get(run.task_id)
+                target = TaskState.COMPLETED if status == RunStatus.COMPLETED else TaskState.FAILED
+                TaskStateMachine(execution.conn).transition_in_transaction(
+                    task.task_id, request=TransitionRequest(
+                        expected_state=TaskState(task.state), to_state=target,
+                        reason=f"runner:{status.value}:{reason}",
+                        completion_decision=target == TaskState.COMPLETED,
+                        failure_decision=target == TaskState.FAILED,
+                    ), actor_id="local-worker-runner",
+                )
+                released = manager.release_in_transaction(lease)
+                if released.decision != Decision.ALLOW:
+                    raise RuntimeError(f"fenced terminal release failed: {released.reason}")
+            if execution.conn is self._control_conn:
+                # Ordinary runs share one database: result, task, release and
+                # their audit events commit together, with no terminal gap.
+                return self._finish(run, status, reason, **kwargs)
+        return self._finish(run, status, reason, **kwargs)
+
     def _recover_mid_turn(self, run: RunnerRun, adapter: WorkerAdapter | None) -> RunResult:
-        """`run.status` is `RUNNING`, meaning a prior process exited (or
-        crashed) after claiming this run for execution. Never blindly
-        re-invokes the worker/tool: inspects the execution plane's own
-        durable operation journal first — see the module docstring's
-        "Known limitations" for exactly what is, and is not, recovered
-        automatically."""
-        if run.task_id is None:
-            # The crash happened before the execution plane was even set
-            # up (during, or before, the very first inference call) --
-            # nothing durable could possibly exist yet, so there is
-            # nothing to inspect; safe to retry from scratch below.
-            return self._proceed_to_execution(run, adapter)
+        """RUNNING means owned, not crashed. Prove takeover before any replay.
+
+        A missing task/lease link is ambiguous (the first caller may still be
+        bootstrapping). Refuse without changing its state. Established leases
+        use Phase-6 TTL/quiescence/process-and-child liveness, with UNKNOWN
+        denying takeover. Never renew somebody else's persisted identity.
+        """
+        if run.task_id is None or adapter is None:
+            return self._to_result(run)
         execution = self._reopen_execution_plane(run)
         try:
-            unresolved = ToolOperationsRepo(execution.conn).list_unresolved(task_id=run.task_id)
+            if execution.task.state in (TaskState.COMPLETED.value, TaskState.FAILED.value):
+                # Execution-plane finalization already committed. Do not acquire
+                # a new lease for a terminal task and occupy a reusable slot.
+                with transaction(self._control_conn):
+                    run = RunnerRepo(self._control_conn).get(run.run_id)
+                    if run.status != RunStatus.RUNNING.value:
+                        return self._to_result(run)
+                    return self._finish(
+                        run, RunStatus.INTERRUPTED_RESUMABLE,
+                        "terminal_execution_task_requires_reconciliation",
+                    )
+            current = LeaseRepo(execution.conn).get(execution.task.worktree_id)
+            if current is None or current.task_id != run.task_id:
+                return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
+            lease_result = self._acquire_lease(execution, run)
+            if lease_result.decision != Decision.ALLOW:
+                return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
+            # The old owner may have completed between our initial read and
+            # acquiring its released lease. Re-read both authoritative records.
+            run = RunnerRepo(self._control_conn).get(run.run_id)
+            task = TaskRepo(execution.conn).get(run.task_id)
+            if run.status != RunStatus.RUNNING.value:
+                LeaseManager(execution.conn).release(lease_result.handle)
+                return self._to_result(run)
+            if task.state in (TaskState.COMPLETED.value, TaskState.FAILED.value):
+                LeaseManager(execution.conn).release(lease_result.handle)
+                return self._finish(
+                    run, RunStatus.INTERRUPTED_RESUMABLE,
+                    "terminal_execution_task_requires_reconciliation",
+                )
+            original_prompt = read_original_prompt(
+                self._control_conn, self._control_blobs_dir, run.original_prompt_hash,
+            )
+            return self._execute_owned(
+                run, execution, lease_result.handle, adapter, original_prompt,
+            )
         finally:
             execution.close()
-        if unresolved:
-            return self._finish(
-                run, RunStatus.INTERRUPTED_RESUMABLE,
-                "unresolved_tool_operation_requires_reconciliation",
-            )
-        if run.tool_operation_id is not None:
-            # The tool already reached a terminal, durably evidenced
-            # state as part of the crashed attempt. Re-invoking
-            # execute_guarded_turn() from scratch would re-run inference
-            # and could re-attempt the tool call -- fail closed rather
-            # than guess or duplicate the effect (see module docstring).
-            return self._finish(
-                run, RunStatus.INTERRUPTED_RESUMABLE,
-                "mid_turn_recovery_not_supported_tool_already_executed",
-            )
-        # Nothing durable happened yet (the crash occurred before or
-        # during the very first inference call) -- safe to retry the
-        # whole bounded turn from scratch; still exclusively claimed
-        # (status is already RUNNING), so no second claim is needed.
-        return self._proceed_to_execution(run, adapter)
 
     def _finish(
         self, run: RunnerRun, status: RunStatus, reason: str, *,
@@ -693,7 +777,9 @@ class LocalWorkerRunner:
                 source_kind=FINAL_TEXT_EVIDENCE_KIND, exportable=False,
             )
             final_text_content_hash = blob.content_hash
-        with transaction(self._control_conn):
+        with (
+            nullcontext() if self._control_conn.in_transaction else transaction(self._control_conn)
+        ):
             updated = RunnerRepo(self._control_conn).update_in_transaction(
                 run.run_id, updated_at=utcnow_iso(), status=status.value, reason=reason,
                 final_text_content_hash=final_text_content_hash,

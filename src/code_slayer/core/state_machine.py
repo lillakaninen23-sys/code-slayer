@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 
 from code_slayer.core.states import TaskState
-from code_slayer.core.transitions import TransitionRequest, validate_transition
+from code_slayer.core.transitions import InvalidTransition, TransitionRequest, validate_transition
 from code_slayer.store.db import transaction
 from code_slayer.store.models import Task
 from code_slayer.store.task_repo import TaskRepo
@@ -69,6 +69,19 @@ class TaskStateMachine:
             raise RuntimeError("state-machine composition requires an open write transaction")
         current = self._repo.get(task_id)
         effect = validate_transition(current, request)
+        if (
+            current.state == TaskState.IMPLEMENTING.value
+            and request.to_state == TaskState.COMPLETED
+        ):
+            unsafe = self._conn.execute(
+                "SELECT 1 FROM tool_operations WHERE task_id = ? AND "
+                "(risk_class != 'READ_ONLY' OR status NOT IN ('SUCCEEDED', 'FAILED')) LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if unsafe:
+                raise InvalidTransition(
+                    "read-only completion requires resolved read-only operations",
+                )
         for guard in self._guards:
             guard(current, request)
         return self._repo._record_transition_in_transaction(

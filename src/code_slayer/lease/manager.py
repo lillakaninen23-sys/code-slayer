@@ -409,19 +409,25 @@ class LeaseManager:
         """Only the current holder (`ACTIVE` or `QUIESCING`) may release;
         releasing never touches task state, checkpoints, or unresolved
         operations."""
+        with transaction(self._conn):
+            return self.release_in_transaction(handle)
+
+    def release_in_transaction(self, handle: LeaseHandle) -> LeaseResult:
+        """Compose the same fenced release with task terminalization and audit."""
+        if not self._conn.in_transaction:
+            raise RuntimeError("lease release requires an open write transaction")
         if not isinstance(handle, LeaseHandle):
             return _deny("malformed_lease_handle")
-        with transaction(self._conn):
-            current = self._leases.get(handle.worktree_id)
-            rejected = self._check_current(current, handle)
-            if rejected is not None:
-                return rejected
-            self._leases.update_status_in_transaction(
-                handle.worktree_id, status=LeaseStatus.RELEASED,
-            )
-            self._event(handle.task_id, EventType.LEASE_RELEASED, {
-                "worktree_id": handle.worktree_id, "generation": handle.generation,
-            })
+        current = self._leases.get(handle.worktree_id)
+        rejected = self._check_current(current, handle)
+        if rejected is not None:
+            return rejected
+        self._leases.update_status_in_transaction(
+            handle.worktree_id, status=LeaseStatus.RELEASED,
+        )
+        self._event(handle.task_id, EventType.LEASE_RELEASED, {
+            "worktree_id": handle.worktree_id, "generation": handle.generation,
+        })
         return LeaseResult(Decision.ALLOW, "released")
 
     def expire_if_stale(self, worktree_id: str) -> LeaseResult:

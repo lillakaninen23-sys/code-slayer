@@ -22,17 +22,23 @@ chain validity.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 
 from code_slayer.audit.verify import verify_chain
-from code_slayer.lease.manager import LeaseHandle, LeaseManager
+from code_slayer.lease.liveness import Liveness
+from code_slayer.lease.manager import LeaseManager
 from code_slayer.runner import LocalWorkerRunner, RunStatus
 from code_slayer.store import location
 from code_slayer.store.db import connect as db_connect
 from code_slayer.store.db import transaction
+from code_slayer.store.lease_repo import LeaseRepo
 from code_slayer.store.runner_repo import RunnerRepo
+from code_slayer.store.task_repo import TaskRepo
 from code_slayer.store.tool_operations_repo import ToolOperationsRepo
 from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.workers.conformance import run_conformance_suite
@@ -641,47 +647,20 @@ def test_stale_lease_remains_safe(guarded_runner):
 
 
 def test_lease_held_by_a_different_owner_is_never_stolen(guarded_runner):
-    """Once this run's own task/lease exist, a takeover by a different
-    identity in between must be respected -- the runner's own
-    acquire-or-renew logic denies rather than steals it."""
-    prompt = "Read the README.md file."
-    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)])
-    ready = guarded_runner.start(
-        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
-    )
-    completed = guarded_runner.resume(
-        ready.run_id, adapter=FakeWorkerAdapter([_read_call(), _text("ok")]),
-    )
-    assert completed.status == RunStatus.COMPLETED
-
-    # A different owner takes over this exact worktree's lease (its
-    # generation/identity now disagrees with this run's own).
+    ready = _ready(guarded_runner)
+    _crash_attempt(guarded_runner, ready.run_id, "before_operation")
     row = RunnerRepo(guarded_runner._control_conn).get(ready.run_id)
-    released = LeaseManager(guarded_runner._control_conn).release(
-        LeaseHandle(
-            row.execution_worktree_id, row.task_id, WORKER_ID, ready.run_id, 1,
-            "2026-01-01T00:00:00.000000Z",
-        ),
-    )
-    assert released.decision.value == "ALLOW"
+    _age_lease(guarded_runner)
     takeover = LeaseManager(guarded_runner._control_conn).acquire(
         worktree_id=row.execution_worktree_id, task_id=row.task_id,
         worker_id="someone-else", worker_session_id="someone-elses-session",
     )
     assert takeover.decision.value == "ALLOW"
-
-    # Rewind this run back to RUNNING with no tool_operation_id, forcing
-    # the "safe to retry" mid-turn-recovery path to re-attempt lease
-    # acquisition against a worktree now genuinely owned elsewhere.
-    with transaction(guarded_runner._control_conn):
-        guarded_runner._control_conn.execute(
-            "UPDATE runner_runs SET status = 'RUNNING', tool_operation_id = NULL WHERE run_id = ?",
-            (ready.run_id,),
-        )
+    before = LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id)
     adapter = FakeWorkerAdapter([_text("should never be requested")])
     result = guarded_runner.resume(ready.run_id, adapter=adapter)
-    assert result.status == RunStatus.INTERRUPTED_RESUMABLE
-    assert "lease_unavailable" in result.reason
+    assert result.status == RunStatus.RUNNING
+    assert LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id) == before
     assert len(adapter.calls) == 0
 
 
@@ -753,109 +732,139 @@ def test_concurrent_resume_cannot_execute_one_step_twice(primary):
 
 # --- 28. safe mid-turn recovery: fail closed, never duplicate --------------
 
-def test_mid_turn_crash_with_completed_tool_operation_fails_closed(guarded_runner):
-    """Simulates a crash after ToolExecutor durably SUCCEEDED but before
-    this run's own bookkeeping reached a terminal status: resume() must
-    never re-invoke the worker/tool in that state -- it fails closed to
-    INTERRUPTED_RESUMABLE instead of guessing or duplicating the effect."""
+def _ready(runner):
     prompt = "Read the README.md file."
-    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)])
-    ready = guarded_runner.start(
-        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    return runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
     )
-    assert ready.status == RunStatus.READY
 
-    # Drive a real, successful bounded turn so a genuine tool_operation
-    # exists, then rewind the run's own status back to RUNNING with that
-    # operation id still attached -- exactly the durable state a crash
-    # right after ToolExecutor succeeded, but before this run reached a
-    # terminal status, would leave behind.
-    adapter = FakeWorkerAdapter([_read_call(), _text("ok")])
-    completed = guarded_runner.resume(ready.run_id, adapter=adapter)
-    assert completed.status == RunStatus.COMPLETED
-    row = RunnerRepo(guarded_runner._control_conn).get(ready.run_id)
-    assert row.tool_operation_id is not None
-    with transaction(guarded_runner._control_conn):
-        guarded_runner._control_conn.execute(
-            "UPDATE runner_runs SET status = 'RUNNING' WHERE run_id = ?", (ready.run_id,),
+
+_CRASH_ATTEMPT = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from code_slayer.runner import LocalWorkerRunner
+from code_slayer.tools.executor import ToolExecutor
+from code_slayer.audit.writer import AuditWriter
+from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+stage = sys.argv[4]
+if stage == "finalization":
+    original_append = AuditWriter.append
+    def append(self, **kwargs):
+        record = original_append(self, **kwargs)
+        if kwargs["event_type"] == "RUN_FINISHED":
+            os._exit(74)
+        return record
+    AuditWriter.append = append
+if stage == "started":
+    def crash(*args, **kwargs):
+        os._exit(74)
+    ToolExecutor._file_effect = staticmethod(crash)
+class Adapter:
+    def infer(self, request):
+        if stage == "before_operation":
+            os._exit(74)
+        if request.prior_tool_result is not None:
+            if stage == "finalization":
+                return WorkerResponse(kind=WorkerResponseKind.TEXT, text="done")
+            os._exit(74)
+        return WorkerResponse(kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}))
+r = LocalWorkerRunner(sys.argv[2])
+r.resume(sys.argv[3], adapter=Adapter())
+os._exit(1)
+"""
+
+
+def _crash_attempt(runner, run_id, stage):
+    crashed = subprocess.run(
+        [sys.executable, "-c", _CRASH_ATTEMPT,
+         str(Path(__file__).resolve().parents[2] / "src"),
+         str(runner._primary.repo_root), run_id, stage],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert crashed.returncode == 74, crashed.stderr
+    row = RunnerRepo(runner._control_conn).get(run_id)
+    assert row.status == "RUNNING"
+    assert row.tool_operation_id is None
+    assert TaskRepo(runner._control_conn).get(row.task_id).state == "IMPLEMENTING"
+    return row
+
+
+def _age_lease(runner):
+    # Only advance the TTL prerequisite. Liveness still uses the real dead
+    # subprocess's recorded PID AND /proc start time, never a fabricated owner.
+    with transaction(runner._control_conn):
+        runner._control_conn.execute(
+            "UPDATE worker_leases SET heartbeat_at = '2000-01-01T00:00:00.000000Z'",
         )
 
-    crash_adapter = FakeWorkerAdapter([_text("should never be requested")])
-    result = guarded_runner.resume(ready.run_id, adapter=crash_adapter)
-    assert result.status == RunStatus.INTERRUPTED_RESUMABLE
-    assert result.reason == "mid_turn_recovery_not_supported_tool_already_executed"
-    assert len(crash_adapter.calls) == 0  # never re-invoked
+
+@pytest.mark.parametrize("stage,op_status,reason", [
+    ("succeeded", "SUCCEEDED", "mid_turn_recovery_not_supported_tool_already_executed"),
+    ("started", "STARTED", "unresolved_tool_operation_requires_reconciliation"),
+    ("finalization", "SUCCEEDED", "mid_turn_recovery_not_supported_tool_already_executed"),
+])
+def test_real_mid_turn_crash_never_replays(guarded_runner, stage, op_status, reason):
+    ready = _ready(guarded_runner)
+    row = _crash_attempt(guarded_runner, ready.run_id, stage)
+    operations = ToolOperationsRepo(guarded_runner._control_conn).list_for_task(row.task_id)
+    assert len(operations) == 1 and operations[0].status == op_status
+    _age_lease(guarded_runner)
+    # A fresh instance/connection has none of the crashed caller's Python state.
+    restarted = LocalWorkerRunner(guarded_runner._primary.repo_root)
+    try:
+        adapter = FakeWorkerAdapter([_read_call(), _text("duplicate")])
+        result = restarted.resume(ready.run_id, adapter=adapter)
+        assert result.status == RunStatus.INTERRUPTED_RESUMABLE
+        assert result.reason == reason
+        assert not adapter.calls
+        assert ToolOperationsRepo(restarted._control_conn).list_for_task(row.task_id) == operations
+        lease = LeaseRepo(restarted._control_conn).get(row.execution_worktree_id)
+        assert lease.generation == 2  # proven-gone takeover, never renewal/impersonation
+        assert lease.status == "ACTIVE"  # unresolved run retains its reconciliation slot
+        assert verify_chain(restarted._control_conn, task_id=row.task_id).ok
+    finally:
+        restarted.close()
 
 
 def test_mid_turn_crash_before_any_tool_execution_safely_retries(guarded_runner):
-    """If the crash happened before the tool ever ran (no tool_operation_id
-    recorded yet), retrying the whole bounded turn from scratch is safe."""
-    prompt = "Read the README.md file."
-    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)])
-    ready = guarded_runner.start(
-        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
-    )
-    claimed = guarded_runner.resume(ready.run_id, adapter=None)
-    assert claimed.status == RunStatus.READY  # rolled back, no task set up yet since adapter=None
-
-    # Manually claim RUNNING with no tool_operation_id, simulating a
-    # crash before the execution plane was even set up.
-    with transaction(guarded_runner._control_conn):
-        guarded_runner._control_conn.execute(
-            "UPDATE runner_runs SET status = 'RUNNING' WHERE run_id = ?", (ready.run_id,),
-        )
+    ready = _ready(guarded_runner)
+    row = _crash_attempt(guarded_runner, ready.run_id, "before_operation")
+    assert not ToolOperationsRepo(guarded_runner._control_conn).list_for_task(row.task_id)
+    old = LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id)
+    unused = FakeWorkerAdapter([])
+    # Process death alone does not bypass the established TTL prerequisite.
+    assert guarded_runner.resume(ready.run_id, adapter=unused).status == RunStatus.RUNNING
+    assert not unused.calls
+    _age_lease(guarded_runner)
     adapter = FakeWorkerAdapter([_read_call(), _text("recovered fine")])
     result = guarded_runner.resume(ready.run_id, adapter=adapter)
     assert result.status == RunStatus.COMPLETED
     assert result.final_text == "recovered fine"
+    new = LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id)
+    assert new.worker_session_id != old.worker_session_id
+    assert new.generation == old.generation + 1
+    assert len(ToolOperationsRepo(guarded_runner._control_conn).list_for_task(row.task_id)) == 1
 
 
-def test_mid_turn_crash_with_unresolved_operation_fails_closed(guarded_runner):
-    prompt = "Read the README.md file."
-    analyst = FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)])
-    ready = guarded_runner.start(
-        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
-    )
-    claimed = guarded_runner.resume(ready.run_id, adapter=None)
-    assert claimed.status == RunStatus.READY
-    # Force a task to exist by claiming with a real adapter that stalls
-    # after tool execution is impossible to simulate deterministically
-    # without a real crash; instead directly seed an unresolved
-    # tool_operations row for a freshly created task via the runner's own
-    # setup path, then mark the run RUNNING.
-    row = RunnerRepo(guarded_runner._control_conn).get(ready.run_id)
-    assert row.task_id is None
-    from code_slayer.repo.baseline import InspectionService
-    from code_slayer.store.task_repo import TaskRepo
-    from code_slayer.store.tool_operations_repo import ToolOperationsRepo
+@pytest.mark.parametrize("liveness", [Liveness.ALIVE, Liveness.UNKNOWN])
+def test_runner_takeover_denied_without_proof_of_death(guarded_runner, monkeypatch, liveness):
+    from code_slayer.runner import local_worker_runner as module
 
-    task = TaskRepo(guarded_runner._control_conn).create(
-        description="x", repo_root=str(guarded_runner._primary.repo_root),
-        repo_id=guarded_runner._primary.repo_id,
-        worktree_id=guarded_runner._primary.worktree_id,
-        task_id=ready.run_id, config={"tool_policy": {"scope": ["."]}},
-    )
-    service = InspectionService(
-        guarded_runner._control_conn, blobs_dir=guarded_runner._control_blobs_dir,
-    )
-    service.start(task.task_id)
-    service.capture(task.task_id)
-    with transaction(guarded_runner._control_conn):
-        ToolOperationsRepo(guarded_runner._control_conn).start_in_transaction(
-            task_id=task.task_id, worktree_id=task.worktree_id, worker_id=WORKER_ID,
-            worker_session_id=ready.run_id, tool_name="read_file", risk_class="READ_ONLY",
-            request_hash="deadbeef", target_resource="README.md",
-        )
-        guarded_runner._control_conn.execute(
-            "UPDATE runner_runs SET task_id = ?, execution_worktree_id = ?, status = 'RUNNING' "
-            "WHERE run_id = ?",
-            (task.task_id, task.worktree_id, ready.run_id),
-        )
-    adapter = FakeWorkerAdapter([_text("should never be requested")])
+    ready = _ready(guarded_runner)
+    row = _crash_attempt(guarded_runner, ready.run_id, "before_operation")
+    _age_lease(guarded_runner)
+    monkeypatch.setattr(module, "LeaseManager", lambda conn: LeaseManager(
+        conn, liveness_fn=lambda *args: liveness,
+    ))
+    adapter = FakeWorkerAdapter([_read_call(), _text()])
     result = guarded_runner.resume(ready.run_id, adapter=adapter)
-    assert result.status == RunStatus.INTERRUPTED_RESUMABLE
-    assert result.reason == "unresolved_tool_operation_requires_reconciliation"
-    assert len(adapter.calls) == 0
+    assert result.status == RunStatus.RUNNING
+    assert not adapter.calls
+    lease = LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id)
+    assert lease.status == "QUIESCING"
+    assert lease.generation == 1
 
 
 # --- 29. audit chain / provenance remains valid ------------------------------
@@ -888,3 +897,201 @@ def test_run_level_audit_events_recorded(guarded_runner):
     assert "QUESTION_GATE_DECISION" in event_types
     assert "RUN_FINISHED" in event_types
     assert result.status == RunStatus.COMPLETED
+
+
+@pytest.mark.parametrize("pause_at", ["claim", "setup", "inference"])
+def test_resume_observes_live_owner_without_impersonating(primary, guarded_runner, pause_at):
+    ready = _ready(guarded_runner)
+    paused = threading.Event()
+    proceed = threading.Event()
+    results = []
+    errors = []
+
+    def pause():
+        paused.set()
+        assert proceed.wait(10)
+
+    class PausingAdapter(FakeWorkerAdapter):
+        def infer(self, request):
+            if request.prior_tool_result is None and pause_at == "inference":
+                pause()
+            return super().infer(request)
+
+    adapter_a = PausingAdapter([_read_call(), _text("A")])
+    adapter_b = FakeWorkerAdapter([_read_call(), _text("B")])
+
+    def first():
+        r = LocalWorkerRunner(primary)
+        try:
+            if pause_at in ("claim", "setup"):
+                original = r._setup_execution_plane
+
+                def setup(run):
+                    if pause_at == "claim":
+                        pause()
+                    execution = original(run)
+                    if pause_at == "setup":
+                        pause()
+                    return execution
+                r._setup_execution_plane = setup
+            results.append(r.resume(ready.run_id, adapter=adapter_a))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            r.close()
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert paused.wait(10)
+        before = LeaseRepo(guarded_runner._control_conn).get(guarded_runner._primary.worktree_id)
+        if pause_at == "inference":
+            assert before.worker_session_id != ready.run_id
+        second = guarded_runner.resume(ready.run_id, adapter=adapter_b)
+        assert second.status == RunStatus.RUNNING
+        assert not adapter_b.calls
+        assert LeaseRepo(guarded_runner._control_conn).get(
+            guarded_runner._primary.worktree_id,
+        ) == before  # no renewal, identity reconstruction or result overwrite
+    finally:
+        proceed.set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert not errors
+    assert results[0].status == RunStatus.COMPLETED
+    assert len(adapter_a.calls) == 2
+    assert len(ToolOperationsRepo(guarded_runner._control_conn).list_for_task(ready.run_id)) == 1
+    assert verify_chain(guarded_runner._control_conn, task_id=None).ok
+    assert verify_chain(guarded_runner._control_conn, task_id=ready.run_id).ok
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "denial", "mutation_denial"])
+def test_terminal_runner_finalizes_task_and_lease(guarded_runner, outcome):
+    from code_slayer.workers.protocol import WorkerAdapterError
+
+    prompt = "Read the README.md file."
+    responses = {
+        "success": [_read_call(), _text()],
+        "failure": [WorkerAdapterError("offline")],
+        "denial": [_read_call()],
+        "mutation_denial": [],
+    }[outcome]
+    if outcome == "denial":
+        WorkerTrustManager(guarded_runner._control_conn).downgrade_to_locked(
+            worker_id=WORKER_ID, role=ROLE, capability="read_file", reason="test denial",
+        )
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        requires_mutation=outcome == "mutation_denial", adapter=FakeWorkerAdapter(responses),
+    )
+    assert result.status == {
+        "success": RunStatus.COMPLETED, "failure": RunStatus.FAILED,
+        "denial": RunStatus.DENIED_TRUST, "mutation_denial": RunStatus.DENIED_TRUST,
+    }[outcome]
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == ("COMPLETED" if outcome == "success" else "FAILED")
+        assert TaskRepo(execution.conn).get_active_for_worktree(row.execution_worktree_id) is None
+        lease = LeaseRepo(execution.conn).get(row.execution_worktree_id)
+        assert lease.status == "RELEASED"
+        assert verify_chain(execution.conn, task_id=row.task_id).ok
+    finally:
+        execution.close()
+    # The terminal run is idempotent; the next ordinary run can use the slot.
+    unused = FakeWorkerAdapter([])
+    assert guarded_runner.resume(result.run_id, adapter=unused) == result
+    assert not unused.calls
+    next_run = _ready(guarded_runner)
+    completed = guarded_runner.resume(next_run.run_id, adapter=FakeWorkerAdapter([_text("next")]))
+    assert completed.status == RunStatus.COMPLETED
+    assert verify_chain(guarded_runner._control_conn, task_id=None).ok
+
+
+def test_unresolved_terminal_outcome_keeps_task_and_lease(guarded_runner, monkeypatch):
+    from code_slayer.tools.executor import ToolExecutor
+
+    original_finish = ToolExecutor._finish
+
+    def unknown(self, task_id, operation_id, status, *args, **kwargs):
+        return original_finish(self, task_id, operation_id, "UNKNOWN", *args, **kwargs)
+
+    monkeypatch.setattr(ToolExecutor, "_finish", unknown)
+    ready = _ready(guarded_runner)
+    result = guarded_runner.resume(ready.run_id, adapter=FakeWorkerAdapter([_read_call()]))
+    assert result.status == RunStatus.INTERRUPTED_RESUMABLE
+    row = RunnerRepo(guarded_runner._control_conn).get(ready.run_id)
+    assert TaskRepo(guarded_runner._control_conn).get(row.task_id).state == "IMPLEMENTING"
+    assert LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id).status == "ACTIVE"
+    operation = ToolOperationsRepo(guarded_runner._control_conn).get(row.tool_operation_id)
+    assert operation.status == "UNKNOWN"
+    assert verify_chain(guarded_runner._control_conn, task_id=row.task_id).ok
+
+
+@pytest.mark.parametrize("child_liveness", [Liveness.ALIVE, Liveness.UNKNOWN])
+def test_runner_takeover_waits_for_recorded_child(guarded_runner, monkeypatch, child_liveness):
+    import os
+
+    from code_slayer.lease.liveness import process_start_time
+    from code_slayer.runner import local_worker_runner as module
+
+    ready = _ready(guarded_runner)
+    row = _crash_attempt(guarded_runner, ready.run_id, "started")
+    journal = ToolOperationsRepo(guarded_runner._control_conn)
+    operation = journal.list_for_task(row.task_id)[0]
+    journal.record_child_pid(operation.operation_id, os.getpid(), process_start_time(os.getpid()))
+    _age_lease(guarded_runner)
+    monkeypatch.setattr(module, "LeaseManager", lambda conn: LeaseManager(
+        conn, child_liveness_fn=lambda *args: child_liveness,
+    ))
+    adapter = FakeWorkerAdapter([])
+    assert guarded_runner.resume(ready.run_id, adapter=adapter).status == RunStatus.RUNNING
+    assert not adapter.calls
+    lease = LeaseRepo(guarded_runner._control_conn).get(row.execution_worktree_id)
+    assert lease.status == "QUIESCING" and lease.generation == 1
+
+
+def test_split_plane_finalization_crash_does_not_reoccupy_terminal_task(
+    guarded_runner, monkeypatch,
+):
+    prompt = "Refactor the module."
+    ready = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE, requires_mutation=True,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+    )
+    original_finish = guarded_runner._finish
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("crash between execution finalization and control bookkeeping")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(guarded_runner, "_finish", crash)
+        with pytest.raises(RuntimeError, match="crash between"):
+            guarded_runner.resume(ready.run_id, adapter=FakeWorkerAdapter([]))
+    row = RunnerRepo(guarded_runner._control_conn).get(ready.run_id)
+    assert row.status == "RUNNING"
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == "FAILED"
+        before = LeaseRepo(execution.conn).get(row.execution_worktree_id)
+        assert before.status == "RELEASED"
+        assert not ToolOperationsRepo(execution.conn).list_for_task(row.task_id)
+    finally:
+        execution.close()
+    assert guarded_runner._finish == original_finish
+    restarted = LocalWorkerRunner(guarded_runner._primary.repo_root)
+    try:
+        unused = FakeWorkerAdapter([])
+        result = restarted.resume(ready.run_id, adapter=unused)
+        assert result.status == RunStatus.INTERRUPTED_RESUMABLE
+        assert result.reason == "terminal_execution_task_requires_reconciliation"
+        assert not unused.calls
+        execution = restarted._reopen_execution_plane(row)
+        try:
+            assert LeaseRepo(execution.conn).get(row.execution_worktree_id) == before
+            assert verify_chain(execution.conn, task_id=row.task_id).ok
+        finally:
+            execution.close()
+    finally:
+        restarted.close()

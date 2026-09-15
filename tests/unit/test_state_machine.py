@@ -377,3 +377,38 @@ def test_transaction_scoped_primitive_rejects_autocommit(db_conn):
         )
     assert TaskRepo(db_conn).get(task.task_id) == task
     assert len(events(db_conn, task.task_id)) == 1
+
+
+@pytest.mark.parametrize(
+    "operation", [None, "SUCCEEDED", "FAILED", "STARTED", "UNKNOWN", "mutation"],
+)
+def test_bounded_read_only_completion_checks_journal(db_conn, operation):
+    from code_slayer.store.tool_operations_repo import ToolOperationsRepo
+
+    task = TaskRepo(db_conn).create(
+        description="bounded read-only turn", repo_root="/r", repo_id="r", worktree_id="w",
+        config={"execution_kind": "bounded_read_only_turn"},
+    )
+    TaskRepo(db_conn).record_transition(
+        task.task_id, to_state="IMPLEMENTING", to_phase="IMPLEMENTING", reason="fixture",
+    )
+    task = TaskRepo(db_conn).get(task.task_id)
+    if operation:
+        repo = ToolOperationsRepo(db_conn)
+        op = repo.start(
+            task_id=task.task_id, worktree_id="w", worker_id="worker", worker_session_id="session",
+            tool_name="write_file" if operation == "mutation" else "read_file",
+            risk_class="MUTATING" if operation == "mutation" else "READ_ONLY",
+            request_hash="hash", target_resource="README.md",
+        )
+        repo.finish(op.operation_id, status="SUCCEEDED" if operation == "mutation" else operation)
+    machine = TaskStateMachine(db_conn)
+    with pytest.raises(InvalidTransition):
+        apply(machine, task, "COMPLETED")  # still needs explicit completion decision
+    if operation in ("STARTED", "UNKNOWN", "mutation"):
+        with pytest.raises(InvalidTransition, match="resolved read-only"):
+            apply(machine, task, "COMPLETED", completion_decision=True)
+        assert TaskRepo(db_conn).get(task.task_id).state == "IMPLEMENTING"
+    else:
+        assert apply(machine, task, "COMPLETED", completion_decision=True).state == "COMPLETED"
+    assert verify_chain(db_conn, task_id=task.task_id).ok

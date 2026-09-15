@@ -32,6 +32,13 @@ suspended states. Neither is terminal or active; both still occupy the
 foundation's single non-terminal task slot for their worktree.
 
 `COMPLETED` and `FAILED` have no outgoing edges, including self-edges.
+Phase 7.7a adds one conditional edge: `IMPLEMENTING → COMPLETED` for tasks
+explicitly created with `config.execution_kind="bounded_read_only_turn"`.
+It requires `completion_decision=True`; the state machine also checks the
+journal in the same write transaction and refuses unresolved or non-read-only
+operations. A bounded read-only turn has no repository changes to checkpoint.
+Ordinary implementation jobs retain the checkpoint completion requirement.
+
 There are no other edges. The immutable static table lives in
 `core/transitions.py`; origin-dependent returns are validated there too.
 Shared classification lives in `core/states.py`.

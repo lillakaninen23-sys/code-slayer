@@ -1,5 +1,6 @@
 """Pure graph and guard validation; no persistence or external actions."""
 
+import json
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -137,7 +138,13 @@ def validate_transition(task: Task, request: TransitionRequest) -> TransitionEff
     elif task.current_phase != _active_phase(state):
         raise InvalidTaskPhase(f"{state} has incompatible phase {task.current_phase!r}")
 
-    if target not in TRANSITIONS[state]:
+    # Bounded read-only runner tasks have no repository changes to checkpoint.
+    # This is a conditional completion edge, never a shortcut for ordinary jobs.
+    read_only_completion = (
+        state == TaskState.IMPLEMENTING and target == TaskState.COMPLETED
+        and json.loads(task.config_json).get("execution_kind") == "bounded_read_only_turn"
+    )
+    if target not in TRANSITIONS[state] and not read_only_completion:
         raise InvalidTransition(f"illegal transition: {state} -> {target}")
     if target in SUSPENDED_STATES:
         return TransitionEffect(state.value, state)
