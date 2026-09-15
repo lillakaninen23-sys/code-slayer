@@ -2,7 +2,7 @@
 
 **Status:** authoritative long-term guidance. Not a spec for what exists today.
 **Audience:** every worker that ever acts on this project — Claude, Codex, Astra, Qwen, future models, and Code Slayer's own future self.
-**Relationship to other documents:** the *Foundation Plan* (Revision 2.1) is the authoritative near-term architecture for the durable core. The ADRs in `adr/` record specific decisions already made and implemented. This document is the horizon those decisions are aimed at — it does not override them, and where it describes something not yet built, that absence is deliberate, not an oversight (see [Guiding Constraints](#guiding-constraints)).
+**Relationship to other documents:** the *Foundation Plan* (Revision 2.1) is the authoritative near-term architecture for the durable core. The ADRs in `adr/` record specific decisions already made and implemented. This document is the horizon those decisions are aimed at — it does not override them, and where it describes something not yet built, that absence is deliberate, not an oversight (see [Guiding Constraints](#guiding-constraints)). [`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](SECURITY_PRIVACY_ARCHITECTURE.md), [`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md), [`docs/PRODUCT_PRINCIPLES.md`](PRODUCT_PRINCIPLES.md), and [`docs/OPERATIONS_UX.md`](OPERATIONS_UX.md) are this vision's governance-layer counterparts (§62) — normative specifications for security/privacy, permissions, product UX, and the operational surface, respectively.
 
 ---
 
@@ -684,6 +684,50 @@ Code Slayer should not "reward activity." A worker that produces many edits, man
 - improves from validated feedback (§55, §57)
 
 Every mechanism in §32–§60 exists in service of that list — none of it is safety for its own sake, and none of it is process for its own sake.
+
+---
+
+## 62. Governance foundation: naming, local-first posture, transparency
+
+**CSLR** is Code Slayer's official short name/brand (Governance Foundation,
+slice G1) — "Code Slayer — Autonomous Engineering System" is the formal
+descriptor, and `cslr` is the target user-facing future CLI name (see
+[`docs/OPERATIONS_UX.md`](OPERATIONS_UX.md); the current, real CLI remains
+`codeslayer` and is not renamed by this section). Existing technical
+identifiers — the `codeslayer`/`code_slayer` packages, repositories, and
+service names — are unaffected; CSLR is the product's name, not a rename
+of its code.
+
+Three product-level commitments, elaborated in full in their own
+authoritative documents, are added here because they apply to every
+section above and below, not to any one subsystem:
+
+- **Local-first, explicit-authority networking.** User project data stays
+  local unless one specific, explicitly authorized operation requires
+  otherwise; telemetry and cloud AI are off by default; discovering
+  something on the local network is never itself authority to connect
+  to, read, write, or otherwise act on it. See
+  [`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](SECURITY_PRIVACY_ARCHITECTURE.md)
+  and [`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md) for the full
+  invariants and the permission vocabulary this implies — a strict
+  superset of, and consistent with, the cloud-escalation posture already
+  established in §4.
+- **Simple by default, powerful underneath.** A routine user should never
+  need to understand this project's own implementation details (a
+  virtual environment, systemd, SQLite, migration numbers, a model
+  runtime's API) to perform a routine operation — see
+  [`docs/PRODUCT_PRINCIPLES.md`](PRODUCT_PRINCIPLES.md) and
+  [`docs/OPERATIONS_UX.md`](OPERATIONS_UX.md).
+- **Progressive transparency.** For anything security-sensitive, a user
+  should be able to go from a simple explanation, to technical detail, to
+  the exact implementation/source — never required to accept "trust us"
+  alone. Source visibility is part of the trust model but is not, by
+  itself, sufficient security — see
+  [`docs/SECURITY_PRIVACY_ARCHITECTURE.md`§11](SECURITY_PRIVACY_ARCHITECTURE.md#11-transparency).
+
+These documents are normative specifications, not additional vision prose
+— see [`AGENTS.md`](../AGENTS.md) for the rule that every future agent
+change must preserve their invariants.
 
 ---
 

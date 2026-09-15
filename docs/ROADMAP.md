@@ -255,6 +255,73 @@ Cross-compilation, QEMU-based boot/runtime testing, and eventually kernel and co
 
 ---
 
+## Security & Privacy / Operations (future track)
+
+**Status: governance specification complete (Governance Foundation, slice
+G1); no runtime implementation exists yet.** This is a **cross-cutting
+track**, not a Phase-8 sub-stage — it does not appear in the dependency
+diagram above because it is a prerequisite *constraint* on several later
+stages, not a rung in the capability ladder itself.
+
+The governance documents this track specifies are authoritative today
+even though their runtime enforcement is not yet built:
+[`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](SECURITY_PRIVACY_ARCHITECTURE.md)
+(local-first posture, consent-before-discovery, non-transitive consent,
+least privilege, fail-closed, secrets, revocation, supply chain),
+[`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md) (the scoped permission
+vocabulary and consent-UX rules a future Permission Engine must implement),
+[`docs/PRODUCT_PRINCIPLES.md`](PRODUCT_PRINCIPLES.md), and
+[`docs/OPERATIONS_UX.md`](OPERATIONS_UX.md) (the `cslr` CLI/operations
+target). See [`AGENTS.md`](../AGENTS.md) for the rule that every future
+change must preserve their invariants.
+
+This track's own future implementation sub-stages, in dependency order:
+
+1. **Permission Engine.** The machine-enforced runtime for the scope
+   vocabulary in `PERMISSIONS_MODEL.md` — durable grant/revocation
+   records, fail-closed evaluation, versioned scope semantics.
+2. **Consent UX.** The user-facing request/explanation/technical-detail/
+   denial/revocation flow `PERMISSIONS_MODEL.md`§6 specifies, wired to
+   the Permission Engine.
+3. **Secrets/Credential Storage.** A dedicated, purpose-scoped secret
+   store satisfying `SECURITY_PRIVACY_ARCHITECTURE.md`§7 — explicitly not
+   designed or implemented yet.
+4. **Network Activity Audit.** The durable "what destination, why, under
+   what permission, which subsystem, what data, when" record
+   `SECURITY_PRIVACY_ARCHITECTURE.md`§6 requires be answerable.
+5. **Supply-chain Security.** Signed releases, verified update artifacts,
+   checksums/signatures, rollback-safe updates, dependency/SBOM
+   visibility (`SECURITY_PRIVACY_ARCHITECTURE.md`§12) — underpins the
+   Update UX target in `OPERATIONS_UX.md`§7.
+6. **Operational/Productization UX.** The `cslr` CLI surface itself
+   (`OPERATIONS_UX.md`), including `cslr doctor`.
+
+**Depends on:** nothing below it in this list requires a specific
+capability stage above to exist first — the Permission Engine and Consent
+UX are foundational and can be designed against today's codebase.
+
+**This track's stages 1–2 (Permission Engine, Consent UX) MUST be
+implemented, and demonstrated to actually enforce the invariants in
+`SECURITY_PRIVACY_ARCHITECTURE.md`, *before* any of the following are
+built:**
+
+- automatic LAN discovery (any form);
+- NAS/storage integration;
+- general AI-server discovery;
+- automatic model downloads;
+- cloud integrations beyond the existing, already-implemented
+  `cloud_escalation` policy dimension (`CODE_SLAYER_VISION.md`§4).
+
+This is the same "safety before autonomy" sequencing discipline the note
+below already applies to model autonomy, applied here to network/storage/
+model-management autonomy: a discovery or integration feature that ships
+before the Permission Engine it depends on is real is not "temporarily
+simplified" — it is the exact defect
+[`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](SECURITY_PRIVACY_ARCHITECTURE.md)
+exists to prevent.
+
+---
+
 ## A note on sequencing discipline
 
 Every "Depends on" above is a real dependency, not a suggestion: building a later stage before its dependency is solid produces a system that *looks* capable and fails unpredictably under the exact conditions the skipped stage exists to guard against (an unverified plan, an untested environment, an ungated self-modification). When in doubt about whether a stage is "ready to start," the test is not "do we want this capability" — it's "does every stage above it in this chain already hold up under real, adversarial use." If the answer is no, the next unit of work belongs in the stage that's still shaky, not the one that sounds more exciting.

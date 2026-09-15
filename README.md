@@ -1,13 +1,23 @@
-# Code Slayer
+# Code Slayer (CSLR)
 
-Code Slayer is a local, persistent, repo-level software-engineering agent
-system. It is not a chat wrapper around a model: models are replaceable
-*workers*; Code Slayer's own durable state — task state, audit history,
-checkpoints, worker leases — is the system's source of truth.
+Code Slayer (short name/brand: **CSLR**) is a local, persistent,
+repo-level software-engineering agent system. It is not a chat wrapper
+around a model: models are replaceable *workers*; Code Slayer's own
+durable state — task state, audit history, checkpoints, worker leases —
+is the system's source of truth.
 
 The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
+
+- [Vision](docs/CODE_SLAYER_VISION.md) — long-term product/engineering direction.
+- [Security & Privacy Architecture](docs/SECURITY_PRIVACY_ARCHITECTURE.md) — normative security/privacy invariants.
+- [Permissions Model](docs/PERMISSIONS_MODEL.md) — the scoped permission vocabulary those invariants are expressed through.
+- [Product Principles](docs/PRODUCT_PRINCIPLES.md) — the product/UX commitments every surface follows.
+
+Existing package/service names (`codeslayer`, `code_slayer`) are unchanged
+by the CSLR brand — see [`AGENTS.md`](AGENTS.md) for the rules every future
+change to this project must follow.
 
 ## Status: Phase 7 / Local Worker Runtime — VERIFIED / ACCEPTED
 
