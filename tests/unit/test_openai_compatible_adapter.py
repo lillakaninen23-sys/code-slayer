@@ -310,7 +310,25 @@ def test_ambient_proxy_env_vars_are_never_consulted(server, monkeypatch):
 
 def test_no_mutating_capability_has_a_tool_schema():
     for name in _TOOL_SCHEMAS:
+        if name not in CAPABILITIES:
+            # Not every `_TOOL_SCHEMAS` entry is a real ToolExecutor
+            # capability at all -- see the next test.
+            continue
         assert not CAPABILITIES[name].mutation
+
+
+def test_structured_output_only_schemas_are_not_registered_capabilities():
+    """`emit_engineering_plan` (Phase 8.2/8.2b, `planning.
+    worker_planner.WorkerAdapterPlanner`) is a structured-output
+    transport tool only -- it must never collide with, or be mistaken
+    for, a real `tools.registry.CAPABILITIES` entry `ToolExecutor` could
+    route to. Offering its schema grants no filesystem mutation, no
+    command execution, no checkpoint authority, and no trust promotion:
+    nothing in this module imports `tools.executor.ToolExecutor`,
+    `policy.engine.PolicyEngine`, `repo.checkpoint`, or `workers.trust`
+    promotion at all."""
+    assert "emit_engineering_plan" in _TOOL_SCHEMAS
+    assert "emit_engineering_plan" not in CAPABILITIES
 
 
 def test_tool_schemas_for_only_translates_known_read_only_capabilities(server):
@@ -319,6 +337,61 @@ def test_tool_schemas_for_only_translates_known_read_only_capabilities(server):
     schemas = adapter._tool_schemas_for(("read_file", "write_file", "made_up_tool"))
     names = {schema["function"]["name"] for schema in schemas}
     assert names == {"read_file"}  # write_file and the invented name are silently omitted
+
+
+# --- Phase 8.2b: emit_engineering_plan schema, offered only when allowed ----
+
+def test_emit_engineering_plan_schema_offered_when_explicitly_allowed(server):
+    script, base_url = server
+    _respond(script, {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "function": {"name": "emit_engineering_plan", "arguments": json.dumps({"goal": "x"})},
+        }],
+    })
+    OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=("emit_engineering_plan",)),
+    )
+    sent = json.loads(script.last_request_body)
+    names = {tool["function"]["name"] for tool in sent["tools"]}
+    assert names == {"emit_engineering_plan"}
+
+
+def test_emit_engineering_plan_schema_absent_when_not_allowed(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request(allowed_tools=("read_file",)))
+    sent = json.loads(script.last_request_body)
+    names = {tool["function"]["name"] for tool in sent["tools"]}
+    assert "emit_engineering_plan" not in names
+
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request(allowed_tools=None))
+    sent = json.loads(script.last_request_body)
+    assert "tools" not in sent  # no allowed_tools at all -> nothing offered
+
+
+def test_emit_engineering_plan_required_emits_standard_tool_choice(server):
+    """Test item 10: exactly the same standard `tool_choice: "required"`
+    mapping `test_required_tool_requirement_emits_standard_tool_choice_
+    field` proves for `read_file` above, exercised for
+    `emit_engineering_plan` specifically -- no special-cased branch for
+    this tool name anywhere in `_build_payload()`."""
+    script, base_url = server
+    _respond(script, {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "function": {"name": "emit_engineering_plan", "arguments": json.dumps({"goal": "x"})},
+        }],
+    })
+    OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(
+            allowed_tools=("emit_engineering_plan",), tool_requirement=ToolRequirement.REQUIRED,
+        ),
+    )
+    sent = json.loads(script.last_request_body)
+    assert sent["tool_choice"] == "required"
+    names = {tool["function"]["name"] for tool in sent["tools"]}
+    assert names == {"emit_engineering_plan"}
 
 
 def test_no_tools_sent_when_request_allows_none(server):

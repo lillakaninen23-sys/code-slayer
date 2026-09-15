@@ -36,10 +36,29 @@ handed to the model itself:
   environment or credentials is forwarded
 - there is no fallback to any other endpoint, local or cloud, ever
 - the only tool schemas this module can ever emit come from its own
-  fixed `_TOOL_SCHEMAS` table (currently just `read_file`) filtered by
-  whatever the caller's `WorkerRequest.allowed_tools` actually allows —
-  never a generic network/shell tool, never something the model asked
-  for by name
+  fixed `_TOOL_SCHEMAS` table filtered by whatever the caller's
+  `WorkerRequest.allowed_tools` actually allows — never a generic
+  network/shell tool, never something the model asked for by name
+
+## Structured-output-only tool schemas grant no capability by existing
+
+`_TOOL_SCHEMAS` currently has two entries: `read_file` (a real,
+`tools.executor.ToolExecutor`-backed capability — offering its schema is
+what lets a model *request* a read, still gated entirely by
+`workers.execution`/`policy.engine.PolicyEngine` downstream, never by
+this adapter) and `emit_engineering_plan` (Phase 8.2/8.2b —
+`planning.worker_planner.WorkerAdapterPlanner`'s structured-output
+transport for one planning turn). Offering `emit_engineering_plan`'s
+schema is not itself a capability grant of any kind: this module has no
+`ToolExecutor`, `PolicyEngine`, lease, or checkpoint import anywhere,
+and a call naming it produces nothing but a `WorkerToolCall(tool=
+"emit_engineering_plan", params={...})` for `workers.protocol_
+validation.validate_response()` to structurally validate and `planning.
+worker_planner`/`planning.planner.parse_planner_output()` to schema-
+validate — it authorizes no filesystem mutation, no command execution,
+no checkpoint creation, and no trust promotion, exactly like every
+other entry in this table only ever describes *what a model may ask
+for*, never *what happens when it does*.
 
 ## No raw tool-call recovery
 
@@ -127,6 +146,149 @@ _TOOL_SCHEMAS: dict[str, dict] = {
                     },
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # Structured-output-only transport for one Phase 8.2 planning turn
+    # (`planning.worker_planner.WorkerAdapterPlanner`) — never a
+    # mutation/execution capability; see the module docstring's
+    # "Structured-output-only tool schemas" section. Field shape is
+    # kept in exact lockstep with `planning.planner.parse_planner_
+    # output()`'s own strict schema (`_ALLOWED_FIELDS`) — this table is
+    # what tells a model what it *may ask to emit*; that function is
+    # what actually validates what it *did* emit, and the two never
+    # disagree about the field set by construction (both enumerate it
+    # explicitly, and a mismatch between them would show up immediately
+    # as every real structured plan failing `parse_planner_output()`).
+    "emit_engineering_plan": {
+        "type": "function",
+        "function": {
+            "name": "emit_engineering_plan",
+            "description": (
+                "Return one complete structured engineering plan. "
+                "This tool only emits planning data and performs no mutation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "requirements": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "assumptions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "affected_files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["inspect", "modify", "create", "delete"],
+                                },
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["path", "action", "reason"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "planned_changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["description"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "risks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "verification_steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "discovered_commands": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string"},
+                                "purpose": {"type": "string"},
+                                "evidence_source": {"type": "string"},
+                            },
+                            "required": ["command", "purpose", "evidence_source"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "authority_requirements": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "evidence_claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "key": {"type": "string"},
+                            },
+                            "required": ["kind", "key"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "ambiguities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "question": {"type": "string"},
+                                "rationale": {"type": "string"},
+                                "risk_class": {
+                                    "type": "string",
+                                    "enum": [
+                                        "ROUTINE",
+                                        "MATERIAL",
+                                        "DESTRUCTIVE",
+                                        "EXTERNAL_SIDE_EFFECT",
+                                    ],
+                                },
+                                "evidence_keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "resolved_by_prompt_substring": {
+                                    "type": "string",
+                                },
+                            },
+                            "required": [
+                                "id",
+                                "question",
+                                "rationale",
+                                "risk_class",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["goal"],
                 "additionalProperties": False,
             },
         },
