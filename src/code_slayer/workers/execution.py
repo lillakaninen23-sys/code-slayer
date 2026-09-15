@@ -75,6 +75,22 @@ is that `expected_hash` came from the one real `ToolExecutor.execute()`
 call, never the label on whichever row dedup happened to land on. No
 filesystem fallback to the repository is ever attempted.
 
+## Cloud escalation gate (Phase 7.7e)
+
+Before any of the above — before `adapter.infer()` is ever reached, for
+either the initial or the continuation inference — `workers.
+cloud_escalation.check_cloud_escalation()` decides whether transport to
+`worker_id` may proceed at all, from its durable `network_class`
+(`store.workers_repo.WorkersRepo`, the same control-plane connection
+trust itself reads from). A local worker proceeds unconditionally; a
+cloud worker requires a `cloud_escalation: CloudEscalationAuthorization`
+naming this exact `(task_id, worker_id, role)` turn, explicitly supplied
+by the caller — never inferred from a model name, a URL, a `PromptAnalyst`,
+or model output itself. Denial here means zero network transport of any
+kind: no DNS, no HTTP request, no bearer token, no prompt or supplemental
+context ever leaves this process. See `workers.cloud_escalation`'s own
+module docstring for the full design.
+
 ## Trust gate
 
 `current_trust(worker_id, role, capability)` is checked only once a
@@ -149,6 +165,10 @@ from code_slayer.store.content_store import ContentStore
 from code_slayer.tools import file_tools as files
 from code_slayer.tools.executor import ToolExecutor
 from code_slayer.tools.models import ToolRequest, ToolResult
+from code_slayer.workers.cloud_escalation import (
+    CloudEscalationAuthorization,
+    check_cloud_escalation,
+)
 from code_slayer.workers.protocol import (
     ToolRequirement,
     WorkerAdapter,
@@ -250,6 +270,7 @@ def execute_guarded_turn(
     role: str, original_prompt: str, lease: LeaseHandle, blobs_dir: Path | str,
     trust_conn: sqlite3.Connection | None = None,
     supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = (),
+    cloud_escalation: CloudEscalationAuthorization | None = None,
 ) -> TurnOutcome:
     """Run one bounded turn: inference -> validation -> trust gate ->
     (at most one) real `ToolExecutor.execute()` -> verified content ->
@@ -277,8 +298,20 @@ def execute_guarded_turn(
     Never executes a second tool request, never recurses, never parses
     or recovers leaked textual tool-call syntax -- that responsibility
     stays entirely with the already-existing, unmodified
-    `protocol_validation.validate_response()`."""
-    trust = WorkerTrustManager(trust_conn if trust_conn is not None else conn)
+    `protocol_validation.validate_response()`.
+
+    `cloud_escalation` (Phase 7.7e) is checked, via `workers.
+    cloud_escalation.check_cloud_escalation()`, against `worker_id`'s
+    durable `network_class` (`trust_conn`, the same control-plane
+    connection trust itself reads from) BEFORE any inference call at all
+    -- see the module docstring's forthcoming "Cloud escalation" note.
+    A local worker needs no authorization and proceeds unchanged; a
+    cloud worker without a matching authorization is denied here,
+    before `adapter.infer()` is ever reached -- zero transport, zero
+    DNS/HTTP, zero prompt/context transmission. Both outcomes are
+    audited (`EventType.CLOUD_ESCALATION_EVALUATED`)."""
+    trust_conn_ = trust_conn if trust_conn is not None else conn
+    trust = WorkerTrustManager(trust_conn_)
 
     def _downgrade(capability: str, reason: str) -> bool:
         return trust.downgrade_to_locked(
@@ -294,6 +327,22 @@ def execute_guarded_turn(
             **extra,
         })
         return turn_outcome
+
+    escalation = check_cloud_escalation(
+        trust_conn_, task_id=task_id, worker_id=worker_id, role=role,
+        authorization=cloud_escalation,
+    )
+    _emit(conn, task_id, worker_id, EventType.CLOUD_ESCALATION_EVALUATED, {
+        "worker_id": worker_id, "role": role, "network_class": escalation.network_class,
+        "decision": "ALLOW" if escalation.ok else "DENY", "reason": escalation.reason,
+    })
+    if not escalation.ok:
+        # Denied strictly before any transport-related work below: no
+        # WorkerRequest is even constructed, let alone sent anywhere.
+        return _finish(
+            "cloud_escalation_denied",
+            TurnOutcome(False, f"cloud_escalation_denied:{escalation.reason}"),
+        )
 
     request = WorkerRequest(
         task_id=task_id, role=role, original_prompt=original_prompt,

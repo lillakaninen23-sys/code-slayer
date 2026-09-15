@@ -98,6 +98,17 @@ The Prompt Analyst may only ever *suggest* — `Ambiguity.evidence_keys`/
 `resolved_by_prompt_substring` — never manufacture. This module never
 promotes an analyst's own hint into `ResolutionEvidence` on its behalf.
 
+## Cloud escalation authorization: a separate question from QuestionGate (Phase 7.7e)
+
+`start()`/`resume()`'s `cloud_escalation` parameter is unrelated to, and
+never derived from, any `ResolutionEvidence`/human `QuestionGate`
+resolution above — a human authorizing a destructive *action*
+(`ResolutionKind.AUTHORIZATION`) says nothing about whether a *cloud*
+worker may receive network transport at all, a completely separate
+question. See `workers.cloud_escalation`'s own module docstring for the
+full design; forwarded, unchanged, to `workers.execution.
+execute_guarded_turn()`'s pre-transport gate.
+
 ## Ownership and terminal lifecycle (Phase 7.7a)
 
 `READY -> RUNNING` is an atomic claim. RUNNING is owned, not evidence of a
@@ -176,6 +187,7 @@ from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.task_repo import TaskAlreadyActiveError, TaskRepo
 from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
 from code_slayer.tools import file_tools as files
+from code_slayer.workers.cloud_escalation import CloudEscalationAuthorization
 from code_slayer.workers.execution import execute_guarded_turn
 from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalysis, PromptAnalyst
 from code_slayer.workers.prompt_provenance import (
@@ -321,12 +333,20 @@ class LocalWorkerRunner:
         self, *, original_prompt: str, worker_id: str, role: str,
         prompt_analyst: PromptAnalyst, requires_mutation: bool = False,
         resolutions: tuple[ResolutionEvidence, ...] = (), adapter: WorkerAdapter | None = None,
+        cloud_escalation: CloudEscalationAuthorization | None = None,
     ) -> RunResult:
         """Create a new run and carry it as far as it can safely go
         without a caller-supplied `adapter`: through Prompt Analyst and
         Question Gate evaluation, to `BLOCKED_ON_QUESTIONS` or `READY`.
         If `adapter` is given and the gate suppresses, proceeds all the
-        way through worker execution in this same call."""
+        way through worker execution in this same call.
+
+        `cloud_escalation` (Phase 7.7e) is forwarded, unchanged, to
+        `workers.execution.execute_guarded_turn()`'s own pre-transport
+        gate if execution is reached this same call — see `workers.
+        cloud_escalation`'s module docstring. `None` (the default) means
+        no cloud escalation is authorized; a local worker needs none
+        regardless."""
         if not isinstance(original_prompt, str):
             raise TypeError("original_prompt must be a str")
         run_id = uuid.uuid4().hex
@@ -350,7 +370,9 @@ class LocalWorkerRunner:
 
         analysis = prompt_analyst.analyze(original_prompt, {})
         run = RunnerRepo(self._control_conn).get(run_id)
-        return self._evaluate_gate(run, original_prompt, analysis, resolutions, adapter)
+        return self._evaluate_gate(
+            run, original_prompt, analysis, resolutions, adapter, cloud_escalation,
+        )
 
     def status(self, run_id: str) -> RunResult:
         """Read-only: the run's current durable state. Never mutates
@@ -406,6 +428,7 @@ class LocalWorkerRunner:
     def resume(
         self, run_id: str, *, adapter: WorkerAdapter | None = None,
         resolutions: tuple[ResolutionEvidence, ...] = (),
+        cloud_escalation: CloudEscalationAuthorization | None = None,
     ) -> RunResult:
         """Derive the next safe action entirely from durable state —
         never from Python object memory. Idempotent for a run already in
@@ -413,7 +436,13 @@ class LocalWorkerRunner:
         no tool. Concurrency-safe: claims the `READY -> RUNNING`
         transition inside one `BEGIN IMMEDIATE` transaction, so two
         concurrent `resume()` calls can never both execute the same
-        bounded turn (see `_claim_for_execution()`)."""
+        bounded turn (see `_claim_for_execution()`).
+
+        `cloud_escalation` (Phase 7.7e) must be supplied fresh on every
+        call that could reach execution for a cloud worker — no prior
+        authorization is durably remembered across a crash/restart; see
+        `workers.cloud_escalation`'s module docstring for why that is
+        deliberate."""
         run = RunnerRepo(self._control_conn).get_or_none(run_id)
         if run is None:
             return RunResult(run_id=run_id, status=RunStatus.FAILED, reason="unknown_run")
@@ -429,18 +458,20 @@ class LocalWorkerRunner:
                 self._control_conn, self._control_blobs_dir, run.analysis_content_hash,
             )
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
-            return self._evaluate_gate(run, original_prompt, analysis, resolutions, adapter)
+            return self._evaluate_gate(
+                run, original_prompt, analysis, resolutions, adapter, cloud_escalation,
+            )
 
         if run.status == RunStatus.READY.value:
             claimed = self._claim_for_execution(run_id)
             if claimed is None:
                 return self._to_result(RunnerRepo(self._control_conn).get(run_id))
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
-            return self._proceed_to_execution(claimed, adapter)
+            return self._proceed_to_execution(claimed, adapter, cloud_escalation)
 
         if run.status == RunStatus.RUNNING.value:
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
-            return self._recover_mid_turn(run, adapter)
+            return self._recover_mid_turn(run, adapter, cloud_escalation)
 
         # INTERRUPTED_RESUMABLE: requires explicit reconciliation this
         # phase does not automate (see the module docstring's "Known
@@ -452,6 +483,7 @@ class LocalWorkerRunner:
     def _evaluate_gate(
         self, run: RunnerRun, original_prompt: str, analysis: PromptAnalysis,
         resolutions: tuple[ResolutionEvidence, ...], adapter: WorkerAdapter | None,
+        cloud_escalation: CloudEscalationAuthorization | None = None,
     ) -> RunResult:
         """Run (or re-run, on resume) `QuestionGate.evaluate()` against
         `analysis` — freshly produced by `PromptAnalyst.analyze()` when
@@ -495,7 +527,7 @@ class LocalWorkerRunner:
         claimed = self._claim_for_execution(run.run_id)
         if claimed is None:
             return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
-        return self._proceed_to_execution(claimed, adapter)
+        return self._proceed_to_execution(claimed, adapter, cloud_escalation)
 
     def _load_durable_human_resolutions(self, run_id: str) -> tuple[_HumanResolution, ...]:
         """Every distinct ambiguity this run has a durable human/
@@ -745,7 +777,10 @@ class LocalWorkerRunner:
             worker_id=run.worker_id, worker_session_id=uuid.uuid4().hex,
         )
 
-    def _proceed_to_execution(self, run: RunnerRun, adapter: WorkerAdapter | None) -> RunResult:
+    def _proceed_to_execution(
+        self, run: RunnerRun, adapter: WorkerAdapter | None,
+        cloud_escalation: CloudEscalationAuthorization | None = None,
+    ) -> RunResult:
         """`run.status` is already `RUNNING` (claimed) here. Sets up (or
         reuses) the execution plane, acquires a fresh task lease, checks
         control-plane trust for a mutating run before inference, and runs
@@ -786,12 +821,14 @@ class LocalWorkerRunner:
                     f"lease_unavailable:{lease_result.reason}",
                 )
             return self._execute_owned(
-                run, execution, lease_result.handle, adapter, original_prompt,
+                run, execution, lease_result.handle, adapter, original_prompt, cloud_escalation,
             )
         finally:
             execution.close()
 
-    def _execute_owned(self, run, execution, lease, adapter, original_prompt) -> RunResult:
+    def _execute_owned(
+        self, run, execution, lease, adapter, original_prompt, cloud_escalation=None,
+    ) -> RunResult:
         # Apply the journal veto to every entry path, including a READY row
         # that unexpectedly already has execution evidence. The runner's own
         # status and nullable operation pointer are never replay authority.
@@ -820,7 +857,7 @@ class LocalWorkerRunner:
             execution.conn, adapter, task_id=execution.task.task_id, worker_id=run.worker_id,
             role=run.role, original_prompt=original_prompt, lease=lease,
             blobs_dir=execution.blobs_dir, trust_conn=self._control_conn,
-            supplemental_resolutions=supplemental_resolutions,
+            supplemental_resolutions=supplemental_resolutions, cloud_escalation=cloud_escalation,
         )
         tool_operation_id = outcome.tool_result.operation_id if outcome.tool_result else None
         status = (
@@ -875,7 +912,10 @@ class LocalWorkerRunner:
                 return self._finish(run, status, reason, **kwargs)
         return self._finish(run, status, reason, **kwargs)
 
-    def _recover_mid_turn(self, run: RunnerRun, adapter: WorkerAdapter | None) -> RunResult:
+    def _recover_mid_turn(
+        self, run: RunnerRun, adapter: WorkerAdapter | None,
+        cloud_escalation: CloudEscalationAuthorization | None = None,
+    ) -> RunResult:
         """RUNNING means owned, not crashed. Prove takeover before any replay.
 
         A missing task/lease link is ambiguous (the first caller may still be
@@ -921,7 +961,7 @@ class LocalWorkerRunner:
                 self._control_conn, self._control_blobs_dir, run.original_prompt_hash,
             )
             return self._execute_owned(
-                run, execution, lease_result.handle, adapter, original_prompt,
+                run, execution, lease_result.handle, adapter, original_prompt, cloud_escalation,
             )
         finally:
             execution.close()

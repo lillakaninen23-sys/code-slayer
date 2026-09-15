@@ -54,6 +54,15 @@ class EventType(StrEnum):
     # `workers.execution`'s module docstring.
     WORKER_TOOL_CALL_EVALUATED = "WORKER_TOOL_CALL_EVALUATED"
     WORKER_TURN_FINISHED = "WORKER_TURN_FINISHED"
+    # Phase 7.7e: the pre-transport cloud-escalation authorization
+    # decision (`workers.cloud_escalation.check_cloud_escalation()`),
+    # recorded for every bounded turn -- local (no escalation needed) and
+    # cloud (authorized or denied) alike -- via `workers.execution.
+    # execute_guarded_turn()`, always BEFORE any `adapter.infer()` call.
+    # Distinct from CLOUD_ESCALATION_PACKAGE_BUILT below, which is a
+    # later, still-unimplemented concept (an actual filtered/redacted
+    # escalation bundle) this event does not attempt to anticipate.
+    CLOUD_ESCALATION_EVALUATED = "CLOUD_ESCALATION_EVALUATED"
     # Phase 7.5c: an isolated, disposable job worktree's own lifecycle
     # (`repo.job_worktree`) -- not scoped to any one task_id (a job
     # worktree may exist before any task is created against it), so
