@@ -1,21 +1,24 @@
 """Deterministic repository intelligence (Phase 8.1).
 
 Covers: exact-HEAD-bound snapshot identity and restart persistence; HEAD
-and working-tree-content invalidation; deterministic, bounded, safety-
-respecting file inventory (exclusions, binary/oversized handling,
-symlink-escape denial); evidence-only project/language detection and
-command discovery (never executed); Python AST symbol extraction that
-fails locally, never repository-wide; a deterministic internal import
-graph; deterministic relevance ranking and bounded context-pack
-assembly with recorded truncation; and the read-only guarantee."""
+and working-tree-content invalidation; content-safe identity that
+cannot be fooled by a preserved size and/or mtime (Phase 8.1a);
+deterministic, bounded, safety-respecting file inventory (exclusions,
+binary/oversized handling, symlink-escape denial); evidence-only
+project/language detection and command discovery (never executed);
+Python AST symbol extraction that fails locally, never
+repository-wide; a deterministic internal import graph; deterministic
+relevance ranking and bounded context-pack assembly with recorded
+truncation; and the read-only guarantee."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
-from code_slayer.intelligence import commands, symbols
+from code_slayer.intelligence import builder, commands, symbols
 from code_slayer.intelligence.limits import MAX_TEXT_FILE_BYTES
 from code_slayer.intelligence.service import RepositoryIntelligenceService
 from tests.repo_helpers import git
@@ -84,6 +87,143 @@ def test_working_tree_edit_without_commit_invalidates_snapshot(service, git_repo
     service.inspect()
     (git_repo_with_commit / "README.md").write_text("changed content\n")
     assert service.status().current is False
+
+
+# --- 8.1a. content-safe identity: never fooled by a preserved size/mtime ---
+#
+# The old `working_tree_fingerprint` was `path:size:mtime_ns` alone -- a
+# file whose content changed but whose path, byte size, and mtime were
+# all preserved would still report CURRENT. These tests prove the
+# replacement identity (`intelligence.builder._working_tree_identity`)
+# never makes that mistake, using real content hashes for every
+# dirty/untracked/masked indexed path instead of trusting stat() metadata.
+
+def _same_stat_rewrite(path: Path, new_bytes: bytes) -> None:
+    """Rewrite `path` with `new_bytes` (same length as the current
+    content) and restore the original mtime -- the strongest form of
+    the regression this phase fixes: an editor that changes content but
+    leaves size and mtime exactly as they were."""
+    original = path.stat()
+    assert len(new_bytes) == original.st_size, "test fixture must preserve exact byte size"
+    path.write_bytes(new_bytes)
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+
+def test_clean_repo_with_unchanged_head_reports_current(service):
+    service.inspect()
+    assert service.status().current is True
+    assert service.status().current is True  # repeated probe agrees, no drift
+
+
+def test_tracked_edit_preserving_exact_byte_size_invalidates_snapshot(
+    service, git_repo_with_commit,
+):
+    service.inspect()
+    readme = git_repo_with_commit / "README.md"
+    assert readme.read_bytes() == b"hello\n"
+    readme.write_bytes(b"bye!!\n")  # same 6-byte size, different content
+    assert service.status().current is False
+
+
+def test_tracked_edit_preserving_size_and_restored_mtime_invalidates_snapshot(
+    service, git_repo_with_commit,
+):
+    """The regression this phase exists to fix: the old stat()-only
+    fingerprint (`path:size:mtime_ns`) cannot distinguish this from an
+    untouched file."""
+    service.inspect()
+    assert service.status().current is True
+    _same_stat_rewrite(git_repo_with_commit / "README.md", b"bye!!\n")
+    assert service.status().current is False
+
+
+def test_untracked_edit_preserving_size_and_mtime_invalidates_snapshot(
+    service, git_repo_with_commit,
+):
+    extra = git_repo_with_commit / "notes.txt"
+    extra.write_text("first!\n")
+    service.inspect(force=True)
+    assert service.status().current is True
+    _same_stat_rewrite(extra, b"abcdef\n")
+    assert service.status().current is False
+
+
+def test_tracked_deletion_invalidates_snapshot(service, git_repo_with_commit):
+    service.inspect()
+    assert service.status().current is True
+    (git_repo_with_commit / "README.md").unlink()
+    assert service.status().current is False
+
+
+def test_binary_content_change_preserving_size_and_mtime_invalidates_snapshot(
+    service, git_repo_with_commit,
+):
+    image = git_repo_with_commit / "image.bin"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00AAAA")
+    service.inspect(force=True)
+    assert service.status().current is True
+    _same_stat_rewrite(image, b"\x89PNG\r\n\x1a\n\x00\x00\x00BBBB")
+    assert service.status().current is False
+
+
+def test_oversized_content_change_preserving_size_and_mtime_invalidates_snapshot(
+    service, git_repo_with_commit,
+):
+    size = MAX_TEXT_FILE_BYTES + 1024
+    huge = git_repo_with_commit / "huge.txt"
+    huge.write_bytes(b"a" * size)
+    service.inspect(force=True)
+    assert service.status().current is True
+    _same_stat_rewrite(huge, b"b" * size)
+    assert service.status().current is False
+
+
+def test_restart_identifies_current_snapshot_with_dirty_worktree(git_repo_with_commit, state_root):
+    """§9: a durable snapshot taken while the worktree was dirty must
+    still be recognized as current after a fresh process restart --
+    the stronger content identity is itself restart-stable."""
+    (git_repo_with_commit / "scratch.txt").write_text("draft\n")
+    first = RepositoryIntelligenceService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        built = first.inspect()
+        assert built.working_tree_dirty is True
+    finally:
+        first.close()
+
+    restarted = RepositoryIntelligenceService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        status = restarted.status()
+        assert status.indexed and status.current
+        assert status.snapshot_id == built.snapshot_id
+    finally:
+        restarted.close()
+
+
+def test_probe_identity_deterministic_across_repeated_calls(git_repo_with_commit):
+    first = builder.probe_identity(git_repo_with_commit)
+    second = builder.probe_identity(git_repo_with_commit)
+    assert first.working_tree_fingerprint == second.working_tree_fingerprint
+    assert first.head_sha == second.head_sha
+
+    (git_repo_with_commit / "dirty.txt").write_text("wip\n")
+    third = builder.probe_identity(git_repo_with_commit)
+    fourth = builder.probe_identity(git_repo_with_commit)
+    assert third.working_tree_fingerprint == fourth.working_tree_fingerprint
+    assert third.working_tree_fingerprint != first.working_tree_fingerprint
+
+
+def test_probing_identity_never_mutates_the_repository(service, git_repo_with_commit):
+    (git_repo_with_commit / "extra.txt").write_text("evidence\n")
+    before_status = git(git_repo_with_commit, "status", "--porcelain")
+    before_stat = (git_repo_with_commit / "extra.txt").stat()
+    service.inspect()
+    service.status()
+    service.query("anything")
+    after_status = git(git_repo_with_commit, "status", "--porcelain")
+    after_stat = (git_repo_with_commit / "extra.txt").stat()
+    assert before_status == after_status
+    assert before_stat.st_mtime_ns == after_stat.st_mtime_ns
+    assert before_stat.st_size == after_stat.st_size
 
 
 # --- 4/5/6/7/8/9. deterministic, bounded, safe inventory --------------------

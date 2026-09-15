@@ -90,10 +90,31 @@ nothing, never a filename-similarity guess.
 
 A snapshot is bound to `(repo_id, worktree_id, head_sha,
 working_tree_dirty, working_tree_fingerprint)`. `working_tree_fingerprint`
-is a cheap `stat()`-only fingerprint (path, size, mtime — never file
-content) over the exact bounded candidate set, so a caller can detect
-that the working tree has changed since the snapshot was taken even
-when `head_sha` has not moved, without re-reading a single byte.
+is a **content-safe** identity (Phase 8.1a; `intelligence.builder`), not a
+bare `stat()` fingerprint — `stat()` metadata (path, size, mtime) is used
+only as an optimization hint elsewhere in this codebase, never as
+authoritative proof that a file's content is unchanged, because a file
+can be edited while its path, byte size, and mtime are all preserved:
+
+- **Clean working tree** (no tracked modification, no staged change, no
+  untracked path, no assume-unchanged/skip-worktree masking): the
+  fingerprint is `head_sha` alone. Git's own object model already makes
+  `head_sha` a complete content identity for every tracked file, so
+  nothing is read or stat()'d — this is the fast path for the common,
+  fully-committed case.
+- **Dirty working tree**: the fingerprint folds in `head_sha` plus a
+  real SHA-256 content hash (streamed, memory-bounded, uncapped by the
+  text-index size limits) of every dirty/untracked/masked path in the
+  bounded candidate set — a tracked deletion, a symlink retarget, and a
+  binary or oversized file's content change are all covered; a clean
+  tracked file still contributes nothing beyond `head_sha`. Only the
+  dirty subset is ever read from disk, however large the rest of the
+  repository is.
+
+So a caller can detect that the working tree has changed since the
+snapshot was taken even when `head_sha` has not moved — and, just as
+importantly, can never be fooled into reporting a stale snapshot as
+current merely because an edit happened to preserve size and mtime.
 `RepositoryIntelligenceService.status()`/`.query()`/`.build_context_pack()`
 never rebuild as a side effect — they read the latest durable snapshot
 and report `current`/`stale` honestly; only `.inspect()` (explicit, or
