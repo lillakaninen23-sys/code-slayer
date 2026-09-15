@@ -21,6 +21,7 @@ from code_slayer.planning.evidence import validate_plan_against_intelligence
 from code_slayer.planning.fake_planner import FakePlanner, FakePlannerError
 from code_slayer.planning.models import PlanState
 from code_slayer.planning.planner import (
+    PlannerFailureCategory,
     PlannerOutcome,
     PlannerRequest,
     PlannerResponse,
@@ -30,7 +31,12 @@ from code_slayer.planning.service import EngineeringPlanningService
 from code_slayer.planning.worker_planner import TOOL_NAME, WorkerAdapterPlanner
 from code_slayer.workers.fake_adapter import FakeWorkerAdapter
 from code_slayer.workers.prompt_analysis import EvidenceSource
-from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+from code_slayer.workers.protocol import (
+    WorkerAdapterError,
+    WorkerResponse,
+    WorkerResponseKind,
+    WorkerToolCall,
+)
 from code_slayer.workers.question_gate import ResolutionKind
 from tests.repo_helpers import git
 
@@ -172,14 +178,14 @@ def test_malformed_planner_output_rejected_safely(service):
         planner = FakePlanner([PlannerResponse(PlannerOutcome.MALFORMED, raw=str(bad))])
         record = service.create(original_request=REQUEST, planner=planner)
         assert record.state == PlanState.DRAFT.value
-        assert record.reason == "malformed_planner_output"
+        assert record.reason.startswith("malformed_planner_output:")
 
 
 def test_planner_returning_garbage_is_never_trusted(service):
     planner = FakePlanner(["not a PlannerResponse at all"])
     record = service.create(original_request=REQUEST, planner=planner)
     assert record.state == PlanState.DRAFT.value
-    assert record.reason == "malformed_planner_output"
+    assert record.reason.startswith("malformed_planner_output:")
 
 
 def test_parse_planner_output_rejects_unknown_and_wrong_shaped_fields():
@@ -399,8 +405,10 @@ def test_evidence_validation_is_pure_and_deterministic(git_repo_with_commit):
 
 
 # --- Planner protocol reuse of the existing worker transport ---------------
+# --- and Phase 8.2b failure-category distinguishability (items 11-15) ------
 
 def test_worker_adapter_planner_reuses_existing_protocol_validation():
+    """Test item 14: real, valid tool-call params become STRUCTURED."""
     params = {"goal": "Do it", "affected_files": [], "ambiguities": []}
     adapter = FakeWorkerAdapter([
         WorkerResponse(kind=WorkerResponseKind.TOOL_CALL, tool_call=WorkerToolCall(
@@ -411,15 +419,35 @@ def test_worker_adapter_planner_reuses_existing_protocol_validation():
     response = planner.plan(PlannerRequest(original_request="Do it"))
     assert response.outcome == PlannerOutcome.STRUCTURED
     assert response.output.goal == "Do it"
+    assert response.failure_category is None  # no failure to categorize
+
+
+def test_worker_adapter_planner_text_response_remains_malformed():
+    """Test item 11: a plain TEXT response is MALFORMED, categorized as
+    a non-tool response -- exactly the observed live production
+    failure (`invalid_transport_response:text_response`)."""
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(kind=WorkerResponseKind.TEXT, text="Here is my implementation plan..."),
+    ])
+    planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
+    response = planner.plan(PlannerRequest(original_request="Do it"))
+    assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.NON_TOOL_RESPONSE
+    assert "text_response" in response.error
 
 
 def test_worker_adapter_planner_rejects_textual_tool_protocol_leakage():
+    """Test item 12: reserved textual pseudo-tool-call syntax leaking
+    into plain text is never recovered/parsed -- MALFORMED, same
+    NON_TOOL_RESPONSE category as any other non-genuine-tool-call
+    response."""
     adapter = FakeWorkerAdapter([
         WorkerResponse(kind=WorkerResponseKind.TEXT, text="<tool_call>{}</tool_call>"),
     ])
     planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
     response = planner.plan(PlannerRequest(original_request="Do it"))
     assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.NON_TOOL_RESPONSE
 
 
 def test_worker_adapter_planner_rejects_wrong_tool_name():
@@ -431,6 +459,88 @@ def test_worker_adapter_planner_rejects_wrong_tool_name():
     planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
     response = planner.plan(PlannerRequest(original_request="Do it"))
     assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.NON_TOOL_RESPONSE
+
+
+def test_worker_adapter_planner_transport_failure_is_categorized_distinctly():
+    """Test item 15 (part 1): `adapter_error:transport_timeout` is its
+    own distinct category, never confused with a response that arrived
+    but wasn't a valid tool call."""
+    adapter = FakeWorkerAdapter([WorkerAdapterError("transport_timeout")])
+    planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
+    response = planner.plan(PlannerRequest(original_request="Do it"))
+    assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.TRANSPORT_ERROR
+    assert "transport_timeout" in response.error
+
+
+def test_worker_adapter_planner_genuine_tool_call_with_malformed_params_is_schema_invalid():
+    """Test item 13: a *genuine*, authorized `emit_engineering_plan`
+    tool call whose own params fail `parse_planner_output()`'s strict
+    schema check is MALFORMED with its own distinct SCHEMA_INVALID
+    category -- never conflated with a transport or non-tool-response
+    failure."""
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(kind=WorkerResponseKind.TOOL_CALL, tool_call=WorkerToolCall(
+            tool=TOOL_NAME, params={"goal": "x", "unknown_field": 1},
+        )),
+    ])
+    planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
+    response = planner.plan(PlannerRequest(original_request="Do it"))
+    assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.SCHEMA_INVALID
+
+
+def test_three_failure_categories_are_all_distinct():
+    categories = {
+        PlannerFailureCategory.TRANSPORT_ERROR,
+        PlannerFailureCategory.NON_TOOL_RESPONSE,
+        PlannerFailureCategory.SCHEMA_INVALID,
+    }
+    assert len(categories) == 3
+
+
+def test_service_reason_distinguishes_all_three_failure_categories(service):
+    """Test item 15 (part 2): the durable, HTTP-visible `reason` field
+    a caller actually sees distinguishes all three categories end to
+    end through `EngineeringPlanningService`."""
+    cases = [
+        (FakeWorkerAdapter([WorkerAdapterError("transport_timeout")]), "transport_error"),
+        (FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text="prose")]),
+         "non_tool_response"),
+        (FakeWorkerAdapter([WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool=TOOL_NAME, params={"goal": "x", "bogus": 1}),
+        )]), "schema_invalid"),
+    ]
+    reasons = set()
+    for adapter, expected_suffix in cases:
+        planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
+        record = service.create(original_request=REQUEST, planner=planner)
+        assert record.state == PlanState.DRAFT.value
+        assert record.reason == f"malformed_planner_output:{expected_suffix}"
+        reasons.add(record.reason)
+    assert len(reasons) == 3  # all three genuinely distinguishable
+
+
+def test_raw_planner_output_never_appears_in_the_plan_record(service):
+    """Do not expose unsafe raw model output by default: `PlanRecord`
+    (what the HTTP API/WebUI ever sees) carries no `raw`/`error` field
+    at all -- only the coarse, code-owned `reason`. Full detail remains
+    durable internally only, via `planning.provenance.
+    store_planner_output()`."""
+    secret_looking_prose = "IMPLEMENTATION PLAN: rm -rf / # api_key=sk-should-never-leak"
+    adapter = FakeWorkerAdapter([
+        WorkerResponse(kind=WorkerResponseKind.TEXT, text=secret_looking_prose),
+    ])
+    planner = WorkerAdapterPlanner(adapter, task_id="plan-x")
+    record = service.create(original_request=REQUEST, planner=planner)
+    assert not hasattr(record, "raw")
+    assert not hasattr(record, "error")
+    import dataclasses
+
+    for value in dataclasses.asdict(record).values():
+        assert secret_looking_prose not in str(value)
 
 
 def test_fake_planner_exhaustion_raises_not_silently_repeats():

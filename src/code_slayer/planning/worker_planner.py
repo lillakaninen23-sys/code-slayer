@@ -45,14 +45,15 @@ which is bound to the pure, untouched original user request only (see
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 
 from code_slayer.planning.planner import (
     Planner,
+    PlannerFailureCategory,
     PlannerOutcome,
     PlannerRequest,
     PlannerResponse,
     parse_planner_output,
+    render_bounded_context,
 )
 from code_slayer.workers.protocol import (
     ToolRequirement,
@@ -76,15 +77,13 @@ _PLANNING_INSTRUCTION = (
 
 
 def _render_planning_prompt(request: PlannerRequest) -> str:
-    evidence = {
-        "repo_context": [asdict(p) for p in request.repo_context],
-        "discovered_commands": [asdict(c) for c in request.discovered_commands],
-        "context_pack": asdict(request.context_pack) if request.context_pack else None,
-    }
+    """`render_bounded_context()` (`planning.planner`) is the exact same
+    bounded-context view `planning.provenance.store_planner_input()`
+    durably records — the two never drift apart (Phase 8.2b)."""
     return (
         f"{_PLANNING_INSTRUCTION}\n\n"
         f"ORIGINAL_REQUEST:\n{request.original_request}\n\n"
-        f"REPOSITORY_CONTEXT:\n{json.dumps(evidence, sort_keys=True)}"
+        f"REPOSITORY_CONTEXT:\n{json.dumps(render_bounded_context(request), sort_keys=True)}"
     )
 
 
@@ -110,23 +109,29 @@ class WorkerAdapterPlanner:
         try:
             response = self._adapter.infer(worker_request)
         except WorkerAdapterError as exc:
-            return PlannerResponse(PlannerOutcome.MALFORMED, error=f"adapter_error:{exc}")
+            return PlannerResponse(
+                PlannerOutcome.MALFORMED, error=f"adapter_error:{exc}",
+                failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
+            )
 
         validation = validate_response(worker_request, response)
         if not validation.executable or validation.tool_call is None:
             return PlannerResponse(
                 PlannerOutcome.MALFORMED, raw=response.text or response.raw,
                 error=f"invalid_transport_response:{validation.reason}",
+                failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
             )
         if validation.tool_call.tool != TOOL_NAME:
             return PlannerResponse(
                 PlannerOutcome.MALFORMED, error=f"unexpected_tool_call:{validation.tool_call.tool}",
+                failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
             )
         raw_params = json.dumps(dict(validation.tool_call.params), sort_keys=True, default=str)
         structured = parse_planner_output(validation.tool_call.params)
         if structured is None:
             return PlannerResponse(
                 PlannerOutcome.MALFORMED, raw=raw_params, error="malformed_structured_output",
+                failure_category=PlannerFailureCategory.SCHEMA_INVALID,
             )
         return PlannerResponse(PlannerOutcome.STRUCTURED, output=structured, raw=raw_params)
 

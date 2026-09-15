@@ -104,7 +104,7 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | --- | --- |
 | `GET /api/plans?limit=100&offset=0` | `{plans: [...]}`; a plan summary/detail per entry (see below), newest first |
 | `GET /api/plans/{plan_id}` | Full plan detail: `state`, `effective_state` (`"STALE"` in place of `"READY"` when the repository has changed since binding), `reason`, revision/predecessor linkage, repository binding, `questions`, and full `content` |
-| `POST /api/plans` | `{request}` → 201 plan detail and `Location`; `503 planner_not_configured` if no server-side `Planner` is configured |
+| `POST /api/plans` | `{request}` → 201 plan detail and `Location`; `503 planner_not_configured` if no server-side `Planner` is configured. **Synchronous, tied to this one HTTP request** for the whole planning turn (can take tens of seconds to minutes against a real local model) — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#known-limitations) |
 | `POST /api/plans/{plan_id}/resume` | `{}` → re-evaluates the Question Gate against durable resolutions; never re-invokes the planner |
 | `POST /api/plans/{plan_id}/replan` | `{}` → creates a new revision (predecessor recorded), supersedes the old one, re-invokes the planner |
 | `POST /api/plans/{plan_id}/resolutions` | `{ambiguity_id, answer, resolution_kind: "FACT" or "AUTHORIZATION"}` → current plan detail through `record_user_resolution`; recording alone does not advance state — resume re-evaluates |

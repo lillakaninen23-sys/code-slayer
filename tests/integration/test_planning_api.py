@@ -126,7 +126,7 @@ def test_malformed_planner_output_surfaces_as_draft_over_http(git_repo_with_comm
     created = client.post("/api/plans", json={"request": REQUEST})
     assert created.status_code == 201
     assert created.json["state"] == "DRAFT"
-    assert created.json["reason"] == "malformed_planner_output"
+    assert created.json["reason"].startswith("malformed_planner_output:")
 
 
 def test_planning_over_http_never_mutates_repository_or_executes(git_repo_with_commit):

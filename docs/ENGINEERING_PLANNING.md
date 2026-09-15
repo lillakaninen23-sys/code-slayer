@@ -155,6 +155,61 @@ Production planning with no `Planner` configured fails explicitly
 (`APIError("planner_not_configured", ...)`, HTTP `503`) — it never
 silently falls back to a fake.
 
+## Planner-turn context budget (Phase 8.2b)
+
+A live production planning turn against a real local model (Devstral,
+over `OpenAICompatibleAdapter`) sent a durable planner input of
+**151211 bytes** with no explicit bound at all — `planning.service` was
+handing `RepositoryIntelligenceService.build_context_pack()` no
+`max_files`/`max_bytes`/`per_file_bytes` arguments, so it silently fell
+back to `intelligence.limits`'s own *indexing-pipeline* defaults
+(sized for a general-purpose context consumer, not one planner turn's
+prompt). Faced with that much prompt content, the model ignored the
+required structured `emit_engineering_plan` tool call entirely and
+emitted ~4 KB of free-form implementation prose instead, containing
+unsupported/hallucinated repository claims — observed as
+`invalid_transport_response:text_response`, twice.
+
+`planning.limits` now defines explicit, centralized, deterministic
+planner-turn bounds, deliberately separate from and tighter than
+`intelligence.limits`'s own indexing defaults:
+
+| Constant | Value |
+| --- | --- |
+| `PLANNER_MAX_FILES` | 8 |
+| `PLANNER_MAX_TOTAL_FILE_BYTES` | 32768 |
+| `PLANNER_MAX_PER_FILE_BYTES` | 8192 |
+
+`planning.service._run_planning_attempt()` passes these explicitly to
+`build_context_pack()` — never the Repository Intelligence query
+defaults. Byte limits only, never token estimation: tokenization is
+model/tokenizer-specific and non-deterministic across providers, so it
+can never be an authoritative boundary; `intelligence.query.
+build_context_pack()`'s own byte accounting (already deterministic and
+tested) is reused unchanged, never duplicated.
+
+Selection itself is unchanged from Phase 8.1: `intelligence.query.
+rank()`'s existing weighted order (exact path/symbol matches highest,
+then associated tests, then import neighbors, then generic project-
+config relevance) decides which evidence is *offered* to the budget;
+this phase only tightens how much of that already-ranked evidence one
+planner turn is ever handed, never re-ranks it.
+
+`planning.planner.render_bounded_context()` is the one, shared,
+deterministic JSON-safe view of a `PlannerRequest` — used identically
+by `WorkerAdapterPlanner` (what is actually sent to the model) and
+`planning.provenance.store_planner_input()` (what is durably recorded),
+so the two can never silently drift apart. It deliberately excludes
+`context_pack.projects`/`.commands` (`intelligence.query.
+build_context_pack()` copies `Snapshot.projects`/`.commands` onto every
+`ContextPack` for unrelated callers' convenience; a planner turn already
+receives those same facts exactly once via `PlannerRequest.
+repo_context`/`.discovered_commands` — repeating them a second time
+nested inside `context_pack` would be pure, unbounded-growth
+duplication) and the full `context_pack.omitted` path list (low-ranked/
+excluded files carry no positive evidence value; only their count is
+retained).
+
 ## Evidence validation
 
 `planning.evidence.validate_plan_against_intelligence(output, snapshot)`
@@ -178,6 +233,36 @@ already-built `intelligence.models.Snapshot`:
   `command_discovered`): checked directly against the snapshot's files/
   symbols/commands; an unsupported claim is dropped with an advisory
   issue, never blocking and never promoted.
+
+## Failure provenance (Phase 8.2b)
+
+`planning.planner.PlannerFailureCategory` is a stable, coarse,
+code-owned taxonomy of why one planning turn did not produce
+`PlannerOutcome.STRUCTURED`, set on `PlannerResponse.failure_category`
+by `WorkerAdapterPlanner`:
+
+- `TRANSPORT_ERROR` — the call to the model never produced a response
+  at all (`workers.protocol.WorkerAdapterError`: network/timeout/HTTP-
+  status/malformed-JSON failure at the transport layer).
+- `NON_TOOL_RESPONSE` — a response arrived, but it was not a valid,
+  authorized `emit_engineering_plan` tool call (plain `TEXT` — exactly
+  the observed live failure — textual tool-call-transport-syntax
+  leakage, a tool call naming something else, or an unauthorized/
+  malformed tool call).
+- `SCHEMA_INVALID` — the model *did* make a genuine, authorized
+  `emit_engineering_plan` tool call, but its own `params` failed
+  `parse_planner_output()`'s strict schema check.
+
+`planning.service` persists only this coarse category into the plan's
+durable, HTTP-visible `reason` field (`"malformed_planner_output:
+transport_error"` / `"...non_tool_response"` / `"...schema_invalid"`)
+— never `PlannerResponse.error`/`.raw` (the adapter's own raw text or
+tool-call params). The full detail remains durable internally only,
+in the content-addressed `planner_output_blob`
+(`planning.provenance.store_planner_output()`, `source_kind=
+"engineering_plan_planner_output"`) — inspectable by a caller with
+direct `ContentStore` access, never surfaced through `planning.service.
+PlanRecord` or the HTTP API by default.
 
 ## Question Gate integration
 
@@ -221,3 +306,21 @@ See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
   Phase 8 slices) — this phase produces a plan, never a verified diff.
 - No execution path exists that consumes a `READY` plan; that is a
   deliberately separate, later decision.
+- **`POST /api/plans` is synchronous and tied to the HTTP request**
+  (Phase 8.2b): a real planner turn against a local model can take
+  tens of seconds to minutes, held entirely on that one HTTP
+  connection/thread for its whole duration. A client that disconnects
+  or is suspended mid-request (e.g. a mobile browser backgrounding the
+  tab, or Safari's own aggressive request suspension) loses its
+  response, even though the plan itself may still complete durably
+  server-side (the plan row/content already exists once `create()`
+  returns — a client can always `GET /api/plans/{plan_id}` afterward to
+  see the actual outcome). This phase deliberately does not solve
+  durable background execution — that is explicitly out of scope here.
+  A later, dedicated slice must make planning turns a server-owned,
+  durable job (create → return immediately with a job/plan id in a
+  pending state → poll or receive a durable status update) so a
+  disconnecting client never affects execution, mirroring how `runner.
+  local_worker_runner.LocalWorkerRunner`'s own `RUNNING`/resume model
+  already decouples a bounded worker turn from any one HTTP request's
+  lifetime.

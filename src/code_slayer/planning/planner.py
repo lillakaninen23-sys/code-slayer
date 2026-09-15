@@ -55,7 +55,7 @@ validator directly for the underlying transport turn)."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Protocol
 
@@ -80,6 +80,80 @@ class PlannerRequest:
     discovered_commands: tuple[CommandCandidate, ...] = ()
     context_pack: ContextPack | None = None
     supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = ()
+
+
+def render_bounded_context(request: PlannerRequest) -> dict:
+    """The one, deterministic, JSON-safe bounded-context view of a
+    `PlannerRequest` — shared by `planning.worker_planner.
+    WorkerAdapterPlanner` (what actually gets sent to the model) and
+    `planning.provenance.store_planner_input()` (what gets durably
+    recorded), so the two can never silently drift apart (Phase 8.2b).
+
+    Deliberately **excludes** `request.context_pack.projects`/
+    `.commands` — `intelligence.query.build_context_pack()` copies
+    `Snapshot.projects`/`Snapshot.commands` onto every `ContextPack` for
+    its own, unrelated callers' convenience, but a planner turn already
+    receives those same facts exactly once via `request.repo_context`/
+    `request.discovered_commands` above; repeating them a second time
+    nested inside `context_pack` would be pure duplication, the exact
+    kind of unbounded-context growth that produced this phase's
+    151211-byte production failure (see `planning.limits`'s module
+    docstring). Also deliberately **excludes** the full `context_pack.
+    omitted` path list — the low-ranked/excluded files a planner turn
+    was not given carry no positive evidence value; only their count is
+    retained, so a caller can still see that truncation happened without
+    ever growing the prompt with names of files that were intentionally
+    left out."""
+    context_pack = None
+    if request.context_pack is not None:
+        pack = request.context_pack
+        context_pack = {
+            "files": [
+                {"path": f.path, "content": f.content, "truncated": f.truncated,
+                 "reasons": list(f.reasons)}
+                for f in pack.files
+            ],
+            "omitted_count": len(pack.omitted),
+            "budget_exhausted": pack.budget_exhausted,
+            "stale": pack.stale,
+        }
+    return {
+        "repo_context": [asdict(p) for p in request.repo_context],
+        "discovered_commands": [asdict(c) for c in request.discovered_commands],
+        "context_pack": context_pack,
+    }
+
+
+class PlannerFailureCategory(StrEnum):
+    """A stable, coarse, code-owned taxonomy of why one planning turn
+    did not produce `PlannerOutcome.STRUCTURED` — Phase 8.2b's own
+    requirement that a transport failure, a non-tool response (plain
+    text, an unauthorized/wrong tool call, textual tool-protocol
+    leakage), and a genuine tool call whose own parameters failed
+    `parse_planner_output()`'s strict schema check must remain
+    distinguishable in durable status/provenance, without ever exposing
+    raw model output through that same channel (see `planning.service`'s
+    use of this in the durable `reason` field, and `planning.
+    provenance.store_planner_output()` for where the full, raw detail —
+    `PlannerResponse.raw`/`.error` — is kept, internal-only).
+
+    `TRANSPORT_ERROR` — the call to the model never produced a response
+    at all (network/timeout/HTTP-status/malformed-JSON failure at the
+    transport layer, `workers.protocol.WorkerAdapterError`).
+    `NON_TOOL_RESPONSE` — a response was received, but it was not a
+    valid, authorized `emit_engineering_plan` tool call: plain `TEXT`
+    (exactly the observed live failure), textual tool-call-transport
+    syntax leaked into text, a tool call naming something else, or an
+    unauthorized/malformed tool call (`workers.protocol_validation.
+    validate_response()`'s own judgment).
+    `SCHEMA_INVALID` — the model *did* make a genuine, authorized
+    `emit_engineering_plan` tool call, but its own `params` did not pass
+    `parse_planner_output()`'s strict, whole-shape schema check.
+    """
+
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    NON_TOOL_RESPONSE = "NON_TOOL_RESPONSE"
+    SCHEMA_INVALID = "SCHEMA_INVALID"
 
 
 @dataclass(frozen=True)
@@ -156,12 +230,19 @@ class PlannerResponse:
     """`output` is populated only when `outcome == STRUCTURED`. `raw`
     is the adapter's own raw text/params, retained only for audit/
     provenance (`planning.provenance`) — never reparsed by anything
-    downstream of this module."""
+    downstream of this module, and never surfaced through `planning.
+    service.PlanRecord`/the HTTP API (Phase 8.2b — see `planning.
+    provenance.PLANNER_OUTPUT_EVIDENCE_KIND`, internal-only durable
+    storage). `failure_category`, populated whenever `outcome ==
+    MALFORMED`, is the stable, coarse `PlannerFailureCategory` a caller
+    may safely surface in durable status without leaking raw model
+    output — see that enum's own docstring."""
 
     outcome: PlannerOutcome
     output: PlannerStructuredOutput | None = None
     raw: str | None = None
     error: str | None = None
+    failure_category: PlannerFailureCategory | None = None
 
 
 class Planner(Protocol):

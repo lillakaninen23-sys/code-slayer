@@ -29,7 +29,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import asdict
 from pathlib import Path
 
 from code_slayer.planning.evidence import EvidenceValidationResult
@@ -38,7 +37,7 @@ from code_slayer.planning.models import (
     plan_content_from_dict,
     plan_content_to_dict,
 )
-from code_slayer.planning.planner import PlannerRequest, PlannerResponse
+from code_slayer.planning.planner import PlannerRequest, PlannerResponse, render_bounded_context
 from code_slayer.store.content_store import ContentBlob, ContentStore
 from code_slayer.workers.protocol import (
     WorkerSupplementalKind,
@@ -96,12 +95,16 @@ def store_planner_input(store: ContentStore, request: PlannerRequest) -> Content
     separately hashed) original request text itself — this document
     exists so a future training/evaluation export can see exactly what
     repository evidence the planner was given, without re-embedding the
-    user's own request a second time."""
+    user's own request a second time. Uses `planning.planner.
+    render_bounded_context()` — the exact same view actually rendered
+    into the model's prompt (Phase 8.2b) — so this durable record can
+    never silently diverge from what the planner really received, and
+    never duplicates `context_pack.projects`/`.commands` a second time
+    alongside `repo_context`/`discovered_commands` (see that function's
+    own docstring)."""
     document = {
         "original_request_length": len(request.original_request),
-        "repo_context": [asdict(p) for p in request.repo_context],
-        "discovered_commands": [asdict(c) for c in request.discovered_commands],
-        "context_pack": asdict(request.context_pack) if request.context_pack else None,
+        **render_bounded_context(request),
         "supplemental_resolutions": [
             _resolution_to_dict(r) for r in request.supplemental_resolutions
         ],
@@ -116,9 +119,15 @@ def store_planner_output(store: ContentStore, response: PlannerResponse) -> Cont
     """The planner's own raw structured response, exactly as received —
     kept distinct from the evidence-validated `EngineeringPlanContent`
     so a later reader can always see what the model actually said versus
-    what of that survived validation."""
+    what of that survived validation. Internal-only: `raw`/`error` are
+    never surfaced through `planning.service.PlanRecord`/the HTTP API
+    (Phase 8.2b) — only the coarse `failure_category` is (via
+    `planning.service`'s durable `reason` field)."""
     document = {
         "outcome": response.outcome.value, "raw": response.raw, "error": response.error,
+        "failure_category": (
+            response.failure_category.value if response.failure_category else None
+        ),
     }
     return store.put(
         _canonical(document), media_type="application/json",

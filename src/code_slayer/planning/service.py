@@ -87,6 +87,11 @@ from code_slayer.audit.writer import AuditWriter
 from code_slayer.intelligence.service import RepositoryIntelligenceService
 from code_slayer.planning import provenance
 from code_slayer.planning.evidence import validate_plan_against_intelligence
+from code_slayer.planning.limits import (
+    PLANNER_MAX_FILES,
+    PLANNER_MAX_PER_FILE_BYTES,
+    PLANNER_MAX_TOTAL_FILE_BYTES,
+)
 from code_slayer.planning.models import EngineeringPlanContent, OpenQuestion, PlanState
 from code_slayer.planning.planner import Planner, PlannerOutcome, PlannerRequest, PlannerResponse
 from code_slayer.repo import identity
@@ -410,7 +415,16 @@ class EngineeringPlanningService:
     ) -> PlanRecord:
         with self._intelligence() as intel:
             snapshot = intel.inspect()
-            context_pack = intel.build_context_pack(original_request)
+            # Planner-turn-specific bounds (`planning.limits`) — never
+            # the broader Repository Intelligence indexing/query
+            # defaults (`intelligence.limits`). Passing no bounds here
+            # is exactly what produced this phase's 151211-byte
+            # production failure; see `planning.limits`'s docstring.
+            context_pack = intel.build_context_pack(
+                original_request, max_files=PLANNER_MAX_FILES,
+                max_bytes=PLANNER_MAX_TOTAL_FILE_BYTES,
+                per_file_bytes=PLANNER_MAX_PER_FILE_BYTES,
+            )
         request = PlannerRequest(
             original_request=original_request, repo_context=snapshot.projects,
             discovered_commands=snapshot.commands, context_pack=context_pack,
@@ -435,7 +449,16 @@ class EngineeringPlanningService:
             )
 
         if response.outcome != PlannerOutcome.STRUCTURED or response.output is None:
-            return self._finish(plan_id, PlanState.DRAFT, "malformed_planner_output")
+            # Coarse, stable, code-owned category only -- never
+            # `response.error`/`.raw` (which may carry finer transport
+            # detail) in this durable, HTTP-visible `reason` field. Full
+            # detail remains internal-only in `planner_output_blob`
+            # above (Phase 8.2b).
+            category = (
+                response.failure_category.value.lower()
+                if response.failure_category else "unknown"
+            )
+            return self._finish(plan_id, PlanState.DRAFT, f"malformed_planner_output:{category}")
 
         validation = validate_plan_against_intelligence(response.output, snapshot)
         validation_blob = provenance.store_validation_result(store, validation)
