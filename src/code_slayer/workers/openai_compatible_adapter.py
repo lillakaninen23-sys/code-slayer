@@ -115,6 +115,7 @@ from code_slayer.workers.protocol import (
     WorkerResponse,
     WorkerResponseKind,
     WorkerToolCall,
+    WorkerUsage,
 )
 
 _DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -418,6 +419,13 @@ class OpenAICompatibleAdapter:
             # never a provider- or model-specific branch (see the module
             # docstring's "Phase 7.4c" section).
             payload["tool_choice"] = "required"
+        if request.max_output_tokens is not None:
+            if not isinstance(request.max_output_tokens, int) or request.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be a positive integer")
+            # Standard OpenAI-compatible `max_tokens` -- generic, never a
+            # provider- or model-specific branch (see `WorkerRequest.
+            # max_output_tokens`'s own docstring for who sets this today).
+            payload["max_tokens"] = request.max_output_tokens
         return payload
 
     def _tool_schemas_for(self, allowed_tools: tuple[str, ...] | None) -> list[dict]:
@@ -468,58 +476,99 @@ class OpenAICompatibleAdapter:
 
     # -- response mapping -------------------------------------------------
 
+    @staticmethod
+    def _parse_usage(body: dict) -> WorkerUsage | None:
+        """`None` unless the provider reported all three standard OpenAI-
+        compatible `usage` fields as integers -- never invented, never
+        partially reconstructed (see `WorkerUsage`'s own docstring)."""
+        usage = body.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if not all(isinstance(v, int) for v in (prompt_tokens, completion_tokens, total_tokens)):
+            return None
+        return WorkerUsage(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
     def _to_worker_response(self, body: dict) -> WorkerResponse:
+        usage = self._parse_usage(body)
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            return WorkerResponse(kind=WorkerResponseKind.MALFORMED, error="no_choices_in_response")
-        message = choices[0].get("message")
+            return WorkerResponse(
+                kind=WorkerResponseKind.MALFORMED, error="no_choices_in_response", usage=usage,
+            )
+        choice = choices[0]
+        finish_reason = choice.get("finish_reason")
+        finish_reason = finish_reason if isinstance(finish_reason, str) else None
+        message = choice.get("message")
         if not isinstance(message, dict):
-            return WorkerResponse(kind=WorkerResponseKind.MALFORMED, error="no_message_in_choice")
+            return WorkerResponse(
+                kind=WorkerResponseKind.MALFORMED, error="no_message_in_choice", usage=usage,
+                finish_reason=finish_reason,
+            )
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             # Bounded single-turn model: only the first tool call is
             # ever considered — no autonomous multi-call loop here.
-            return self._first_tool_call_to_response(tool_calls[0])
+            return self._first_tool_call_to_response(tool_calls[0], usage, finish_reason)
 
         content = message.get("content")
         if isinstance(content, str):
-            return WorkerResponse(kind=WorkerResponseKind.TEXT, text=content)
+            return WorkerResponse(
+                kind=WorkerResponseKind.TEXT, text=content, usage=usage,
+                finish_reason=finish_reason,
+            )
 
         return WorkerResponse(
             kind=WorkerResponseKind.MALFORMED, error="empty_message_no_content_no_tool_calls",
+            usage=usage, finish_reason=finish_reason,
         )
 
-    def _first_tool_call_to_response(self, tool_call: object) -> WorkerResponse:
+    def _first_tool_call_to_response(
+        self, tool_call: object, usage: WorkerUsage | None = None,
+        finish_reason: str | None = None,
+    ) -> WorkerResponse:
         if not isinstance(tool_call, dict):
             return WorkerResponse(
-                kind=WorkerResponseKind.MALFORMED, error="tool_call_not_an_object",
+                kind=WorkerResponseKind.MALFORMED, error="tool_call_not_an_object", usage=usage,
+                finish_reason=finish_reason,
             )
         function = tool_call.get("function")
         if not isinstance(function, dict):
             return WorkerResponse(
-                kind=WorkerResponseKind.MALFORMED, error="tool_call_missing_function",
+                kind=WorkerResponseKind.MALFORMED, error="tool_call_missing_function", usage=usage,
+                finish_reason=finish_reason,
             )
         name = function.get("name")
         raw_arguments = function.get("arguments")
         if not isinstance(name, str) or not name:
             return WorkerResponse(
                 kind=WorkerResponseKind.MALFORMED, error="tool_call_name_missing_or_empty",
+                usage=usage, finish_reason=finish_reason,
             )
         if not isinstance(raw_arguments, str):
             return WorkerResponse(
                 kind=WorkerResponseKind.MALFORMED, error="tool_call_arguments_not_a_string",
+                usage=usage, finish_reason=finish_reason,
             )
         try:
             params = json.loads(raw_arguments)
         except json.JSONDecodeError:
             return WorkerResponse(
                 kind=WorkerResponseKind.MALFORMED, error="tool_call_arguments_not_valid_json",
+                usage=usage, finish_reason=finish_reason,
             )
         if not isinstance(params, dict):
             return WorkerResponse(
                 kind=WorkerResponseKind.MALFORMED, error="tool_call_arguments_not_an_object",
+                usage=usage, finish_reason=finish_reason,
             )
         return WorkerResponse(
             kind=WorkerResponseKind.TOOL_CALL, tool_call=WorkerToolCall(tool=name, params=params),
+            usage=usage, finish_reason=finish_reason,
         )

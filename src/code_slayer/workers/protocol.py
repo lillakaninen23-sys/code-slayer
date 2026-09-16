@@ -230,6 +230,16 @@ class WorkerRequest:
     tools available (`allowed_tools` non-empty) never implies a demand
     to use one. Only a caller that specifically needs proof a structured
     tool call can be produced sets `REQUIRED` — see `ToolRequirement`.
+
+    `max_output_tokens` (Phase 8.2e's qualification context-adequacy
+    hardening), when set, maps to the standard OpenAI-compatible
+    `max_tokens` request field (`workers.openai_compatible_adapter.
+    OpenAICompatibleAdapter._build_payload()`) — a genuine, provider-
+    neutral, generic completion-length cap, never a model-specific hack.
+    `None` (the default) omits it entirely, exactly as every ordinary
+    production task turn already behaves; only `planning.qualification`
+    ever sets this, to make a qualification run's own output budget a
+    real, runtime-enforced limit rather than pure bookkeeping.
     """
 
     task_id: str
@@ -239,6 +249,20 @@ class WorkerRequest:
     prior_tool_result: WorkerToolResult | None = None
     tool_requirement: ToolRequirement = ToolRequirement.OPTIONAL
     supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = ()
+    max_output_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class WorkerUsage:
+    """Token accounting the provider itself reported for one turn —
+    read-only evidence only, never authoritative for anything beyond
+    diagnostics/qualification measurement (`planning.qualification`).
+    `WorkerResponse.usage` is `None` whenever a provider/adapter does not
+    report it — never invented, never estimated here."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
 
 
 @dataclass(frozen=True)
@@ -246,13 +270,24 @@ class WorkerResponse:
     """One inference response, exactly as the adapter itself classified
     it. Exactly one of `text`/`tool_call` is meaningful, selected by
     `kind` — the others are `None`. `raw` and `error` are opaque
-    evidence only (never parsed by anything that reads this object)."""
+    evidence only (never parsed by anything that reads this object).
+    `usage`, when the provider reports it, is real token accounting for
+    this exact call — see `WorkerUsage`. `finish_reason`, when the
+    provider reports it (the standard OpenAI-compatible field, e.g.
+    `"stop"`/`"length"`/`"tool_calls"`), is read-only evidence of *why*
+    generation ended — `"length"` means the completion was cut off by a
+    token cap (the caller's own `max_output_tokens` or the runtime's own
+    default), which `planning.qualification` uses to distinguish a
+    genuinely malformed/irrelevant response from one that was simply
+    truncated before it could finish; never itself interpreted here."""
 
     kind: WorkerResponseKind
     text: str | None = None
     tool_call: WorkerToolCall | None = None
     raw: str | None = None
     error: str | None = None
+    usage: WorkerUsage | None = None
+    finish_reason: str | None = None
 
 
 class WorkerAdapter(Protocol):

@@ -282,7 +282,7 @@ def test_worker_request_has_no_endpoint_controlling_field():
     field_names = {f.name for f in fields(WorkerRequest)}
     assert field_names == {
         "task_id", "role", "original_prompt", "allowed_tools", "prior_tool_result",
-        "tool_requirement", "supplemental_resolutions",
+        "tool_requirement", "supplemental_resolutions", "max_output_tokens",
     }
 
 
@@ -600,3 +600,118 @@ def test_supplemental_resolutions_precede_prior_tool_result_message(server):
     assert len(messages) == 3
     assert "the answer" in messages[1]["content"]
     assert "file contents" in messages[2]["content"]
+
+
+# --- max_output_tokens / usage (Phase 8.2e context-adequacy hardening) -----
+
+
+def test_max_output_tokens_is_omitted_by_default(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    sent = json.loads(script.last_request_body)
+    assert "max_tokens" not in sent
+
+
+def test_max_output_tokens_maps_to_standard_max_tokens_field(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    OpenAICompatibleAdapter(_config(base_url)).infer(_request(max_output_tokens=256))
+    sent = json.loads(script.last_request_body)
+    assert sent["max_tokens"] == 256
+
+
+def test_max_output_tokens_must_be_a_positive_integer(server):
+    _script, base_url = server
+    with pytest.raises(ValueError):
+        OpenAICompatibleAdapter(_config(base_url)).infer(_request(max_output_tokens=0))
+    with pytest.raises(ValueError):
+        OpenAICompatibleAdapter(_config(base_url)).infer(_request(max_output_tokens=-5))
+
+
+def test_usage_is_parsed_and_attached_to_the_response(server):
+    script, base_url = server
+    script.body = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    }).encode()
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    assert response.usage is not None
+    assert response.usage.prompt_tokens == 100
+    assert response.usage.completion_tokens == 20
+    assert response.usage.total_tokens == 120
+
+
+def test_usage_is_attached_for_a_tool_call_response_too(server):
+    script, base_url = server
+    script.body = json.dumps({
+        "choices": [{"message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+            }],
+        }}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55},
+    }).encode()
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED),
+    )
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.usage is not None
+    assert response.usage.total_tokens == 55
+
+
+def test_usage_is_none_when_the_provider_does_not_report_it(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    assert response.usage is None
+
+
+def test_malformed_usage_is_never_partially_reconstructed(server):
+    script, base_url = server
+    script.body = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 100},  # missing completion_tokens/total_tokens
+    }).encode()
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    assert response.usage is None
+
+
+def test_finish_reason_is_threaded_through_for_text_responses(server):
+    script, base_url = server
+    script.body = json.dumps({
+        "choices": [{
+            "message": {"role": "assistant", "content": "ok"}, "finish_reason": "length",
+        }],
+    }).encode()
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    assert response.finish_reason == "length"
+
+
+def test_finish_reason_is_threaded_through_for_tool_call_responses(server):
+    script, base_url = server
+    script.body = json.dumps({
+        "choices": [{
+            "message": {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }).encode()
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED),
+    )
+    assert response.finish_reason == "tool_calls"
+
+
+def test_finish_reason_is_none_when_the_provider_does_not_report_it(server):
+    script, base_url = server
+    _respond(script, {"role": "assistant", "content": "ok"})
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(_request())
+    assert response.finish_reason is None

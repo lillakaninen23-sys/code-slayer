@@ -60,6 +60,7 @@ from code_slayer.workers.protocol import (
     WorkerAdapter,
     WorkerAdapterError,
     WorkerRequest,
+    WorkerToolResult,
 )
 from code_slayer.workers.protocol_validation import validate_response
 
@@ -100,11 +101,23 @@ class WorkerAdapterPlanner:
         self._role = role
 
     def plan(self, request: PlannerRequest) -> PlannerResponse:
+        # `prior_attempt_feedback` (Phase 8.2e qualification self-
+        # correction extension) reuses the *existing* "one prior tool
+        # result" transport unchanged -- see `PlannerRequest`'s own
+        # docstring. `None` here (every ordinary production planning
+        # turn) means `prior_tool_result` stays `None`, exactly as
+        # before this field existed.
+        prior_tool_result = (
+            WorkerToolResult(tool=TOOL_NAME, output_summary=request.prior_attempt_feedback)
+            if request.prior_attempt_feedback is not None else None
+        )
         worker_request = WorkerRequest(
             task_id=self._task_id, role=self._role,
             original_prompt=_render_planning_prompt(request),
             allowed_tools=(TOOL_NAME,), tool_requirement=ToolRequirement.REQUIRED,
             supplemental_resolutions=request.supplemental_resolutions,
+            prior_tool_result=prior_tool_result,
+            max_output_tokens=request.output_token_budget,
         )
         try:
             response = self._adapter.infer(worker_request)
@@ -120,20 +133,26 @@ class WorkerAdapterPlanner:
                 PlannerOutcome.MALFORMED, raw=response.text or response.raw,
                 error=f"invalid_transport_response:{validation.reason}",
                 failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
+                usage=response.usage, finish_reason=response.finish_reason,
             )
         if validation.tool_call.tool != TOOL_NAME:
             return PlannerResponse(
                 PlannerOutcome.MALFORMED, error=f"unexpected_tool_call:{validation.tool_call.tool}",
-                failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
+                failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE, usage=response.usage,
+                finish_reason=response.finish_reason,
             )
         raw_params = json.dumps(dict(validation.tool_call.params), sort_keys=True, default=str)
         structured = parse_planner_output(validation.tool_call.params)
         if structured is None:
             return PlannerResponse(
                 PlannerOutcome.MALFORMED, raw=raw_params, error="malformed_structured_output",
-                failure_category=PlannerFailureCategory.SCHEMA_INVALID,
+                failure_category=PlannerFailureCategory.SCHEMA_INVALID, usage=response.usage,
+                finish_reason=response.finish_reason,
             )
-        return PlannerResponse(PlannerOutcome.STRUCTURED, output=structured, raw=raw_params)
+        return PlannerResponse(
+            PlannerOutcome.STRUCTURED, output=structured, raw=raw_params, usage=response.usage,
+            finish_reason=response.finish_reason,
+        )
 
 
 # Satisfy the `Planner` structural protocol explicitly for readability;

@@ -61,7 +61,7 @@ from typing import Protocol
 
 from code_slayer.intelligence.models import CommandCandidate, ContextPack, ProjectEvidence
 from code_slayer.workers.prompt_analysis import Ambiguity, AmbiguityRiskClass
-from code_slayer.workers.protocol import WorkerSupplementalResolution
+from code_slayer.workers.protocol import WorkerSupplementalResolution, WorkerUsage
 
 
 @dataclass(frozen=True)
@@ -73,13 +73,39 @@ class PlannerRequest:
     `supplemental_resolutions`, when non-empty, carries durable, already
     Question-Gate-verified answers to ambiguities raised on an earlier
     `replan()` attempt for this same plan lineage — never merged into
-    `original_request` itself."""
+    `original_request` itself.
+
+    `prior_attempt_feedback` (Phase 8.2e's qualification self-correction
+    extension), when set, is a short, deterministic, code-generated
+    diagnostic describing exactly why an earlier attempt at this *same*
+    planning turn was rejected and what to correct — never model prose,
+    never itself the answer to the underlying task. It is threaded
+    through to `workers.protocol.WorkerRequest.prior_tool_result` by
+    `planning.worker_planner.WorkerAdapterPlanner` unchanged — reusing
+    that existing "one prior tool result" transport rather than adding a
+    second one. `None` (the default) is what every ordinary planning
+    turn uses today; nothing in `planning.service.
+    EngineeringPlanningService` ever sets this field, so production
+    planning behavior is completely unchanged by its existence. Only
+    `planning.qualification`'s retry harness constructs a `PlannerRequest`
+    with this field set.
+
+    `output_token_budget` (Phase 8.2e's context-adequacy hardening), when
+    set, is threaded unchanged to `workers.protocol.WorkerRequest.
+    max_output_tokens` — a genuine, runtime-enforced completion-length
+    cap (standard OpenAI-compatible `max_tokens`), not just bookkeeping.
+    `None` (the default) omits it entirely, exactly like every ordinary
+    production planning turn today; only `planning.qualification` ever
+    sets this, and only when its own `RuntimeContextProfile` says
+    enforcement has actually been verified for the runtime in use."""
 
     original_request: str
     repo_context: tuple[ProjectEvidence, ...] = ()
     discovered_commands: tuple[CommandCandidate, ...] = ()
     context_pack: ContextPack | None = None
     supplemental_resolutions: tuple[WorkerSupplementalResolution, ...] = ()
+    prior_attempt_feedback: str | None = None
+    output_token_budget: int | None = None
 
 
 def render_bounded_context(request: PlannerRequest) -> dict:
@@ -236,13 +262,26 @@ class PlannerResponse:
     storage). `failure_category`, populated whenever `outcome ==
     MALFORMED`, is the stable, coarse `PlannerFailureCategory` a caller
     may safely surface in durable status without leaking raw model
-    output — see that enum's own docstring."""
+    output — see that enum's own docstring. `usage`, when the underlying
+    adapter reported it (`workers.protocol.WorkerResponse.usage`), is
+    real, runtime-reported token accounting for this exact turn — used
+    by `planning.qualification` as evidence of what the runtime actually
+    evaluated (never, by itself, proof the full untruncated request
+    survived — see that module's own "expected vs. actual" section).
+    `finish_reason`, when reported, distinguishes a response the model
+    completed on its own (`"stop"`/`"tool_calls"`) from one cut short by
+    a token cap (`"length"`) — `planning.qualification` uses this to
+    classify output-budget exhaustion separately from a genuine schema/
+    protocol failure, rather than trying to interpret truncated JSON as
+    if it were a deliberate malformed response."""
 
     outcome: PlannerOutcome
     output: PlannerStructuredOutput | None = None
     raw: str | None = None
     error: str | None = None
     failure_category: PlannerFailureCategory | None = None
+    usage: WorkerUsage | None = None
+    finish_reason: str | None = None
 
 
 class Planner(Protocol):
