@@ -189,10 +189,11 @@ from code_slayer.store import location
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.lease_repo import LeaseRepo, LeaseStatus
-from code_slayer.store.models import RunnerRun
+from code_slayer.store.models import RunnerRun, Worker
 from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.task_repo import TaskAlreadyActiveError, TaskRepo
 from code_slayer.store.tool_operations_repo import OperationStatus, ToolOperationsRepo
+from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.tools import file_tools as files
 from code_slayer.workers.cloud_escalation import CloudEscalationAuthorization
 from code_slayer.workers.execution import execute_guarded_turn
@@ -325,6 +326,19 @@ class LocalWorkerRunner:
         instance against the same primary repository reopens the exact
         same durable state — nothing here is held only in memory."""
         self._control_conn.close()
+
+    def register_worker(self, *, worker_id: str, kind: str, network_class: str) -> Worker:
+        """Idempotently register a worker in the control-plane `workers`
+        table (`store.workers_repo.WorkersRepo`) — the exact row `api.
+        service.ApplicationService.start()` requires to exist before a
+        run can even be created, and the same row `workers.trust.
+        WorkerTrustManager`/`workers.cloud_escalation` read from. Grants
+        no trust and no capability by itself: a freshly registered
+        worker starts with no conformance evidence and no trust history,
+        exactly like any other newly registered worker."""
+        return WorkersRepo(self._control_conn).register(
+            worker_id=worker_id, kind=kind, network_class=network_class,
+        )
 
     # -- audit ----------------------------------------------------------
 

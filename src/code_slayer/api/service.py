@@ -29,12 +29,36 @@ class APIError(Exception):
 
 
 @dataclass(frozen=True)
+class WorkerRegistration:
+    """One worker this runtime declares at server startup — the exact
+    `(worker_id, kind, network_class)` `store.workers_repo.WorkersRepo.
+    register()` needs. Declaring a worker here grants it no trust and no
+    qualification/certification of any kind: it only makes the worker
+    row exist so `ApplicationService.start()`'s existing `unknown_worker`
+    check (`reads.worker(worker_id) is None`) can pass, and so `workers.
+    trust.WorkerTrustManager`/`workers.cloud_escalation` have a real row
+    to read `network_class` from. Every actual capability/role
+    certification still comes entirely from conformance-gated trust
+    promotion (`workers.promotion.promote_from_conformance`), never from
+    this declaration."""
+
+    worker_id: str
+    kind: str
+    network_class: str
+
+
+@dataclass(frozen=True)
 class RuntimeBindings:
     """Server-owned factories; registration and trust remain existing backend work."""
 
     analyst_factory: Callable[[], PromptAnalyst] | None = None
     adapter_factory: Callable[[str, str], WorkerAdapter | None] | None = None
     planner_factory: Callable[[], object] | None = None
+    # Workers this runtime declares as existing (Phase: runtime
+    # integration). Registered idempotently once at `ApplicationService`
+    # construction -- never re-registered per request, and never itself
+    # a trust/qualification grant; see `WorkerRegistration`.
+    worker_registrations: tuple[WorkerRegistration, ...] = ()
     # Background planning executor tuning (Phase 8.2d) -- server
     # configuration only, never client-facing. Correctness over
     # throughput: one worker by default (see `planning.executor`'s
@@ -54,9 +78,16 @@ class ApplicationService:
         self.repo_path = Path(repo_path).resolve()
         self.state_root = state_root
         self.bindings = bindings or RuntimeBindings()
-        # Initialize through the real application service, including existing migrations.
-        with self.runner():
-            pass
+        # Initialize through the real application service, including existing
+        # migrations, and idempotently register every runtime-declared
+        # worker (never a trust/qualification grant — see
+        # `WorkerRegistration`) before anything else can reference it.
+        with self.runner() as runner:
+            for registration in self.bindings.worker_registrations:
+                runner.register_worker(
+                    worker_id=registration.worker_id, kind=registration.kind,
+                    network_class=registration.network_class,
+                )
         self.identity = identity.resolve(self.repo_path, create=False)
         # One long-lived background planning executor per process (Phase
         # 8.2d) -- never one per HTTP request. Only constructed/started

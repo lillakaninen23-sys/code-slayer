@@ -94,8 +94,10 @@ from code_slayer.workers.prompt_analysis import (
     EvidenceItem,
     EvidenceSource,
     PromptAnalysis,
+    PromptAnalysisFields,
     PromptAnalyst,
     hash_original_prompt,
+    parse_prompt_analysis_output,
 )
 from code_slayer.workers.prompt_provenance import PromptProvenance, record_prompt_analysis
 from code_slayer.workers.protocol import (
@@ -121,6 +123,10 @@ from code_slayer.workers.question_gate import (
     ResolutionKind,
 )
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
+from code_slayer.workers.worker_prompt_analyst import (
+    PromptAnalystError,
+    WorkerAdapterPromptAnalyst,
+)
 
 __all__ = [
     "Ambiguity",
@@ -139,7 +145,9 @@ __all__ = [
     "OpenAICompatibleAdapter",
     "OpenAICompatibleConfig",
     "PromptAnalysis",
+    "PromptAnalysisFields",
     "PromptAnalyst",
+    "PromptAnalystError",
     "PromptProvenance",
     "QuestionGate",
     "QuestionGateResult",
@@ -153,6 +161,7 @@ __all__ = [
     "ValidationResult",
     "WorkerAdapter",
     "WorkerAdapterError",
+    "WorkerAdapterPromptAnalyst",
     "WorkerRequest",
     "WorkerResponse",
     "WorkerResponseKind",
@@ -161,6 +170,7 @@ __all__ = [
     "WorkerTrustManager",
     "execute_guarded_turn",
     "hash_original_prompt",
+    "parse_prompt_analysis_output",
     "promote_from_conformance",
     "record_prompt_analysis",
     "run_conformance_suite",

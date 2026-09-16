@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from code_slayer.api import create_app
-from code_slayer.api.service import RuntimeBindings
+from code_slayer.api.service import RuntimeBindings, WorkerRegistration
 from code_slayer.audit.events import EventType
 from code_slayer.audit.verify import verify_chain
 from code_slayer.audit.writer import AuditWriter
@@ -18,6 +18,8 @@ from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.prompt_analysis import Ambiguity, AmbiguityRiskClass, PromptAnalysis
 from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
 from code_slayer.workers.question_gate import ResolutionKind
+from code_slayer.workers.worker_prompt_analyst import TOOL_NAME as ANALYST_TOOL_NAME
+from code_slayer.workers.worker_prompt_analyst import WorkerAdapterPromptAnalyst
 from tests.repo_helpers import git
 
 PROMPT = "Read README.md."
@@ -566,3 +568,72 @@ def test_api_intelligence_never_executes_or_mutates(setup):
     after_audit = runner._control_conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
     assert after_audit == before_audit
     runner.close()
+
+
+# -- Runtime integration: `RuntimeBindings.worker_registrations` +           --
+# -- `WorkerAdapterPromptAnalyst`, the real (non-fake) production analyst    --
+
+def test_worker_registrations_binding_registers_worker_at_startup(git_repo_with_commit):
+    """A worker declared via `RuntimeBindings.worker_registrations` must
+    be usable through the ordinary HTTP API without any separate manual
+    `WorkersRepo.register()` step -- the exact gap that otherwise makes
+    `POST /api/runs` fail `unknown_worker` even once `analyst_factory`/
+    `adapter_factory` are both configured."""
+    repo = git_repo_with_commit
+    analysis_adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool=ANALYST_TOOL_NAME, params={"goals": ["demo"]}),
+        ),
+    ])
+    execution_adapter = FakeWorkerAdapter([text_response("done")])
+    analyst = WorkerAdapterPromptAnalyst(analysis_adapter, task_id="analysis-run")
+    bindings = RuntimeBindings(
+        analyst_factory=lambda: analyst,
+        adapter_factory=lambda worker_id, role: execution_adapter,
+        worker_registrations=(
+            WorkerRegistration(worker_id=WORKER, kind="fake", network_class="local"),
+        ),
+    )
+    app = create_app(repo, bindings=bindings)
+    client = app.test_client()
+
+    health = client.get("/api/health").json
+    assert health["actions"] == {
+        "start": True, "execution_configured": True, "planning_configured": False,
+    }
+
+    response = start(client)
+    assert response.status_code == 201
+    assert response.json["status"] == "COMPLETED"
+    # The real `WorkerAdapterPromptAnalyst` actually called the configured
+    # adapter -- this is not `FakePromptAnalyst` standing in for it.
+    assert len(analysis_adapter.calls) == 1
+    assert len(execution_adapter.calls) == 1
+
+
+def test_worker_registration_alone_grants_no_trust(git_repo_with_commit):
+    """Declaring a worker via `worker_registrations` must never itself
+    authorize a tool call: a freshly registered worker still starts
+    `LOCKED`, so a run whose model actually requests `read_file` is
+    denied exactly as it would be for any other unqualified worker."""
+    repo = git_repo_with_commit
+    analysis_adapter = FakeWorkerAdapter([
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool=ANALYST_TOOL_NAME, params={}),
+        ),
+    ])
+    execution_adapter = FakeWorkerAdapter([read_response()])
+    analyst = WorkerAdapterPromptAnalyst(analysis_adapter, task_id="analysis-run")
+    bindings = RuntimeBindings(
+        analyst_factory=lambda: analyst,
+        adapter_factory=lambda worker_id, role: execution_adapter,
+        worker_registrations=(
+            WorkerRegistration(worker_id=WORKER, kind="fake", network_class="local"),
+        ),
+    )
+    client = create_app(repo, bindings=bindings).test_client()
+    response = start(client)
+    assert response.status_code == 201
+    assert response.json["status"] == "DENIED_TRUST"

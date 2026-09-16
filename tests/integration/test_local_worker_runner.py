@@ -119,6 +119,38 @@ def guarded_runner(runner):
     return runner
 
 
+# --- register_worker(): the runtime-integration registration entry point ---
+
+def test_register_worker_makes_an_unknown_worker_startable(primary):
+    """`api.service.ApplicationService` registers every runtime-declared
+    `WorkerRegistration` through exactly this method at startup -- an
+    unregistered `worker_id` must not be usable beforehand."""
+    r = LocalWorkerRunner(primary)
+    try:
+        assert WorkersRepo(r._control_conn).get("brand-new-worker") is None
+        worker = r.register_worker(
+            worker_id="brand-new-worker", kind="openai_compatible", network_class="local",
+        )
+        assert worker.worker_id == "brand-new-worker"
+        assert worker.network_class == "local"
+        assert WorkersRepo(r._control_conn).get("brand-new-worker") is not None
+    finally:
+        r.close()
+
+
+def test_register_worker_is_idempotent_and_grants_no_trust(primary):
+    r = LocalWorkerRunner(primary)
+    try:
+        r.register_worker(worker_id=WORKER_ID, kind="fake", network_class="local")
+        r.register_worker(worker_id=WORKER_ID, kind="fake", network_class="local")
+        worker = WorkersRepo(r._control_conn).get(WORKER_ID)
+        assert worker is not None
+        trust = WorkerTrustManager(r._control_conn).current_trust(WORKER_ID, ROLE, "read_file")
+        assert trust == TrustLevel.LOCKED
+    finally:
+        r.close()
+
+
 # --- 1/2. exact original prompt / hash durability ---------------------------
 
 def test_exact_original_prompt_persists_unchanged(runner):

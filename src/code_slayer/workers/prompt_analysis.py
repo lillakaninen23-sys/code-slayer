@@ -84,7 +84,7 @@ advisory/decision component only.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -246,3 +246,109 @@ class PromptAnalyst(Protocol):
     protocol.WorkerAdapter`'s own pattern."""
 
     def analyze(self, original_prompt: str, evidence: EvidenceContext) -> PromptAnalysis: ...
+
+
+# -- structured output parsing: strict schema, never heuristic prose --------
+#
+# Mirrors `planning.planner.parse_planner_output()`'s own "strict,
+# whole-shape schema validation, never a partial/best-effort
+# reconstruction" discipline exactly, applied to `PromptAnalysis`
+# instead of `PlannerStructuredOutput` — the schema this exact module
+# owns, so its parser lives here rather than beside whichever adapter
+# happens to produce raw model output (`workers.worker_prompt_analyst.
+# WorkerAdapterPromptAnalyst` today). Deliberately duplicated, rather
+# than imported, from `planning.planner`'s equivalent helpers: `workers`
+# is a lower layer than `planning` and must not depend on it (the same
+# "mirrors... without importing" posture `WorkerSupplementalKind`/
+# `WorkerSupplementalSource` already use against `workers.question_gate`/
+# this module's own `EvidenceSource`).
+
+
+@dataclass(frozen=True)
+class PromptAnalysisFields:
+    """Exactly the subset of `PromptAnalysis`'s own fields a model turn
+    may supply — `original_prompt` is deliberately excluded: only the
+    caller that actually holds the true original prompt text may ever
+    set that field (see `PromptAnalysis.__post_init__` and this module's
+    "the original prompt is authoritative" principle)."""
+
+    goals: tuple[str, ...] = ()
+    explicit_requirements: tuple[str, ...] = ()
+    constraints: tuple[str, ...] = ()
+    already_answered: tuple[str, ...] = ()
+    risk_points: tuple[str, ...] = ()
+    ambiguities: tuple[Ambiguity, ...] = ()
+
+
+def _is_str_tuple(value: object) -> bool:
+    return isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value)
+
+
+def _parse_ambiguity(item: object) -> Ambiguity | None:
+    if not isinstance(item, Mapping):
+        return None
+    id_, question, rationale = item.get("id"), item.get("question"), item.get("rationale")
+    risk = item.get("risk_class")
+    if not all(isinstance(v, str) and v for v in (id_, question, rationale)):
+        return None
+    if not isinstance(risk, str) or risk not in AmbiguityRiskClass.__members__:
+        return None
+    evidence_keys = item.get("evidence_keys", [])
+    if not _is_str_tuple(evidence_keys):
+        return None
+    substring = item.get("resolved_by_prompt_substring")
+    if substring is not None and not isinstance(substring, str):
+        return None
+    return Ambiguity(
+        id=id_, question=question, rationale=rationale,
+        risk_class=AmbiguityRiskClass(risk), evidence_keys=tuple(evidence_keys),
+        resolved_by_prompt_substring=substring,
+    )
+
+
+def _parse_list(items: object, parser) -> tuple | None:
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        return None
+    parsed = []
+    for item in items:
+        result = parser(item)
+        if result is None:
+            return None
+        parsed.append(result)
+    return tuple(parsed)
+
+
+_ALLOWED_FIELDS = frozenset({
+    "goals", "explicit_requirements", "constraints", "already_answered",
+    "risk_points", "ambiguities",
+})
+
+
+def parse_prompt_analysis_output(data: object) -> PromptAnalysisFields | None:
+    """Strict, whole-shape schema validation of one model turn's raw
+    `emit_prompt_analysis` tool-call parameters — `None` on anything
+    that does not exactly match, never a partial or best-effort
+    reconstruction (mirrors `planning.planner.parse_planner_output()`).
+    An unrecognized top-level field rejects the whole payload. The
+    caller (`workers.worker_prompt_analyst.WorkerAdapterPromptAnalyst`)
+    combines the result with the one true `original_prompt` string to
+    build a real `PromptAnalysis`."""
+    if not isinstance(data, Mapping):
+        return None
+    if set(data) - _ALLOWED_FIELDS:
+        return None
+    for key in ("goals", "explicit_requirements", "constraints", "already_answered",
+                "risk_points"):
+        if key in data and not _is_str_tuple(data[key]):
+            return None
+    ambiguities = _parse_list(data.get("ambiguities", []), _parse_ambiguity)
+    if ambiguities is None:
+        return None
+    return PromptAnalysisFields(
+        goals=tuple(data.get("goals", ())),
+        explicit_requirements=tuple(data.get("explicit_requirements", ())),
+        constraints=tuple(data.get("constraints", ())),
+        already_answered=tuple(data.get("already_answered", ())),
+        risk_points=tuple(data.get("risk_points", ())),
+        ambiguities=ambiguities,
+    )

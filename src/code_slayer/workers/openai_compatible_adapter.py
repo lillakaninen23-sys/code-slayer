@@ -42,14 +42,17 @@ handed to the model itself:
 
 ## Structured-output-only tool schemas grant no capability by existing
 
-`_TOOL_SCHEMAS` currently has two entries: `read_file` (a real,
+`_TOOL_SCHEMAS` currently has three entries: `read_file` (a real,
 `tools.executor.ToolExecutor`-backed capability — offering its schema is
 what lets a model *request* a read, still gated entirely by
 `workers.execution`/`policy.engine.PolicyEngine` downstream, never by
-this adapter) and `emit_engineering_plan` (Phase 8.2/8.2b —
+this adapter), `emit_prompt_analysis` (`workers.worker_prompt_analyst.
+WorkerAdapterPromptAnalyst`'s structured-output transport for one Prompt
+Analyst turn), and `emit_engineering_plan` (Phase 8.2/8.2b —
 `planning.worker_planner.WorkerAdapterPlanner`'s structured-output
-transport for one planning turn). Offering `emit_engineering_plan`'s
-schema is not itself a capability grant of any kind: this module has no
+transport for one planning turn). Offering `emit_prompt_analysis`'s or
+`emit_engineering_plan`'s schema is not itself a capability grant of any
+kind: this module has no
 `ToolExecutor`, `PolicyEngine`, lease, or checkpoint import anywhere,
 and a call naming it produces nothing but a `WorkerToolCall(tool=
 "emit_engineering_plan", params={...})` for `workers.protocol_
@@ -147,6 +150,72 @@ _TOOL_SCHEMAS: dict[str, dict] = {
                     },
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    # Structured-output-only transport for one Prompt Analyst turn
+    # (`workers.worker_prompt_analyst.WorkerAdapterPromptAnalyst`) — never
+    # a mutation/execution capability, and never itself authoritative
+    # over the original prompt (`workers.prompt_analysis`'s own "the
+    # original prompt is authoritative, analysis is not" principle).
+    # Field shape is kept in exact lockstep with `workers.prompt_
+    # analysis.parse_prompt_analysis_output()`'s own strict schema, the
+    # same "table offers it, function validates it" split
+    # `emit_engineering_plan`/`parse_planner_output()` already use below.
+    "emit_prompt_analysis": {
+        "type": "function",
+        "function": {
+            "name": "emit_prompt_analysis",
+            "description": (
+                "Return one complete structured analysis of the user's original prompt. "
+                "This tool only emits supplemental analysis and performs no mutation; it "
+                "never replaces, rewrites, or summarizes the original prompt."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goals": {"type": "array", "items": {"type": "string"}},
+                    "explicit_requirements": {"type": "array", "items": {"type": "string"}},
+                    "constraints": {"type": "array", "items": {"type": "string"}},
+                    "already_answered": {"type": "array", "items": {"type": "string"}},
+                    "risk_points": {"type": "array", "items": {"type": "string"}},
+                    "ambiguities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "question": {"type": "string"},
+                                "rationale": {"type": "string"},
+                                "risk_class": {
+                                    "type": "string",
+                                    "enum": [
+                                        "ROUTINE",
+                                        "MATERIAL",
+                                        "DESTRUCTIVE",
+                                        "EXTERNAL_SIDE_EFFECT",
+                                    ],
+                                },
+                                "evidence_keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "resolved_by_prompt_substring": {
+                                    "type": "string",
+                                },
+                            },
+                            "required": [
+                                "id",
+                                "question",
+                                "rationale",
+                                "risk_class",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [],
                 "additionalProperties": False,
             },
         },
