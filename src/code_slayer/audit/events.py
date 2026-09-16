@@ -169,3 +169,13 @@ class EventType(StrEnum):
     # decision" convention -- never a worker/model's own self-report, and
     # never fabricated merely to drive a UI.
     SECURITY_BASELINE_CERTIFICATE_RECORDED = "SECURITY_BASELINE_CERTIFICATE_RECORDED"
+    # Role Qualification Certification foundation: one durable role-
+    # specific certification decision recorded for a `(worker_id, role,
+    # runtime profile)` binding (`code_slayer.workers.role_qualification.
+    # record_role_certificate`) -- a SEPARATE dimension from
+    # SECURITY_BASELINE_CERTIFICATE_RECORDED (the mandatory,
+    # role-independent Security floor), WORKER_TRUST_CHANGED (execution
+    # authority), and WORKER_CONFORMANCE_RUN_STARTED/_FINALIZED
+    # (capability conformance). Covers PASS/FAIL alike via its own
+    # payload fields; never a worker/model's own self-report.
+    ROLE_QUALIFICATION_CERTIFICATE_RECORDED = "ROLE_QUALIFICATION_CERTIFICATE_RECORDED"

@@ -88,8 +88,7 @@ from code_slayer.workers.openai_compatible_adapter import (
 )
 from code_slayer.workers.production_eligibility import (
     EligibilityDecision,
-    RoleQualificationStatus,
-    is_worker_eligible,
+    evaluate_production_eligibility,
 )
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.prompt_analysis import (
@@ -128,6 +127,12 @@ from code_slayer.workers.question_gate import (
     ResolutionEvidence,
     ResolutionKind,
 )
+from code_slayer.workers.role_qualification import (
+    ProductionRole,
+    RoleCertificationResult,
+    RoleQualificationOutcome,
+    record_role_certificate,
+)
 from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
     HardDisqualifierCategory,
@@ -158,6 +163,7 @@ __all__ = [
     "HardDisqualifierCategory",
     "OpenAICompatibleAdapter",
     "OpenAICompatibleConfig",
+    "ProductionRole",
     "PromptAnalysis",
     "PromptAnalysisFields",
     "PromptAnalyst",
@@ -167,7 +173,8 @@ __all__ = [
     "QuestionGateResult",
     "ResolutionEvidence",
     "ResolutionKind",
-    "RoleQualificationStatus",
+    "RoleCertificationResult",
+    "RoleQualificationOutcome",
     "RuntimeProfileIdentity",
     "SecurityBaselineOutcome",
     "SecurityCertificationResult",
@@ -186,13 +193,14 @@ __all__ = [
     "WorkerToolCall",
     "WorkerToolResult",
     "WorkerTrustManager",
+    "evaluate_production_eligibility",
     "execute_guarded_turn",
     "hash_original_prompt",
-    "is_worker_eligible",
     "parse_prompt_analysis_output",
     "promote_from_conformance",
     "record_baseline_certificate",
     "record_prompt_analysis",
+    "record_role_certificate",
     "run_conformance_suite",
     "validate_response",
 ]

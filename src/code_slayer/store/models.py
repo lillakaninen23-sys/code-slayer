@@ -193,6 +193,46 @@ class WorkerBaselineSecurityCertificate:
 
 
 @dataclass(frozen=True)
+class WorkerRoleCertificate:
+    """One durable role-qualification certification decision (Role
+    Qualification Certification foundation —
+    migrations/0012_role_qualification_certification.sql). A SEPARATE
+    dimension from `WorkerTrustEvent` (execution authority),
+    `WorkerConformanceRun`/`WorkerConformanceResult` (capability
+    conformance), and `WorkerBaselineSecurityCertificate` (the
+    mandatory, role-independent Security floor) — see
+    `code_slayer.workers.role_qualification`'s module docstring.
+
+    Append-only: a re-evaluation, a different role, or the same
+    `(worker_id, role)` evaluated under a changed runtime profile or
+    `policy_version`, always creates a new row. The current certificate
+    for a given `(worker_id, role, runtime profile)` binding is
+    *derived* by finding the most recent row whose profile fields match
+    exactly — see `code_slayer.workers.production_eligibility`.
+
+    `evidence_ref` is required on every row, `PASS`/`FAIL` alike — a
+    certificate is never a bare boolean with no referenceable evidence.
+    `classification` preserves the richer, role-specific evidence detail
+    behind `outcome` (e.g. a Planner certification passes through
+    `planning.qualification.QualificationOutcome`'s own value, such as
+    `"PASS_FIRST_TRY"`/`"FAIL_POLICY"`)."""
+
+    certificate_id: str
+    worker_id: str
+    role: str
+    policy_version: str
+    model_tag: str
+    model_digest: str | None
+    endpoint: str | None
+    runtime_version: str | None
+    outcome: str
+    classification: str
+    evidence_ref: str
+    reason: str
+    issued_at: str
+
+
+@dataclass(frozen=True)
 class RunnerRun:
     """One durable application-level run record (Phase 7.7 —
     `runner.local_worker_runner.LocalWorkerRunner`). Always lives in the

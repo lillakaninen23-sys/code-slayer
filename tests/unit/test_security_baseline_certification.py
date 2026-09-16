@@ -1,17 +1,14 @@
 """Baseline Security Certification foundation: certificate
-representation/recording (`workers.security_baseline`) and the
-production-eligibility gate (`workers.production_eligibility`).
+representation/recording (`workers.security_baseline`).
 
-Core invariant under test throughout: production eligibility requires
-BOTH a valid Baseline Security Certificate AND a valid role-specific
-qualification result — a strong role-qualification result never
-compensates for a missing/failed/disqualifying certificate, and hard
-Security disqualifiers always win regardless of role-qualification
-strength."""
+`workers.production_eligibility`'s own tests (combining this with Role
+Qualification Certificates) live in
+`tests/unit/test_production_eligibility.py`."""
 
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -20,13 +17,8 @@ from code_slayer.audit.verify import verify_chain
 from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
 )
-from code_slayer.store.db import migrate
+from code_slayer.store.db import connect, migrate
 from code_slayer.store.workers_repo import WorkersRepo
-from code_slayer.workers.production_eligibility import (
-    EligibilityDecision,
-    RoleQualificationStatus,
-    is_worker_eligible,
-)
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
@@ -37,14 +29,6 @@ from code_slayer.workers.security_baseline import (
     record_baseline_certificate,
 )
 from code_slayer.workers.trust import TrustLevel, WorkerTrustManager
-
-
-class _FakeClock:
-    def __init__(self, start: str = "2026-01-01T00:00:00.000000Z") -> None:
-        self.now = start
-
-    def __call__(self) -> str:
-        return self.now
 
 
 @pytest.fixture
@@ -84,6 +68,24 @@ def _hard_disqualified(conn, worker_id, profile, *, evidence_ref="evidence-1", n
     )
 
 
+def _passing_conformance_responses():
+    from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+
+    return [
+        WorkerResponse(kind=WorkerResponseKind.TEXT, text="hi there"),
+        WorkerResponse(kind=WorkerResponseKind.TEXT, text="clean output"),
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
+        ),
+        WorkerResponse(kind=WorkerResponseKind.TEXT, text="continuing"),
+        WorkerResponse(
+            kind=WorkerResponseKind.TOOL_CALL,
+            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
+        ),
+    ]
+
+
 # -- RuntimeProfileIdentity: exact matching, no wildcards --------------------
 
 def test_runtime_profile_identity_requires_nonempty_model_tag():
@@ -104,6 +106,14 @@ def test_runtime_profile_identity_none_never_matches_a_set_value():
     b = RuntimeProfileIdentity(model_tag="m", model_digest="d1")
     assert not a.matches(b)
     assert not b.matches(a)
+
+
+def test_runtime_profile_identity_is_fully_specified_requires_every_field():
+    assert not RuntimeProfileIdentity(model_tag="m").is_fully_specified
+    assert not RuntimeProfileIdentity(model_tag="m", model_digest="d").is_fully_specified
+    assert RuntimeProfileIdentity(
+        model_tag="m", model_digest="d", endpoint="e", runtime_version="v",
+    ).is_fully_specified
 
 
 # -- record_baseline_certificate(): fail-closed validation -------------------
@@ -174,11 +184,9 @@ def test_malformed_runtime_profile_type_is_refused(db_conn, registered_worker):
     assert result == SecurityCertificationResult(False, "malformed_certificate_request")
 
 
-# -- persistence round-trip (item 12) ----------------------------------------
+# -- persistence round-trip -----------------------------------------------
 
 def test_certificate_round_trip_across_reopen(tmp_path):
-    from code_slayer.store.db import connect
-
     path = tmp_path / "state.db"
     conn = connect(path)
     migrate(conn)
@@ -203,20 +211,12 @@ def test_certificate_round_trip_across_reopen(tmp_path):
     assert fetched.outcome == "PASS"
     assert fetched.evidence_ref == "conformance-run-abc"
     assert fetched.baseline_version == BASELINE_VERSION
-
-    decision = is_worker_eligible(
-        reopened, worker_id="w1", role="coder", runtime_profile=profile_,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision.eligible
     reopened.close()
 
 
-# -- append-only schema (item 13 companion: migration/persistence) ----------
+# -- append-only schema -------------------------------------------------
 
 def test_certificate_table_is_append_only(db_conn, registered_worker, profile):
-    import sqlite3
-
     result = _pass(db_conn, registered_worker, profile)
     with pytest.raises(sqlite3.IntegrityError):
         db_conn.execute(
@@ -231,7 +231,7 @@ def test_certificate_table_is_append_only(db_conn, registered_worker, profile):
         )
 
 
-# -- audit/provenance (item 14) ----------------------------------------------
+# -- audit/provenance -----------------------------------------------------
 
 def test_recording_a_certificate_is_audited(db_conn, registered_worker, profile):
     result = _pass(db_conn, registered_worker, profile, reason="baseline_checks_passed")
@@ -266,7 +266,7 @@ def test_hard_disqualified_certificate_is_also_audited_with_its_categories(
     assert payload["hard_disqualifiers"] == ["POLICY_OR_GATE_BYPASS_ATTEMPT"]
 
 
-# -- registration/trust never fabricate a certificate (items 8, 9) ----------
+# -- registration/trust never fabricate a certificate ------------------------
 
 def test_worker_registration_creates_no_security_certificate(db_conn):
     WorkersRepo(db_conn).register(worker_id="fresh-worker", kind="fake", network_class="local")
@@ -290,7 +290,7 @@ def test_trust_promotion_creates_no_security_certificate(db_conn, registered_wor
     assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
 
 
-# -- certificate never mutates trust (item 10) -------------------------------
+# -- certificate never mutates trust -----------------------------------------
 
 def test_recording_any_certificate_outcome_never_changes_trust(db_conn, registered_worker, profile):
     manager = WorkerTrustManager(db_conn)
@@ -300,173 +300,3 @@ def test_recording_any_certificate_outcome_never_changes_trust(db_conn, register
     _hard_disqualified(db_conn, registered_worker, profile, evidence_ref="ev3")
     after = manager.current_trust(registered_worker, "coder", "read_file")
     assert before == after == TrustLevel.LOCKED
-
-
-# -- is_worker_eligible(): the core invariant (items 1-7) --------------------
-
-def test_role_qualification_alone_without_baseline_security_is_ineligible(
-    db_conn, registered_worker, profile,
-):
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(False, "no_baseline_security_certificate")
-
-
-def test_baseline_security_pass_alone_without_role_qualification_is_ineligible(
-    db_conn, registered_worker, profile,
-):
-    cert = _pass(db_conn, registered_worker, profile)
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.MISSING,
-    )
-    assert decision == EligibilityDecision(
-        False, "role_qualification_missing", certificate_id=cert.certificate.certificate_id,
-    )
-
-
-def test_both_valid_is_eligible(db_conn, registered_worker, profile):
-    cert = _pass(db_conn, registered_worker, profile)
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(
-        True, "eligible", certificate_id=cert.certificate.certificate_id,
-    )
-
-
-def test_security_fail_with_role_pass_is_ineligible(db_conn, registered_worker, profile):
-    """A good role-qualification score never compensates for a Security
-    FAIL."""
-    cert = _fail(db_conn, registered_worker, profile)
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(
-        False, "security_baseline_fail", certificate_id=cert.certificate.certificate_id,
-    )
-
-
-def test_hard_disqualifier_with_role_pass_is_ineligible(db_conn, registered_worker, profile):
-    """Hard Security disqualifiers win regardless of role-qualification
-    strength -- the literal core invariant."""
-    cert = _hard_disqualified(db_conn, registered_worker, profile)
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(
-        False, "security_hard_disqualifier", certificate_id=cert.certificate.certificate_id,
-    )
-
-
-def test_certificate_for_a_different_runtime_profile_is_ineligible(
-    db_conn, registered_worker, profile,
-):
-    """Item 6: a certificate exists, but for the WRONG runtime/profile."""
-    _pass(db_conn, registered_worker, profile)
-    different_profile = RuntimeProfileIdentity(model_tag="a-completely-different-model")
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=different_profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
-
-
-def test_stale_superseded_certificate_is_never_preferred_over_the_latest(
-    db_conn, registered_worker, profile,
-):
-    """Item 7: an older PASS for the exact same profile is superseded by
-    a later FAIL -- eligibility must reflect the latest evidence, never
-    silently reuse the earlier, now-stale PASS."""
-    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
-    _pass(db_conn, registered_worker, profile, now_fn=clock, evidence_ref="ev-old")
-    clock.now = "2026-01-02T00:00:00.000000Z"
-    _fail(db_conn, registered_worker, profile, now_fn=clock, evidence_ref="ev-new")
-
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert not decision.eligible
-    assert decision.reason == "security_baseline_fail"
-
-
-def test_a_later_pass_correctly_supersedes_an_earlier_hard_disqualifier(
-    db_conn, registered_worker, profile,
-):
-    """The reverse of the previous test: re-evaluation is not itself
-    forbidden, and the latest evidence always governs -- only the most
-    recent certificate for a matching profile is ever consulted."""
-    clock = _FakeClock("2026-01-01T00:00:00.000000Z")
-    _hard_disqualified(db_conn, registered_worker, profile, now_fn=clock, evidence_ref="ev-old")
-    clock.now = "2026-01-02T00:00:00.000000Z"
-    _pass(db_conn, registered_worker, profile, now_fn=clock, evidence_ref="ev-new")
-
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision.eligible
-
-
-def test_unknown_worker_is_ineligible(db_conn, profile):
-    decision = is_worker_eligible(
-        db_conn, worker_id="never-registered", role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert decision == EligibilityDecision(False, "unknown_worker")
-
-
-def test_malformed_eligibility_request_is_refused(db_conn, registered_worker, profile):
-    decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification="PASS",  # a plain string, not RoleQualificationStatus.PASS
-    )
-    assert decision == EligibilityDecision(False, "malformed_eligibility_request")
-
-
-# -- no transitive certification across roles (item 11) ---------------------
-
-def test_role_qualification_never_carries_across_roles(db_conn, registered_worker, profile):
-    """A PASS role_qualification supplied for 'planner' has no bearing
-    whatsoever on a separate eligibility check for 'coder' with the same
-    worker and the same valid Baseline Security certificate -- each call
-    supplies its own role_qualification independently, and there is no
-    shared/derived state connecting them."""
-    _pass(db_conn, registered_worker, profile)
-
-    planner_decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="planner", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.PASS,
-    )
-    assert planner_decision.eligible
-
-    coder_decision = is_worker_eligible(
-        db_conn, worker_id=registered_worker, role="coder", runtime_profile=profile,
-        role_qualification=RoleQualificationStatus.MISSING,
-    )
-    assert not coder_decision.eligible
-    assert coder_decision.reason == "role_qualification_missing"
-
-
-def _passing_conformance_responses():
-    from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
-
-    return [
-        WorkerResponse(kind=WorkerResponseKind.TEXT, text="hi there"),
-        WorkerResponse(kind=WorkerResponseKind.TEXT, text="clean output"),
-        WorkerResponse(
-            kind=WorkerResponseKind.TOOL_CALL,
-            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
-        ),
-        WorkerResponse(kind=WorkerResponseKind.TEXT, text="continuing"),
-        WorkerResponse(
-            kind=WorkerResponseKind.TOOL_CALL,
-            tool_call=WorkerToolCall(tool="read_file", params={"path": "README.md"}),
-        ),
-    ]

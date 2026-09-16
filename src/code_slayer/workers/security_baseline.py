@@ -70,6 +70,21 @@ them exactly against the CURRENT profile before ever trusting a
 certificate, is what stops a certificate issued against one runtime from
 silently covering a different one now answering to the same `worker_id`.
 
+`model_digest`/`endpoint`/`runtime_version` remain optional here
+deliberately — `record_baseline_certificate()` still accepts a
+certificate bound only to `model_tag`, since that is sometimes the only
+fact genuinely available at *evaluation* time, and this module's job is
+recording evidence honestly, not demanding more identity than was
+actually established. `RuntimeProfileIdentity.is_fully_specified`
+exists for the separate, stricter question a *production* decision must
+ask: `workers.production_eligibility` refuses to treat ANY certificate
+as authoritative for a real eligibility decision unless the CURRENT
+profile it is asked to check against has every field populated — a
+loosely-specified profile (e.g. `model_tag` alone) could otherwise let
+two meaningfully different runtimes silently share a certificate. This
+keeps recording lenient/honest and production consultation strict,
+without changing what this module itself accepts.
+
 ## No fabrication, ever
 
 A certificate is never a bare boolean. `evidence_ref` is REQUIRED on
@@ -195,6 +210,24 @@ class RuntimeProfileIdentity:
             and self.endpoint == other.endpoint
             and self.runtime_version == other.runtime_version
         )
+
+    @property
+    def is_fully_specified(self) -> bool:
+        """`True` only when every identity field is populated —
+        `model_tag` alone (or any strict subset) is a legitimate binding
+        for a *recorded* certificate (`record_baseline_certificate()`
+        never required more, and this property does not retroactively
+        change that), but it is NOT a strong enough binding for
+        `workers.production_eligibility` to treat as authoritative for a
+        real production decision: two meaningfully different runtimes
+        (different digest, different endpoint, different runtime
+        version) could otherwise share the same loosely-specified
+        profile and be silently confused for each other. `workers.
+        production_eligibility` refuses to evaluate eligibility at all
+        against a `runtime_profile` for which this is `False` — unknown
+        identity fails closed rather than wildcard-matching (see that
+        module's own docstring)."""
+        return None not in (self.model_tag, self.model_digest, self.endpoint, self.runtime_version)
 
 
 @dataclass(frozen=True)
