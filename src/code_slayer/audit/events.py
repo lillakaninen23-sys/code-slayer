@@ -158,3 +158,14 @@ class EventType(StrEnum):
     # own precedent: one event per decision, never a worker/model's own
     # self-report.
     FINALIZATION_DECIDED = "FINALIZATION_DECIDED"
+    # Baseline Security Certification foundation: one durable Baseline
+    # Security evaluation result recorded for a `(worker_id, runtime
+    # profile)` binding (`code_slayer.workers.security_baseline.
+    # record_baseline_certificate`) -- a SEPARATE dimension from
+    # WORKER_TRUST_CHANGED (execution authority) and
+    # WORKER_CONFORMANCE_RUN_STARTED/_FINALIZED (capability conformance).
+    # Covers PASS/FAIL/HARD_DISQUALIFIED alike via its own payload
+    # fields, mirroring RUN_FINISHED/PLAN_FINISHED's "one event per
+    # decision" convention -- never a worker/model's own self-report, and
+    # never fabricated merely to drive a UI.
+    SECURITY_BASELINE_CERTIFICATE_RECORDED = "SECURITY_BASELINE_CERTIFICATE_RECORDED"

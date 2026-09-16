@@ -86,6 +86,11 @@ from code_slayer.workers.openai_compatible_adapter import (
     OpenAICompatibleAdapter,
     OpenAICompatibleConfig,
 )
+from code_slayer.workers.production_eligibility import (
+    EligibilityDecision,
+    RoleQualificationStatus,
+    is_worker_eligible,
+)
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.prompt_analysis import (
     Ambiguity,
@@ -123,15 +128,25 @@ from code_slayer.workers.question_gate import (
     ResolutionEvidence,
     ResolutionKind,
 )
+from code_slayer.workers.security_baseline import (
+    BASELINE_VERSION,
+    HardDisqualifierCategory,
+    RuntimeProfileIdentity,
+    SecurityBaselineOutcome,
+    SecurityCertificationResult,
+    record_baseline_certificate,
+)
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
 from code_slayer.workers.worker_prompt_analyst import WorkerAdapterPromptAnalyst
 
 __all__ = [
+    "BASELINE_VERSION",
     "Ambiguity",
     "AmbiguityRiskClass",
     "CaseKind",
     "ConformanceRunStatus",
     "ConformanceSuiteResult",
+    "EligibilityDecision",
     "EvidenceContext",
     "EvidenceItem",
     "EvidenceSource",
@@ -140,6 +155,7 @@ __all__ = [
     "FakeWorkerAdapter",
     "FakeWorkerAdapterError",
     "GateDecision",
+    "HardDisqualifierCategory",
     "OpenAICompatibleAdapter",
     "OpenAICompatibleConfig",
     "PromptAnalysis",
@@ -151,6 +167,10 @@ __all__ = [
     "QuestionGateResult",
     "ResolutionEvidence",
     "ResolutionKind",
+    "RoleQualificationStatus",
+    "RuntimeProfileIdentity",
+    "SecurityBaselineOutcome",
+    "SecurityCertificationResult",
     "ToolRequirement",
     "TrustLevel",
     "TrustResult",
@@ -168,8 +188,10 @@ __all__ = [
     "WorkerTrustManager",
     "execute_guarded_turn",
     "hash_original_prompt",
+    "is_worker_eligible",
     "parse_prompt_analysis_output",
     "promote_from_conformance",
+    "record_baseline_certificate",
     "record_prompt_analysis",
     "run_conformance_suite",
     "validate_response",

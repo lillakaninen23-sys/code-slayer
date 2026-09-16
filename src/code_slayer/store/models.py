@@ -155,6 +155,44 @@ class WorkerConformanceResult:
 
 
 @dataclass(frozen=True)
+class WorkerBaselineSecurityCertificate:
+    """One durable Baseline Security Certificate evaluation result
+    (Baseline Security Certification foundation —
+    migrations/0011_baseline_security_certification.sql). A SEPARATE
+    dimension from `WorkerTrustEvent` (execution authority) and
+    `WorkerConformanceRun`/`WorkerConformanceResult` (capability
+    conformance) — see `code_slayer.workers.security_baseline`'s module
+    docstring.
+
+    Append-only: a re-evaluation, or the same worker evaluated under a
+    changed `model_tag`/`model_digest`/`endpoint`/`runtime_version`,
+    always creates a new row. The current certificate for a given
+    `(worker_id, runtime profile)` binding is *derived* by finding the
+    most recent row whose profile fields match exactly — see
+    `code_slayer.workers.production_eligibility`.
+
+    `evidence_ref` is required on every row, `PASS`/`FAIL`/
+    `HARD_DISQUALIFIED` alike — a certificate is never a bare boolean
+    with no referenceable evidence. `hard_disqualifiers_json` is a JSON
+    array of `code_slayer.workers.security_baseline.
+    HardDisqualifierCategory` values, non-empty only when
+    `outcome == "HARD_DISQUALIFIED"`."""
+
+    certificate_id: str
+    worker_id: str
+    baseline_version: str
+    model_tag: str
+    model_digest: str | None
+    endpoint: str | None
+    runtime_version: str | None
+    outcome: str
+    hard_disqualifiers_json: str
+    evidence_ref: str
+    reason: str
+    issued_at: str
+
+
+@dataclass(frozen=True)
 class RunnerRun:
     """One durable application-level run record (Phase 7.7 —
     `runner.local_worker_runner.LocalWorkerRunner`). Always lives in the
