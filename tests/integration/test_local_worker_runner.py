@@ -1517,3 +1517,321 @@ def test_audit_records_which_resolution_ids_informed_the_turn(runner):
     assert payload["supplemental_resolution_content_hashes"][0]  # a real, non-empty hash
     # No raw answer text ever lands in the audit payload -- hash/id only.
     assert "billing.py" not in _json.dumps(payload)
+
+
+# --- Deterministic Finalization: VERIFYING instead of direct COMPLETED -----
+
+def test_mutating_job_success_routes_to_verifying_not_direct_completed(guarded_runner):
+    """A worker turn completing without error (`outcome.ok`) still only
+    decides the *turn* is done -- `RunStatus.COMPLETED` -- never the job
+    itself. For a mutating job (not `bounded_read_only_turn`), the
+    underlying task now goes to `VERIFYING` and the finalizer decides the
+    rest from real evidence; here the fixture repository has no
+    repository-grounded verification command at all, so the deterministic,
+    evidence-based outcome is `BLOCKED` with a structured
+    `INVALID_ENVIRONMENT` reason_code -- not a guessed COMPLETED."""
+    import json as _json
+
+    WorkerTrustManager(guarded_runner._control_conn).promote_to_guarded(
+        worker_id=WORKER_ID, role=ROLE, capability="write_file",
+        reason="test_fixture_grant", evidence_ref="test-fixture",
+    )
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        requires_mutation=True, adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+
+    # The worker's own turn completed cleanly -- RunStatus is layered
+    # above, and independent of, TaskState (see runner/local_worker_runner
+    # .py's RunStatus docstring).
+    assert result.status == RunStatus.COMPLETED
+
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == "BLOCKED"
+        # BLOCKED is suspended, not terminal: the task still occupies its
+        # worktree's active slot.
+        assert TaskRepo(execution.conn).get_active_for_worktree(
+            row.execution_worktree_id,
+        ) is not None
+        lease = LeaseRepo(execution.conn).get(row.execution_worktree_id)
+        assert lease.status == "RELEASED"
+        assert verify_chain(execution.conn, task_id=row.task_id).ok
+
+        decided = execution.conn.execute(
+            "SELECT payload_json FROM audit_events WHERE task_id = ? "
+            "AND event_type = 'FINALIZATION_DECIDED' ORDER BY seq",
+            (row.task_id,),
+        ).fetchall()
+        assert len(decided) == 1
+        payload = _json.loads(decided[0]["payload_json"])
+        assert payload["verdict"] == "INVALID_ENVIRONMENT"
+        assert payload["reason_code"] == "no_verification_commands_grounded"
+        assert payload["verification"] == []
+
+        transition_rows = execution.conn.execute(
+            "SELECT payload_json FROM audit_events WHERE task_id = ? "
+            "AND event_type = 'STATE_TRANSITION' ORDER BY seq",
+            (row.task_id,),
+        ).fetchall()
+        to_states = [_json.loads(r["payload_json"])["to_state"] for r in transition_rows]
+        # IMPLEMENTING -> VERIFYING -> BLOCKED: never a direct jump to
+        # COMPLETED for a mutating job.
+        assert "VERIFYING" in to_states
+        assert "COMPLETED" not in to_states
+    finally:
+        execution.close()
+
+
+def test_bounded_read_only_turn_still_completes_directly(guarded_runner):
+    """Regression: a non-mutating (`bounded_read_only_turn`) job is
+    completely unaffected by Deterministic Finalization -- it still
+    completes directly, exactly as before."""
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+    assert result.status == RunStatus.COMPLETED
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == "COMPLETED"
+    finally:
+        execution.close()
+
+
+# --- Deterministic Finalization: finalizer exception path is fail-closed ---
+
+def test_finalizer_exception_is_contained_and_recorded_as_blocked(guarded_runner, monkeypatch):
+    """Item #4: an unexpected (non-FinalizationError) exception inside the
+    finalizer must never propagate out of the runner's public API, and
+    must never leave the task silently stuck at VERIFYING with no trace
+    -- it is durably recorded and the task is moved to BLOCKED with the
+    correct resume_target (VERIFYING), no new TaskState."""
+    import json as _json
+
+    from code_slayer.finalization.service import Finalizer
+
+    def boom(self, task_id, lease, **kwargs):
+        raise RuntimeError("simulated finalizer crash")
+
+    monkeypatch.setattr(Finalizer, "decide_after_verification", boom)
+
+    WorkerTrustManager(guarded_runner._control_conn).promote_to_guarded(
+        worker_id=WORKER_ID, role=ROLE, capability="write_file",
+        reason="test_fixture_grant", evidence_ref="test-fixture",
+    )
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        requires_mutation=True, adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+
+    # The runner call itself never raised -- the worker's own turn is
+    # still reported as having completed cleanly (RunStatus is layered
+    # above, and independent of, TaskState).
+    assert result.status == RunStatus.COMPLETED
+
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        task = execution.conn.execute(
+            "SELECT state, current_phase FROM tasks WHERE task_id = ?", (row.task_id,),
+        ).fetchone()
+        assert task["state"] == "BLOCKED"
+        assert task["current_phase"] == "VERIFYING"  # correct resume_target
+
+        decided = execution.conn.execute(
+            "SELECT payload_json FROM audit_events WHERE task_id = ? "
+            "AND event_type = 'FINALIZATION_DECIDED' ORDER BY seq",
+            (row.task_id,),
+        ).fetchall()
+        assert len(decided) == 1
+        payload = _json.loads(decided[0]["payload_json"])
+        assert payload["verdict"] == "BLOCKED"
+        assert payload["reason_code"] == "finalizer_exception:RuntimeError"
+        assert payload["exception_type"] == "RuntimeError"
+        assert "simulated finalizer crash" not in _json.dumps(payload)  # stable reason code only
+
+        lease = LeaseRepo(execution.conn).get(row.execution_worktree_id)
+        assert lease.status == "RELEASED"  # the finalizer's own lease was still released
+    finally:
+        execution.close()
+
+
+def test_finalizer_exception_never_writes_under_a_stale_lease(guarded_runner, monkeypatch):
+    """Item #4: if the finalizer's own lease has already gone stale by the
+    time the exception handler runs, it must write nothing at all --
+    never use a stale lease's authority, even just to record the
+    failure."""
+    from code_slayer.finalization.service import Finalizer
+    from code_slayer.lease.manager import LeaseManager
+
+    def boom(self, task_id, lease, **kwargs):
+        raise RuntimeError("simulated finalizer crash")
+
+    monkeypatch.setattr(Finalizer, "decide_after_verification", boom)
+    # Only the finalizer's own, distinctly-named lease is stale -- the
+    # worker turn's own lease checks (a different worker_id) are
+    # untouched, so only this scenario's specific race is simulated.
+    original_is_current = LeaseManager.is_current
+
+    def is_current_unless_finalizer(self, handle):
+        if handle.worker_id == "code-slayer-finalizer":
+            return False
+        return original_is_current(self, handle)
+
+    monkeypatch.setattr(LeaseManager, "is_current", is_current_unless_finalizer)
+
+    WorkerTrustManager(guarded_runner._control_conn).promote_to_guarded(
+        worker_id=WORKER_ID, role=ROLE, capability="write_file",
+        reason="test_fixture_grant", evidence_ref="test-fixture",
+    )
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        requires_mutation=True, adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+    assert result.status == RunStatus.COMPLETED
+
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        task = execution.conn.execute(
+            "SELECT state FROM tasks WHERE task_id = ?", (row.task_id,),
+        ).fetchone()
+        # No write was attempted at all -- the task is exactly where the
+        # ordinary IMPLEMENTING -> VERIFYING transition left it.
+        assert task["state"] == "VERIFYING"
+        decided = execution.conn.execute(
+            "SELECT 1 FROM audit_events WHERE task_id = ? "
+            "AND event_type = 'FINALIZATION_DECIDED'",
+            (row.task_id,),
+        ).fetchall()
+        assert decided == []
+    finally:
+        execution.close()
+
+
+def test_bounded_read_only_turn_unaffected_even_if_finalizer_would_crash(
+    guarded_runner, monkeypatch,
+):
+    """Item #4: `bounded_read_only_turn` never calls the finalizer at all
+    -- confirmed by making the finalizer unconditionally raise and
+    checking the read-only job still completes exactly as before."""
+    from code_slayer.finalization.service import Finalizer
+
+    def boom(self, task_id, lease, **kwargs):
+        raise RuntimeError("should never be called for a read-only turn")
+
+    monkeypatch.setattr(Finalizer, "decide_after_verification", boom)
+
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+    assert result.status == RunStatus.COMPLETED
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == "COMPLETED"
+    finally:
+        execution.close()
+
+
+# --- Deterministic Finalization: automatic checkpoint/completion driver ----
+
+def test_mutating_job_reaches_completed_fully_automatically(guarded_runner, primary):
+    """End-to-end: a mutating job (zero real mutation -- the worker turn
+    still only ever calls `read_file`) whose baseline already has a
+    verification command grounded runs all the way to COMPLETED with no
+    manual intervention: VERIFYING -> VERIFIED -> READY_FOR_CHECKPOINT ->
+    automatic real checkpoint -> CHECKPOINTED -> guarded automatic
+    COMPLETED, driven entirely by `finalization.lifecycle` from inside
+    `_run_finalizer_best_effort`."""
+    from tests.repo_helpers import commit
+
+    (primary / "pyproject.toml").write_text("[tool.ruff]\n")
+    commit(primary, "add ruff config")
+
+    WorkerTrustManager(guarded_runner._control_conn).promote_to_guarded(
+        worker_id=WORKER_ID, role=ROLE, capability="write_file",
+        reason="test_fixture_grant", evidence_ref="test-fixture",
+    )
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        requires_mutation=True, adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+    assert result.status == RunStatus.COMPLETED
+
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        task = execution.conn.execute(
+            "SELECT state FROM tasks WHERE task_id = ?", (row.task_id,),
+        ).fetchone()
+        assert task["state"] == "COMPLETED"
+
+        import json as _json
+
+        transitions = [
+            _json.loads(e["payload_json"])["to_state"] for e in execution.conn.execute(
+                "SELECT payload_json FROM audit_events WHERE task_id = ? "
+                "AND event_type = 'STATE_TRANSITION' ORDER BY seq",
+                (row.task_id,),
+            ).fetchall()
+        ]
+        for expected in ("VERIFYING", "READY_FOR_CHECKPOINT", "CHECKPOINTED", "COMPLETED"):
+            assert expected in transitions
+
+        checkpoints = execution.conn.execute(
+            "SELECT 1 FROM checkpoints WHERE task_id = ?", (row.task_id,),
+        ).fetchall()
+        assert len(checkpoints) == 1
+
+        lease = LeaseRepo(execution.conn).get(row.execution_worktree_id)
+        assert lease.status == "RELEASED"
+    finally:
+        execution.close()
+
+
+def test_bounded_read_only_turn_never_invokes_checkpoint_or_completion_driver(
+    guarded_runner, monkeypatch,
+):
+    """`bounded_read_only_turn` must never even reach the new
+    checkpoint/completion driver code -- proven by making both raise if
+    called at all (patched where the runner itself imported them, since
+    `from ... import name` binds its own local reference), then
+    confirming the read-only job still completes exactly as before."""
+    from code_slayer.runner import local_worker_runner as runner_module
+
+    def boom(*a, **kw):
+        raise AssertionError("checkpoint/completion driver must not run for bounded_read_only_turn")
+
+    monkeypatch.setattr(runner_module, "advance_ready_for_checkpoint", boom)
+    monkeypatch.setattr(runner_module, "advance_checkpointed_completion", boom)
+
+    prompt = "Read the README.md file."
+    result = guarded_runner.start(
+        original_prompt=prompt, worker_id=WORKER_ID, role=ROLE,
+        prompt_analyst=FakePromptAnalyst([PromptAnalysis(original_prompt=prompt)]),
+        adapter=FakeWorkerAdapter([_read_call(), _text()]),
+    )
+    assert result.status == RunStatus.COMPLETED
+    row = RunnerRepo(guarded_runner._control_conn).get(result.run_id)
+    execution = guarded_runner._reopen_execution_plane(row)
+    try:
+        assert execution.task.state == "COMPLETED"
+    finally:
+        execution.close()

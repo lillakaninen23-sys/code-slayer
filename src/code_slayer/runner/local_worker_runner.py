@@ -172,6 +172,13 @@ from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.core import TaskState, TaskStateMachine
 from code_slayer.core.transitions import TransitionRequest
+from code_slayer.finalization.lifecycle import (
+    CheckpointAdvanceOutcome,
+    advance_checkpointed_completion,
+    advance_ready_for_checkpoint,
+)
+from code_slayer.finalization.service import Finalizer, checkpointed_completion_guard
+from code_slayer.finalization.verification import FinalizationError
 from code_slayer.lease.manager import LeaseManager
 from code_slayer.policy.engine import Decision
 from code_slayer.repo import identity
@@ -877,8 +884,21 @@ class LocalWorkerRunner:
         Unknown effects keep the non-terminal task and lease occupied. Execution
         finalization precedes control bookkeeping: a crash between the databases
         leaves a terminal task that recovery will never execute again.
+
+        Deterministic Finalization: a mutating job (`run.requires_mutation`,
+        and not `bounded_read_only_turn`) whose worker turn completed
+        without error does NOT go straight to `COMPLETED` here -- it goes
+        to `TaskState.VERIFYING` instead, and `_run_finalizer_best_effort`
+        drives it the rest of the way from real, executed verification
+        evidence once this transaction has committed. `outcome.ok` (via
+        `status == RunStatus.COMPLETED`) still decides whether the
+        worker's own turn executed without error; it never again, by
+        itself, decides that the *job* is done. The `bounded_read_only_
+        turn` shortcut (no repository changes to verify) is unchanged.
         """
         manager = LeaseManager(execution.conn)
+        verifying = False
+        result: RunResult | None = None
         with transaction(execution.conn):
             current = LeaseRepo(execution.conn).get(lease.worktree_id)
             if (
@@ -894,8 +914,19 @@ class LocalWorkerRunner:
                 reason = "unresolved_tool_operation_requires_reconciliation"
             else:
                 task = TaskRepo(execution.conn).get(run.task_id)
-                target = TaskState.COMPLETED if status == RunStatus.COMPLETED else TaskState.FAILED
-                TaskStateMachine(execution.conn).transition_in_transaction(
+                execution_kind = json.loads(task.config_json).get("execution_kind")
+                verifying = (
+                    status == RunStatus.COMPLETED and run.requires_mutation
+                    and execution_kind != "bounded_read_only_turn"
+                )
+                target = (
+                    TaskState.VERIFYING if verifying else
+                    TaskState.COMPLETED if status == RunStatus.COMPLETED else
+                    TaskState.FAILED
+                )
+                TaskStateMachine(
+                    execution.conn, guards=(checkpointed_completion_guard(execution.conn),),
+                ).transition_in_transaction(
                     task.task_id, request=TransitionRequest(
                         expected_state=TaskState(task.state), to_state=target,
                         reason=f"runner:{status.value}:{reason}",
@@ -909,8 +940,115 @@ class LocalWorkerRunner:
             if execution.conn is self._control_conn:
                 # Ordinary runs share one database: result, task, release and
                 # their audit events commit together, with no terminal gap.
-                return self._finish(run, status, reason, **kwargs)
-        return self._finish(run, status, reason, **kwargs)
+                result = self._finish(run, status, reason, **kwargs)
+        if result is None:
+            result = self._finish(run, status, reason, **kwargs)
+        if verifying:
+            # Outside every transaction opened above: verification runs
+            # real subprocesses and must never do so under an open write
+            # lock (established discipline throughout this codebase).
+            self._run_finalizer_best_effort(execution, run.task_id)
+        return result
+
+    def _run_finalizer_best_effort(self, execution, task_id: str) -> None:
+        """Drive a newly-`VERIFYING` task the rest of the way -- real,
+        executed verification evidence (`finalization.service.Finalizer`)
+        and, when that reaches `READY_FOR_CHECKPOINT`, automatic
+        checkpoint creation and guarded automatic completion
+        (`finalization.lifecycle.advance_ready_for_checkpoint`/
+        `advance_checkpointed_completion` -- both thin wrappers around
+        the existing `CheckpointManager`/`checkpointed_completion_guard`,
+        never a second implementation of either) -- under one
+        freshly-acquired lease held for the whole pipeline, never the
+        worker turn's just-released one, matching every other
+        lease-consuming module's own acquire-per-activity discipline.
+        Never called for a `bounded_read_only_turn` job at all --
+        `_finish_owned()` only invokes this when `verifying` was true,
+        which that shortcut never sets.
+
+        Never lets an exception escape (this call happens after the
+        worker turn's own `RunResult` was already finalized -- an
+        exception here must never make that legitimate result
+        unreachable): `FinalizationError` (expected fencing/state races)
+        is silently benign and leaves the task at `VERIFYING` for a later
+        attempt; any other exception from the verification stage is
+        contained by `_record_finalizer_failure`, which durably records
+        it (never a silent crash leaving the task stuck with no trace)
+        using the existing `BLOCKED` state with `resume_target=VERIFYING`
+        -- no new TaskState. The checkpoint/completion stages are
+        exception-safe by construction (see `finalization.lifecycle`'s
+        own module docstring) and never raise at all -- only while this
+        call's own lease is still current (a lease that went stale gets
+        no further writes from us at all, at any stage)."""
+        acquired = LeaseManager(execution.conn).acquire(
+            worktree_id=execution.task.worktree_id, task_id=task_id,
+            worker_id="code-slayer-finalizer", worker_session_id=str(uuid.uuid4()),
+        )
+        if acquired.decision != Decision.ALLOW or acquired.handle is None:
+            return
+        handle = acquired.handle
+        tmp_dir = location.tmp_dir(
+            self._primary.repo_id, execution.task.worktree_id,
+            override=self._state_root_override,
+        )
+        try:
+            decision = Finalizer(
+                execution.conn, blobs_dir=execution.blobs_dir, tmp_dir=tmp_dir,
+            ).decide_after_verification(task_id, handle)
+        except FinalizationError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- contained and durably recorded, never re-raised
+            self._record_finalizer_failure(execution, task_id, handle, exc)
+        else:
+            if decision.target_state == TaskState.READY_FOR_CHECKPOINT:
+                checkpoint_result = advance_ready_for_checkpoint(
+                    execution.conn, task_id, handle,
+                    blobs_dir=execution.blobs_dir, tmp_dir=tmp_dir,
+                )
+                if checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED:
+                    advance_checkpointed_completion(execution.conn, task_id, handle)
+        finally:
+            LeaseManager(execution.conn).release(handle)
+
+    def _record_finalizer_failure(self, execution, task_id: str, lease, exc: Exception) -> None:
+        """An unexpected (non-`FinalizationError`) exception escaped the
+        finalizer. Fail closed: never let it propagate, and never leave
+        the task silently stuck at `VERIFYING` with no durable trace.
+        Reuses the existing `BLOCKED` state with the same
+        `resume_target=VERIFYING` mechanics `finalization.policy`'s own
+        `BLOCKED`/`INVALID_ENVIRONMENT` verdicts already rely on -- no new
+        TaskState. Only ever writes while `lease` is still current at the
+        moment of writing (rechecked fresh, inside the transaction); a
+        lease that already went stale is never used to write anything,
+        matching every other module's fencing discipline. Recording the
+        failure must itself never raise past this method -- if even that
+        cannot be done safely, the task is simply left at `VERIFYING`,
+        exactly as it would have been before this hardening."""
+        reason_code = f"finalizer_exception:{type(exc).__name__}"
+        try:
+            with transaction(execution.conn):
+                if not LeaseManager(execution.conn).is_current(lease):
+                    return
+                task = TaskRepo(execution.conn).get(task_id)
+                if task.state != TaskState.VERIFYING.value:
+                    return
+                TaskStateMachine(execution.conn).transition_in_transaction(
+                    task_id, request=TransitionRequest(
+                        expected_state=TaskState.VERIFYING, to_state=TaskState.BLOCKED,
+                        reason=f"finalizer:BLOCKED:{reason_code}",
+                    ), actor_id="finalizer",
+                )
+                AuditWriter(execution.conn).append(
+                    task_id=task_id, event_type=EventType.FINALIZATION_DECIDED,
+                    actor_type="system", actor_id="finalizer",
+                    payload={
+                        "verdict": "BLOCKED", "reason_code": reason_code,
+                        "target_state": TaskState.BLOCKED.value,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+        except Exception:  # noqa: BLE001 -- never propagate a failure while reporting a failure
+            return
 
     def _recover_mid_turn(
         self, run: RunnerRun, adapter: WorkerAdapter | None,

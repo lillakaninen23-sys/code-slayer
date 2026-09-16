@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
+from code_slayer.finalization.dispatcher import TaskLifecycleExecutor
 from code_slayer.intelligence import RepositoryIntelligenceService
 from code_slayer.permissions.service import PermissionService
 from code_slayer.planning.executor import PlanningJobExecutor
@@ -41,6 +42,11 @@ class RuntimeBindings:
     # production has no reason to lower it below the default.
     planning_max_workers: int = 1
     planning_poll_interval_seconds: float = 2.0
+    # Restart/resume recovery dispatcher tuning (`finalization.dispatcher.
+    # TaskLifecycleExecutor`) -- server configuration only, never
+    # client-facing. A smaller poll interval is useful for tests;
+    # production has no reason to lower it below the default.
+    lifecycle_poll_interval_seconds: float = 2.0
 
 
 class ApplicationService:
@@ -66,20 +72,33 @@ class ApplicationService:
                 poll_interval_seconds=self.bindings.planning_poll_interval_seconds,
             )
             self._planning_executor.start()
+        # One long-lived restart/resume recovery dispatcher per process,
+        # started unconditionally -- unlike planning, it depends on no
+        # external factory and no client ever needs to configure it in
+        # (`finalization.dispatcher.TaskLifecycleExecutor`, closing the
+        # orchestration gap the restart/resume audit found: nothing
+        # previously re-discovered a task stranded in
+        # READY_FOR_CHECKPOINT/CHECKPOINTED after a process restart).
+        self._lifecycle_executor = TaskLifecycleExecutor(
+            self.repo_path, state_root_override=self.state_root,
+            poll_interval_seconds=self.bindings.lifecycle_poll_interval_seconds,
+        )
+        self._lifecycle_executor.start()
 
     def close(self) -> None:
-        """Stop this instance's background planning executor, if one was
-        started. Production (`cli.main.serve`, run via `waitress`, itself
-        run under the existing systemd-hosted process) has no call site
-        for this -- the executor's dispatcher thread is a daemon thread
-        and simply exits with the process, which is exactly Case B's own
-        crash-safe recovery path exercised the ordinary way. This exists
-        so tests (and any embedding context that constructs many
-        short-lived `ApplicationService` instances in one process) can
-        avoid leaking an unbounded number of live background dispatcher
-        threads across a long-running test session."""
+        """Stop this instance's background dispatchers, if started.
+        Production (`cli.main.serve`, run via `waitress`, itself run
+        under the existing systemd-hosted process) has no call site for
+        this -- each dispatcher's thread is a daemon thread and simply
+        exits with the process, which is exactly Case B's own crash-safe
+        recovery path exercised the ordinary way. This exists so tests
+        (and any embedding context that constructs many short-lived
+        `ApplicationService` instances in one process) can avoid leaking
+        an unbounded number of live background dispatcher threads across
+        a long-running test session."""
         if self._planning_executor is not None:
             self._planning_executor.stop()
+        self._lifecycle_executor.stop()
 
     @contextmanager
     def runner(self):
