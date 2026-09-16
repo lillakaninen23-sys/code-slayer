@@ -47,7 +47,16 @@ _FORWARD = {
     TaskState.PLANNING: {TaskState.PLANNED},
     TaskState.PLANNED: {TaskState.IMPLEMENTING},
     TaskState.IMPLEMENTING: {TaskState.VERIFYING},
-    TaskState.VERIFYING: {TaskState.REVIEWING, TaskState.REPAIRING},
+    # READY_FOR_CHECKPOINT is a direct edge (not only via REVIEWING):
+    # Deterministic Finalization's finalizer (`finalization.service.
+    # Finalizer`) takes it whenever no reviewer was actually consulted
+    # (review_required = false in this phase/version -- no reviewer model
+    # exists yet) so audit/state history never pretends a review happened
+    # when none did; REVIEWING remains reachable for when a real review
+    # verdict genuinely is supplied.
+    TaskState.VERIFYING: {
+        TaskState.REVIEWING, TaskState.REPAIRING, TaskState.READY_FOR_CHECKPOINT,
+    },
     TaskState.REPAIRING: {TaskState.VERIFYING},
     TaskState.REVIEWING: {TaskState.READY_FOR_CHECKPOINT, TaskState.REPAIRING},
     TaskState.READY_FOR_CHECKPOINT: {TaskState.CHECKPOINTED},

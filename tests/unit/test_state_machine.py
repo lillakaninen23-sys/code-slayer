@@ -39,6 +39,12 @@ FORWARD_EDGES = set(zip(HAPPY_PATH, HAPPY_PATH[1:], strict=False)) | {
     ("VERIFYING", "REPAIRING"),
     ("REPAIRING", "VERIFYING"),
     ("REVIEWING", "REPAIRING"),
+    # Deterministic Finalization: review_required = false in this phase/
+    # version (no reviewer model exists) -- VERIFIED goes straight to
+    # READY_FOR_CHECKPOINT rather than through a pretend REVIEWING hop.
+    # REVIEWING remains reachable too, for when a real review verdict is
+    # actually supplied.
+    ("VERIFYING", "READY_FOR_CHECKPOINT"),
 }
 STATIC_EDGES = (
     FORWARD_EDGES

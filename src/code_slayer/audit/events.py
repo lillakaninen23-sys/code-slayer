@@ -150,3 +150,11 @@ class EventType(StrEnum):
     PERMISSION_DENIED = "PERMISSION_DENIED"
     PERMISSION_REVOKED = "PERMISSION_REVOKED"
     PERMISSION_CHECK_DENIED = "PERMISSION_CHECK_DENIED"
+    # Deterministic Finalization: the code-owned finalizer's own decision
+    # record (`finalization.service.Finalizer`) -- the structured evidence
+    # bundle (verdict, reason_code, verification command results) a
+    # verified-not-self-declared FINAL/REPAIR_REQUIRED/BLOCKED/
+    # INVALID_ENVIRONMENT outcome was based on. Mirrors CHECKPOINT_VALIDATED's
+    # own precedent: one event per decision, never a worker/model's own
+    # self-report.
+    FINALIZATION_DECIDED = "FINALIZATION_DECIDED"

@@ -170,6 +170,29 @@ def build_tree(
     return result.stdout.decode("ascii").strip()
 
 
+def checkout_tree_to_directory(index_path: Path, dest_dir: Path, *, cwd: Path) -> None:
+    """Materialize every entry already written into `index_path` (by a
+    prior `build_tree()` call against this same path) as real files under
+    `dest_dir`, via Git's own `checkout-index` — never by independently
+    copying or reconstructing file bytes in Python. `dest_dir` must
+    already exist (created fresh, empty, by the caller); this never reads
+    or copies anything from the repository's real working tree, only from
+    the object database via the given index.
+
+    Deterministic Finalization: this is what lets verification commands
+    run against exactly `verified_tree_sha`'s content instead of the live
+    worktree — closing the gap where unrelated/ignored/untracked live
+    content could otherwise influence a verification tool's result while
+    never being part of what gets checkpointed.
+    """
+    dest = str(dest_dir.resolve())
+    result = _run(
+        ["checkout-index", "--all", f"--prefix={dest}/"], cwd=cwd, index_path=index_path,
+    )
+    if result.returncode != 0:
+        raise CheckpointGitError("git checkout-index failed")
+
+
 def commit_tree(tree_sha: str, parents: tuple[str, ...], message: str, *, cwd: Path) -> str:
     """Create a commit object with an explicit tree/parents; touches no ref."""
     argv = ["commit-tree", tree_sha]
