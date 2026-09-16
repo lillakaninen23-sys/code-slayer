@@ -22,6 +22,7 @@ chain validity.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -52,12 +53,20 @@ from code_slayer.workers.prompt_analysis import (
     PromptAnalysis,
     hash_original_prompt,
 )
-from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+from code_slayer.workers.protocol import (
+    WorkerAdapterError,
+    WorkerResponse,
+    WorkerResponseKind,
+    WorkerToolCall,
+)
 from code_slayer.workers.question_gate import ResolutionKind
 from code_slayer.workers.trust import TrustLevel, WorkerTrustManager
+from code_slayer.workers.worker_prompt_analyst import TOOL_NAME as ANALYST_TOOL_NAME
+from code_slayer.workers.worker_prompt_analyst import WorkerAdapterPromptAnalyst
 
 WORKER_ID = "test-worker"
 ROLE = "coder"
+PROMPT = "Read the README.md file."
 README_BYTES = b"hello\n"
 
 
@@ -149,6 +158,179 @@ def test_register_worker_is_idempotent_and_grants_no_trust(primary):
         assert trust == TrustLevel.LOCKED
     finally:
         r.close()
+
+
+# --- PromptAnalyst terminal failure: ANALYZING must never outlive it -------
+
+def _failing_analyst(response_or_exception):
+    return WorkerAdapterPromptAnalyst(
+        FakeWorkerAdapter([response_or_exception]), task_id="analysis-x",
+    )
+
+
+def _malformed_analysis_response():
+    return WorkerResponse(
+        kind=WorkerResponseKind.TOOL_CALL,
+        tool_call=WorkerToolCall(tool=ANALYST_TOOL_NAME, params={"unknown_field": 1}),
+    )
+
+
+def test_prompt_analyst_transport_failure_terminalizes_to_failed(runner):
+    """Item 1: a transport failure (connection refused, timeout, ...)
+    from a real `PromptAnalyst` must never propagate as a raw, uncaught
+    exception -- it becomes a durable, terminal `FAILED` run."""
+    analyst = _failing_analyst(WorkerAdapterError("connection_refused"))
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.FAILED
+    row = RunnerRepo(runner._control_conn).get(result.run_id)
+    assert row.status == RunStatus.FAILED.value
+    assert row.reason == "prompt_analysis_failed:adapter_error:connection_refused"
+
+
+def test_prompt_analyst_malformed_output_terminalizes_to_failed(runner):
+    """Item 2: malformed/invalid structured output from a real
+    `PromptAnalyst` is a distinct failure class from a transport error,
+    but is equally terminal -- never left dangling, never guessed at."""
+    analyst = _failing_analyst(_malformed_analysis_response())
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status == RunStatus.FAILED
+    row = RunnerRepo(runner._control_conn).get(result.run_id)
+    assert row.reason == "prompt_analysis_failed:malformed_structured_output"
+
+
+def test_transport_failure_is_never_reclassified_as_trust_or_qualification_result(runner):
+    """A `PromptAnalyst` transport/schema failure is a runtime/transport
+    failure, never a policy/trust denial or a qualification result --
+    the run must land on plain `FAILED`, never `DENIED_TRUST`."""
+    analyst = _failing_analyst(WorkerAdapterError("transport_timeout"))
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status not in (RunStatus.DENIED_TRUST, RunStatus.BLOCKED_ON_QUESTIONS)
+    assert result.status == RunStatus.FAILED
+
+
+def test_run_is_never_left_in_analyzing_after_a_failed_start(runner):
+    """Item 3, the exact invariant this fix exists for."""
+    analyst = _failing_analyst(WorkerAdapterError("connection_refused"))
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.status != RunStatus.ANALYZING
+    row = RunnerRepo(runner._control_conn).get(result.run_id)
+    assert row.status != RunStatus.ANALYZING.value
+
+
+def test_failed_analysis_creates_no_task(runner):
+    """Item 6: a run that never got past Prompt Analysis must never
+    gain a `task_id` -- no execution-plane task exists for it."""
+    analyst = _failing_analyst(WorkerAdapterError("connection_refused"))
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    assert result.task_id is None
+    assert RunnerRepo(runner._control_conn).get(result.run_id).task_id is None
+
+
+def test_failed_analysis_changes_no_trust_permission_or_certification(runner):
+    """Item 7: an analysis failure touches nothing in `workers_trust`/
+    conformance/promotion state -- the worker's trust is exactly as
+    unqualified (LOCKED) after the failure as before it."""
+    before = WorkerTrustManager(runner._control_conn).current_trust(WORKER_ID, ROLE, "read_file")
+    analyst = _failing_analyst(WorkerAdapterError("connection_refused"))
+    runner.start(original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst)
+    after = WorkerTrustManager(runner._control_conn).current_trust(WORKER_ID, ROLE, "read_file")
+    assert before == after == TrustLevel.LOCKED
+
+
+def test_failed_analysis_audit_trail_is_exactly_started_then_finished(runner):
+    """Item 5: the failure transition is durably audited via the exact
+    same `RUN_FINISHED` event every other terminal outcome uses -- no
+    parallel/ad hoc audit path, and no `PROMPT_ANALYSIS_RECORDED`/
+    `QUESTION_GATE_DECISION` event, since the gate was never reached."""
+    analyst = _failing_analyst(WorkerAdapterError("connection_refused"))
+    result = runner.start(
+        original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE, prompt_analyst=analyst,
+    )
+    rows = [dict(r) for r in runner._control_conn.execute(
+        "SELECT event_type, payload_json FROM audit_events WHERE task_id IS NULL ORDER BY seq",
+    )]
+    event_types = [r["event_type"] for r in rows]
+    assert event_types == ["RUN_STARTED", "RUN_FINISHED"]
+    finished = json.loads(rows[-1]["payload_json"])
+    assert finished["run_id"] == result.run_id
+    assert finished["status"] == "FAILED"
+    assert finished["reason"] == "prompt_analysis_failed:adapter_error:connection_refused"
+    assert verify_chain(runner._control_conn, task_id=None).ok
+
+
+def test_random_analyst_bug_is_never_silently_absorbed(runner):
+    """Only the typed `PromptAnalystError` failure contract is caught --
+    a genuine, unexpected defect in an analyst implementation must keep
+    propagating rather than being reclassified as an ordinary analysis
+    failure (no bare `except Exception` around this call)."""
+
+    class _BuggyAnalyst:
+        def analyze(self, original_prompt, evidence):
+            raise ValueError("not a PromptAnalystError")
+
+    with pytest.raises(ValueError, match="not a PromptAnalystError"):
+        runner.start(
+            original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE,
+            prompt_analyst=_BuggyAnalyst(),
+        )
+
+
+# --- resume() on a stranded ANALYZING row (a genuine process crash) --------
+
+def test_resume_on_a_stranded_analyzing_run_reconciles_to_interrupted_resumable(runner):
+    """Item 8: restart/recovery semantics. `start()` now terminalizes
+    every ordinary `PromptAnalystError` itself, so the only way a run is
+    ever genuinely found at `ANALYZING` by `resume()` is the analyst
+    itself never returning control to `start()` at all -- a real process
+    crash mid-call, or (exercised here, without actually killing the
+    process) an unexpected defect that isn't the typed failure contract
+    `start()` knows how to terminalize, exactly like
+    `test_random_analyst_bug_is_never_silently_absorbed` above. Either
+    way, `create_in_transaction` already durably committed
+    `status=ANALYZING` before the analyst was ever invoked, so the row
+    this test finds afterward is a genuinely, durably stranded row --
+    not a simulation via direct row manipulation.
+
+    Recovery reuses the *existing* `INTERRUPTED_RESUMABLE` "requires
+    explicit reconciliation" contract -- never a second, new recovery
+    mechanism, and never guesses that analysis actually completed."""
+
+    class _CrashingAnalyst:
+        def analyze(self, original_prompt, evidence):
+            raise RuntimeError("crashed_mid_call")
+
+    with pytest.raises(RuntimeError, match="crashed_mid_call"):
+        runner.start(
+            original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE,
+            prompt_analyst=_CrashingAnalyst(),
+        )
+
+    rows = [dict(r) for r in runner._control_conn.execute(
+        "SELECT run_id FROM runner_runs WHERE status = 'ANALYZING'",
+    )]
+    assert len(rows) == 1
+    run_id = rows[0]["run_id"]
+
+    result = runner.resume(run_id)
+    assert result.status == RunStatus.INTERRUPTED_RESUMABLE
+    assert result.reason == "analysis_interrupted_requires_reconciliation"
+    row = RunnerRepo(runner._control_conn).get(run_id)
+    assert row.status == RunStatus.INTERRUPTED_RESUMABLE.value
+
+    # Fails closed, permanently, for this exact run -- never silently
+    # re-guessed forward on a later resume().
+    again = runner.resume(run_id)
+    assert again.status == RunStatus.INTERRUPTED_RESUMABLE
 
 
 # --- 1/2. exact original prompt / hash durability ---------------------------

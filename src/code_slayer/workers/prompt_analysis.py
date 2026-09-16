@@ -236,6 +236,38 @@ class PromptAnalysis:
         )
 
 
+class PromptAnalystError(RuntimeError):
+    """The stable, typed exception a real `PromptAnalyst.analyze()`
+    implementation raises when it cannot produce a valid `PromptAnalysis`
+    at all — transport failure, a non-conforming model response, or
+    malformed structured output. Mirrors `workers.protocol.
+    WorkerAdapterError`'s exact role for `WorkerAdapter.infer()`: the one
+    typed failure boundary every caller of this protocol can catch,
+    without needing to know which concrete `PromptAnalyst`
+    implementation it is holding.
+
+    `analyze()`'s own return type is `PromptAnalysis` unconditionally —
+    there is no "malformed" variant to return instead (unlike `planning.
+    planner.PlannerResponse`) — so a real implementation raises this
+    rather than ever fabricating an empty, ambiguity-free `PromptAnalysis`
+    on failure: an empty analysis would silently suppress every question
+    `workers.question_gate.QuestionGate` might otherwise have asked,
+    exactly the fail-open failure mode this codebase's "fail closed"
+    posture forbids. A caller (`runner.local_worker_runner.
+    LocalWorkerRunner.start()`) catches exactly this type to terminate a
+    run cleanly and durably, never a bare `Exception`, so a genuine
+    programming defect in an analyst implementation still propagates
+    rather than being silently absorbed as an ordinary analysis failure.
+
+    Deliberately distinct from `workers.fake_prompt_analyst.
+    FakePromptAnalystError`, which signals a *test-harness*
+    misconfiguration (a fake's canned response queue was exhausted) —
+    never a real analysis failure a caller should catch and durably
+    record. The two are intentionally not related by inheritance: a
+    caller that catches this type must never accidentally swallow a
+    broken test double's own loud failure."""
+
+
 class PromptAnalyst(Protocol):
     """The one method a real or fake Prompt Analyst implements.
     Deliberately given no filesystem, tool, or database access here —
@@ -243,7 +275,11 @@ class PromptAnalyst(Protocol):
     `EvidenceContext` the caller already collected; see the module
     docstring's "Security" section. A concrete adapter needs no base
     class — this is structural (`typing.Protocol`), matching `workers.
-    protocol.WorkerAdapter`'s own pattern."""
+    protocol.WorkerAdapter`'s own pattern.
+
+    Raises `PromptAnalystError` when a real implementation cannot
+    produce a valid `PromptAnalysis` at all — see that exception's own
+    docstring. Never returns a fabricated/empty analysis on failure."""
 
     def analyze(self, original_prompt: str, evidence: EvidenceContext) -> PromptAnalysis: ...
 

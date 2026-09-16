@@ -134,6 +134,15 @@ primary promotion is fabricated to finish a read-only turn.
   reconciliation. A concurrent caller cannot distinguish that crash from
   live bootstrap, so it returns RUNNING without executing or changing the
   owner's record. ALIVE/UNKNOWN liveness similarly refuses takeover.
+- **A crash during `ANALYZING` requires explicit reconciliation, same as
+  above.** An ordinary `PromptAnalystError` raised during `start()`'s own
+  call is caught and terminalized to `FAILED` in that same call — a run
+  is only ever still found at `ANALYZING` by `resume()` if the process
+  crashed before that could happen. `resume()` never re-invokes the
+  analyst itself (it takes no `prompt_analyst` argument, exactly like the
+  `BLOCKED_ON_QUESTIONS` branch), so it fails closed to
+  `INTERRUPTED_RESUMABLE` instead of guessing whether analysis actually
+  completed.
 - **Mid-turn crash recovery is fail-closed, not fully automatic.** If a
   process crashes after `ToolExecutor` durably recorded `SUCCEEDED` but
   before the worker's continuation completed, `resume()` recovers
@@ -197,7 +206,12 @@ from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.tools import file_tools as files
 from code_slayer.workers.cloud_escalation import CloudEscalationAuthorization
 from code_slayer.workers.execution import execute_guarded_turn
-from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalysis, PromptAnalyst
+from code_slayer.workers.prompt_analysis import (
+    EvidenceSource,
+    PromptAnalysis,
+    PromptAnalyst,
+    PromptAnalystError,
+)
 from code_slayer.workers.prompt_provenance import (
     read_original_prompt,
     read_prompt_analysis,
@@ -362,6 +376,27 @@ class LocalWorkerRunner:
         If `adapter` is given and the gate suppresses, proceeds all the
         way through worker execution in this same call.
 
+        A `PromptAnalystError` raised by `prompt_analyst.analyze()`
+        (transport failure, non-conforming or malformed model output —
+        see that exception's own docstring) never leaves this run
+        durably stranded in `ANALYZING`: it is caught here and
+        terminalized to `RunStatus.FAILED` via the same `_finish()` this
+        module already uses for every other terminal outcome, exactly
+        mirroring how `workers.execution.execute_guarded_turn()`'s own
+        `transport_failure`/malformed-response outcomes already
+        terminalize to `FAILED` rather than propagating a raw exception.
+        This is a genuine analysis failure, never a qualification/trust
+        result — it grants no trust, denies no trust, and creates no
+        task; a fresh `start()` call with a new prompt/run is always
+        still available. Nothing durable or irreversible had happened
+        yet at this point (no task, no lease, no tool call), so this is
+        always safe to terminalize outright, never `INTERRUPTED_
+        RESUMABLE` (that status is reserved for a turn that may have
+        left real execution-plane side effects requiring reconciliation
+        — see `resume()`'s own handling of a run found at `ANALYZING`,
+        the different, crash-shaped case where this exception was never
+        actually raised because the process died before it could be).
+
         `cloud_escalation` (Phase 7.7e) is forwarded, unchanged, to
         `workers.execution.execute_guarded_turn()`'s own pre-transport
         gate if execution is reached this same call — see `workers.
@@ -389,8 +424,11 @@ class LocalWorkerRunner:
                 "role": role, "requires_mutation": requires_mutation,
             })
 
-        analysis = prompt_analyst.analyze(original_prompt, {})
         run = RunnerRepo(self._control_conn).get(run_id)
+        try:
+            analysis = prompt_analyst.analyze(original_prompt, {})
+        except PromptAnalystError as exc:
+            return self._finish(run, RunStatus.FAILED, f"prompt_analysis_failed:{exc}")
         return self._evaluate_gate(
             run, original_prompt, analysis, resolutions, adapter, cloud_escalation,
         )
@@ -493,6 +531,30 @@ class LocalWorkerRunner:
         if run.status == RunStatus.RUNNING.value:
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
             return self._recover_mid_turn(run, adapter, cloud_escalation)
+
+        if run.status == RunStatus.ANALYZING.value:
+            # `start()` now catches every ordinary `PromptAnalystError`
+            # itself and terminalizes to FAILED before ever returning --
+            # a run can only still be found here if the process crashed
+            # between durably creating this row and that call completing
+            # (before either outcome, success or failure, could be
+            # recorded). Nothing durable or irreversible happened during
+            # that window (no task, no lease, no tool call --
+            # `PromptAnalyst.analyze()` has no filesystem/tool access at
+            # all), but `resume()` deliberately never re-invokes the
+            # analyst (see the `BLOCKED_ON_QUESTIONS` branch above) and
+            # takes no `prompt_analyst` argument to do so safely even if
+            # it wanted to. Fails closed to INTERRUPTED_RESUMABLE --
+            # the exact same "requires explicit reconciliation, never
+            # guessed forward" contract already used for every other
+            # crash-shaped gap in this state machine (see the module
+            # docstring's "Known limitations") -- rather than leaving
+            # the row lying about still being an active analysis.
+            self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
+            return self._finish(
+                run, RunStatus.INTERRUPTED_RESUMABLE,
+                "analysis_interrupted_requires_reconciliation",
+            )
 
         # INTERRUPTED_RESUMABLE: requires explicit reconciliation this
         # phase does not automate (see the module docstring's "Known

@@ -36,27 +36,22 @@ does not have.
 
 ## Fail closed, not fail open
 
-`PromptAnalyst.analyze()`'s protocol signature returns a `PromptAnalysis`
-unconditionally — there is no "malformed" variant to return instead (
-unlike `planning.planner.PlannerResponse`). A transport failure or a
-non-conforming response therefore raises `PromptAnalystError` rather
-than silently returning an empty, ambiguity-free `PromptAnalysis`: an
-empty analysis would suppress every question `workers.question_gate.
-QuestionGate` might otherwise have asked, exactly the fail-open failure
-mode this codebase's "fail closed" posture forbids. `workers.
-fake_prompt_analyst.FakePromptAnalystError` already established the
-same "raise, never fabricate a benign result" contract for the
-deterministic test double; this is its real-adapter counterpart.
+A transport failure or a non-conforming response raises `workers.
+prompt_analysis.PromptAnalystError` — see that exception's own
+docstring for the full "why raise, never fabricate" rationale and its
+relationship to `workers.fake_prompt_analyst.FakePromptAnalystError`.
+The caller, `runner.local_worker_runner.LocalWorkerRunner.start()`,
+catches exactly that type to terminate the run cleanly and durably
+(`RunStatus.FAILED`) rather than leaving it stranded in `ANALYZING`.
 """
 
 from __future__ import annotations
-
-import json
 
 from code_slayer.workers.prompt_analysis import (
     EvidenceContext,
     PromptAnalysis,
     PromptAnalyst,
+    PromptAnalystError,
     parse_prompt_analysis_output,
 )
 from code_slayer.workers.protocol import (
@@ -78,15 +73,6 @@ _ANALYSIS_INSTRUCTION = (
     "destructive action, an external service choice, or a required user preference is not "
     "already decided by the prompt itself."
 )
-
-
-class PromptAnalystError(RuntimeError):
-    """A real Prompt Analyst turn did not produce a valid, structured
-    `emit_prompt_analysis` tool call — transport failure, a non-tool
-    response, an unauthorized/wrong tool call, or a tool call whose own
-    parameters failed `parse_prompt_analysis_output()`'s strict schema
-    check. Never raised for the ordinary case (a valid structured
-    response, however few or many ambiguities it raises)."""
 
 
 def _render_analysis_prompt(original_prompt: str) -> str:
@@ -130,8 +116,14 @@ class WorkerAdapterPromptAnalyst:
 
         fields = parse_prompt_analysis_output(validation.tool_call.params)
         if fields is None:
-            raw = json.dumps(dict(validation.tool_call.params), sort_keys=True, default=str)
-            raise PromptAnalystError(f"malformed_structured_output:{raw}")
+            # A fixed, code-owned error string only -- never the raw
+            # model-produced params, which may be arbitrarily large or
+            # adversarial (mirrors `planning.worker_planner.
+            # WorkerAdapterPlanner`'s own `error="malformed_structured_
+            # output"` for the identical planner-side case: raw output
+            # belongs in content-addressed evidence storage, if anywhere,
+            # never embedded in a short, durably-stored status string).
+            raise PromptAnalystError("malformed_structured_output")
 
         return PromptAnalysis(
             original_prompt=original_prompt,

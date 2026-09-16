@@ -16,7 +16,12 @@ from code_slayer.workers.fake_adapter import FakeWorkerAdapter
 from code_slayer.workers.fake_prompt_analyst import FakePromptAnalyst
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.prompt_analysis import Ambiguity, AmbiguityRiskClass, PromptAnalysis
-from code_slayer.workers.protocol import WorkerResponse, WorkerResponseKind, WorkerToolCall
+from code_slayer.workers.protocol import (
+    WorkerAdapterError,
+    WorkerResponse,
+    WorkerResponseKind,
+    WorkerToolCall,
+)
 from code_slayer.workers.question_gate import ResolutionKind
 from code_slayer.workers.worker_prompt_analyst import TOOL_NAME as ANALYST_TOOL_NAME
 from code_slayer.workers.worker_prompt_analyst import WorkerAdapterPromptAnalyst
@@ -637,3 +642,47 @@ def test_worker_registration_alone_grants_no_trust(git_repo_with_commit):
     response = start(client)
     assert response.status_code == 201
     assert response.json["status"] == "DENIED_TRUST"
+
+
+def test_prompt_analyst_transport_failure_is_a_normal_failed_response_not_a_500(
+    git_repo_with_commit,
+):
+    """A `PromptAnalyst` transport failure is a known, terminal outcome
+    of the run state machine (`RunStatus.FAILED`) -- the API returns it
+    the ordinary way, exactly like any other terminal run outcome
+    (`transport_failure` during execution already behaves this way),
+    never as an opaque 500. The safe `reason_code()` prefix is exposed;
+    no raw adapter/provider detail ever reaches the response body."""
+    repo = git_repo_with_commit
+    analysis_adapter = FakeWorkerAdapter([WorkerAdapterError("connection_refused")])
+    analyst = WorkerAdapterPromptAnalyst(analysis_adapter, task_id="analysis-run")
+    bindings = RuntimeBindings(
+        analyst_factory=lambda: analyst,
+        worker_registrations=(
+            WorkerRegistration(worker_id=WORKER, kind="fake", network_class="local"),
+        ),
+    )
+    client = create_app(repo, bindings=bindings).test_client()
+    response = start(client)
+    assert response.status_code == 201
+    assert response.json["status"] == "FAILED"
+    assert response.json["reason"] == "prompt_analysis_failed"
+    assert "connection_refused" not in response.text
+
+    run_id = response.json["run_id"]
+    detail = client.get("/api/runs/" + run_id).json
+    assert detail["status"] == "FAILED"
+    assert detail["task_status"] is None
+
+
+def test_unrelated_internal_error_is_still_masked_as_a_generic_500(setup):
+    """Only the typed `PromptAnalystError` contract is turned into a
+    normal `FAILED` response -- a genuinely unexpected internal error
+    must still be caught by the existing generic error handler, exactly
+    as before this change (regression coverage for item 4)."""
+    client, _, _ = application(setup)
+    with patch.object(LocalWorkerRunner, "start", side_effect=RuntimeError("connection_refused")):
+        response = start(client)
+    assert response.status_code == 500
+    assert response.json["error"]["code"] == "application_error"
+    assert "connection_refused" not in response.text

@@ -96,6 +96,7 @@ from code_slayer.workers.prompt_analysis import (
     PromptAnalysis,
     PromptAnalysisFields,
     PromptAnalyst,
+    PromptAnalystError,
     hash_original_prompt,
     parse_prompt_analysis_output,
 )
@@ -123,10 +124,7 @@ from code_slayer.workers.question_gate import (
     ResolutionKind,
 )
 from code_slayer.workers.trust import TrustResult, WorkerTrustManager
-from code_slayer.workers.worker_prompt_analyst import (
-    PromptAnalystError,
-    WorkerAdapterPromptAnalyst,
-)
+from code_slayer.workers.worker_prompt_analyst import WorkerAdapterPromptAnalyst
 
 __all__ = [
     "Ambiguity",
