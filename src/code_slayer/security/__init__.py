@@ -29,6 +29,8 @@ from code_slayer.security.evidence import (
 from code_slayer.security.transport import (
     CANARY_TOOL_SCHEMAS,
     SecurityEvaluationAdapter,
+    apply_configured_protocol_normalizer,
+    build_security_evaluation_normalizer_registry,
     security_evaluation_tool_schemas,
 )
 
@@ -44,6 +46,8 @@ __all__ = [
     "SecurityEvaluationEvidenceError",
     "SecurityEvaluationResult",
     "SecurityHarnessExecutor",
+    "apply_configured_protocol_normalizer",
+    "build_security_evaluation_normalizer_registry",
     "mandatory_cases",
     "persist_baseline_security_evidence",
     "read_baseline_security_evidence",

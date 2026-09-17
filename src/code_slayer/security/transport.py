@@ -11,6 +11,15 @@ temperature — the production common `RuntimeProfileIdentity` is
 unchanged — and injects the suite-owned canary schemas into the
 outgoing chat-completions payload. Incoming canary calls become
 `WorkerToolCall` observations. Nothing is executed.
+
+When a verified `RuntimeProfileIdentity` names
+`qwen_textual_tool_v1`, this transport applies that exact existing
+decoder (same grammar, not a fork) with known/string parameters taken
+from the reviewed canary schema vocabulary. Native structured
+`tool_calls` always win. The normalizer runs only after
+`validate_response` reports exact `textual_tool_protocol_leakage`.
+A native-only identity never normalizes. An unknown or incomplete
+normalizer fails closed.
 """
 
 from __future__ import annotations
@@ -29,6 +38,17 @@ from code_slayer.security.evaluation import (
     mandatory_cases,
 )
 from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
+from code_slayer.workers.protocol import WorkerRequest, WorkerResponse, WorkerResponseKind
+from code_slayer.workers.protocol_normalization import (
+    NormalizationOutcome,
+    ToolProtocolNormalizer,
+    ToolProtocolNormalizerRegistry,
+)
+from code_slayer.workers.protocol_validation import validate_response
+from code_slayer.workers.qwen_textual_tool_normalizer import QwenTextualToolNormalizer
+from code_slayer.workers.security_baseline import RuntimeProfileIdentity
+
+_LEAKAGE_REASON = "textual_tool_protocol_leakage"
 
 
 def _function_schema(
@@ -129,13 +149,167 @@ def security_evaluation_tool_schemas(allowed_tools: tuple[str, ...] | None) -> l
     return [CANARY_TOOL_SCHEMAS[name] for name in allowed_tools]
 
 
+def security_canary_known_parameters() -> frozenset[str]:
+    """Parameter names the security suite has actually reviewed.
+
+    Sourced from `CANARY_TOOL_SCHEMAS`, never from free-form model
+    output and never from the Planner structured-output field set.
+    """
+    names: set[str] = set()
+    for schema in CANARY_TOOL_SCHEMAS.values():
+        properties = schema["function"]["parameters"]["properties"]
+        names.update(properties)
+        if any(properties[key] != _STRING for key in properties):
+            raise RuntimeError("security_evaluation_canary_schema_non_string_parameter")
+    return frozenset(names)
+
+
+def security_canary_string_parameters() -> frozenset[str]:
+    """Every reviewed canary parameter is a string; JSON decoding is
+    not used for this vocabulary."""
+    return security_canary_known_parameters()
+
+
+def build_security_evaluation_normalizer_registry() -> ToolProtocolNormalizerRegistry:
+    """Security-suite registry wrapping the existing
+    `qwen_textual_tool_v1` implementation. Does not fork its grammar.
+    Constructing the registry does not enable it; a
+    `RuntimeProfileIdentity` must still name this exact pair.
+    """
+    known = security_canary_known_parameters()
+    return ToolProtocolNormalizerRegistry(
+        (
+            QwenTextualToolNormalizer(
+                known_parameters=known,
+                string_parameters=known,
+            ),
+        ),
+    )
+
+
+def resolve_security_evaluation_normalizer(
+    profile: RuntimeProfileIdentity,
+) -> ToolProtocolNormalizer | None:
+    """`None` for native-only identities. Unknown or incomplete
+    `(id, version)` pairs also return `None` — callers must fail
+    closed rather than decode."""
+    if not isinstance(profile, RuntimeProfileIdentity):
+        return None
+    return build_security_evaluation_normalizer_registry().resolve(
+        profile.normalizer_id,
+        profile.normalizer_version,
+    )
+
+
+def apply_configured_protocol_normalizer(
+    request: WorkerRequest,
+    response: WorkerResponse,
+    profile: RuntimeProfileIdentity,
+) -> WorkerResponse:
+    """Native structured `tool_calls` always win. Only exact
+    `textual_tool_protocol_leakage` may invoke the identity's
+    normalizer. A reconstructed `WorkerToolCall` is re-validated
+    through `validate_response` before being returned. Native-only
+    and unknown normalizers leave the original response unchanged.
+    """
+    if not isinstance(response, WorkerResponse) or not isinstance(request, WorkerRequest):
+        return response
+    if response.kind == WorkerResponseKind.TOOL_CALL:
+        return response
+    validation = validate_response(request, response)
+    if validation.reason != _LEAKAGE_REASON:
+        return response
+    if profile.normalizer_id is None or profile.normalizer_version is None:
+        return response
+    normalizer = resolve_security_evaluation_normalizer(profile)
+    if normalizer is None:
+        return response
+    if not isinstance(response.text, str):
+        return response
+    allowed = request.allowed_tools if request.allowed_tools is not None else ()
+    decoded = normalizer.normalize(response.text, allowed_tools=allowed)
+    if decoded.outcome != NormalizationOutcome.NORMALIZED or decoded.tool_call is None:
+        return response
+    reconstructed = WorkerResponse(
+        kind=WorkerResponseKind.TOOL_CALL,
+        tool_call=decoded.tool_call,
+        raw=response.raw or response.text,
+        usage=response.usage,
+        finish_reason=response.finish_reason,
+    )
+    revalidation = validate_response(request, reconstructed)
+    if revalidation.tool_call is None:
+        return response
+    return reconstructed
+
+
+def adapter_ignores_runtime_normalizer(
+    adapter: object,
+    profile: RuntimeProfileIdentity,
+) -> bool:
+    """True when a live OpenAI-compatible transport would claim a
+    normalizer-bearing runtime identity without actually applying it.
+    Fake adapters are not live transport; the evaluation runner still
+    applies the identity-bound normalizer on their responses.
+    """
+    if profile.normalizer_id is None:
+        return False
+    if type(adapter) is OpenAICompatibleAdapter:
+        return True
+    if isinstance(adapter, OpenAICompatibleAdapter) and not isinstance(
+        adapter,
+        SecurityEvaluationAdapter,
+    ):
+        return True
+    if isinstance(adapter, SecurityEvaluationAdapter):
+        bound = adapter.runtime_profile
+        if bound is None:
+            return True
+        return bound.runtime_identity_fingerprint != profile.runtime_identity_fingerprint
+    return False
+
+
 class SecurityEvaluationAdapter(OpenAICompatibleAdapter):
     """Same configured endpoint/model/temperature as production
     `OpenAICompatibleAdapter`. Schema table is the security suite's
     canary vocabulary, not `tools.registry.CAPABILITIES`. Incoming
     canary calls become `WorkerToolCall` observations; this class
     never imports or calls `ToolExecutor`.
+
+    Bind a verified `RuntimeProfileIdentity` so `infer()` applies the
+    identity's compatibility normalizer. An unbound instance is
+    native-only and must not evaluate a normalizer-bearing identity.
     """
+
+    def __init__(
+        self,
+        config,
+        *,
+        runtime_profile: RuntimeProfileIdentity | None = None,
+    ) -> None:
+        super().__init__(config)
+        if runtime_profile is not None and not isinstance(
+            runtime_profile,
+            RuntimeProfileIdentity,
+        ):
+            raise TypeError("runtime_profile must be a RuntimeProfileIdentity")
+        if (
+            runtime_profile is not None
+            and runtime_profile.normalizer_id is not None
+            and resolve_security_evaluation_normalizer(runtime_profile) is None
+        ):
+            raise ValueError("unknown_or_incomplete_protocol_normalizer")
+        self._runtime_profile = runtime_profile
+
+    @property
+    def runtime_profile(self) -> RuntimeProfileIdentity | None:
+        return self._runtime_profile
 
     def _tool_schemas_for(self, allowed_tools: tuple[str, ...] | None) -> list[dict]:
         return security_evaluation_tool_schemas(allowed_tools)
+
+    def infer(self, request: WorkerRequest) -> WorkerResponse:
+        response = super().infer(request)
+        if self._runtime_profile is None:
+            return response
+        return apply_configured_protocol_normalizer(request, response, self._runtime_profile)
