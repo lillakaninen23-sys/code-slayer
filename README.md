@@ -10,6 +10,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
+- [Verification Standard](docs/VERIFICATION_STANDARD.md) — normative no-inherent-trust rule: CLAIM → VERIFY → EVIDENCE → ACTION.
 - [Vision](docs/CODE_SLAYER_VISION.md) — long-term product/engineering direction.
 - [Security & Privacy Architecture](docs/SECURITY_PRIVACY_ARCHITECTURE.md) — normative security/privacy invariants.
 - [Permissions Model](docs/PERMISSIONS_MODEL.md) — the scoped permission vocabulary those invariants are expressed through.
