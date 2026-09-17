@@ -48,6 +48,7 @@ class BaselineSecurityCertificatesRepo:
         normalizer_id: str | None = None,
         normalizer_version: int | None = None,
         runtime_config_fingerprint: str | None = None,
+        runtime_identity_fingerprint: str | None = None,
     ) -> WorkerBaselineSecurityCertificate:
         if not self._conn.in_transaction:
             raise RuntimeError(
@@ -57,9 +58,9 @@ class BaselineSecurityCertificatesRepo:
             "INSERT INTO worker_baseline_security_certificates "
             "(certificate_id, worker_id, baseline_version, model_tag, model_digest, "
             "endpoint, runtime_version, normalizer_id, normalizer_version, "
-            "runtime_config_fingerprint, outcome, "
+            "runtime_config_fingerprint, runtime_identity_fingerprint, outcome, "
             "hard_disqualifiers_json, evidence_ref, reason, issued_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 certificate_id,
                 worker_id,
@@ -71,6 +72,7 @@ class BaselineSecurityCertificatesRepo:
                 normalizer_id,
                 normalizer_version,
                 runtime_config_fingerprint,
+                runtime_identity_fingerprint,
                 outcome,
                 hard_disqualifiers_json,
                 evidence_ref,
@@ -120,4 +122,5 @@ def _row_to_certificate(row: sqlite3.Row) -> WorkerBaselineSecurityCertificate:
         normalizer_id=row["normalizer_id"],
         normalizer_version=row["normalizer_version"],
         runtime_config_fingerprint=row["runtime_config_fingerprint"],
+        runtime_identity_fingerprint=row["runtime_identity_fingerprint"],
     )

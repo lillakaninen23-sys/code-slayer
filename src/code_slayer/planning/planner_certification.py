@@ -69,41 +69,49 @@ verdict about the model) when:
   produced that way was never bound to a specific, verified runtime and
   can never be certified against one)
 - the `(model_tag, model_digest, endpoint, runtime_version,
-  normalizer_id, normalizer_version, runtime_config_fingerprint)`
+  normalizer_id, normalizer_version, runtime_identity_fingerprint)`
   recorded in every attempt's `AttemptProvenance`, across every
   instance, does not agree exactly — ambiguous evidence about which
   runtime was actually tested is never resolved by guessing one.
   Native-only (`normalizer_id is None`) is a different runtime identity
   from one that uses a compatibility normalizer; a certificate for one
-  must never silently cover the other. A missing runtime-config
-  fingerprint is a different identity from one that bound temperature,
-  context capacity, and output-token budget; a pre-fingerprint
-  certificate must never silently cover a fully-specified runtime.
+  must never silently cover the other. A missing v2 runtime-identity
+  fingerprint is a different identity from one that bound temperature
+  and context capacity; a pre-v15 certificate must never silently cover
+  a fully-specified runtime.
+- the `(output_token_budget, tool_choice_enforcement)` recorded across
+  every attempt does not agree exactly — mixed Planner evaluation
+  configurations are a different role/evaluation identity, never
+  collapsed into the common runtime identity.
 - the agreed-upon runtime profile is not fully specified (`workers.
   security_baseline.RuntimeProfileIdentity.is_fully_specified`) — see
   that property's own docstring for why a loosely-specified profile is
   never treated as a strong enough production binding
-- the canonical runtime-config spec reconstructed from provenance does
-  not recompute to the agreed `runtime_config_fingerprint` (tampered or
-  internally inconsistent evidence)
+- the canonical runtime-identity spec reconstructed from provenance does
+  not recompute to the agreed `runtime_identity_fingerprint`, or the
+  role/evaluation spec does not recompute to the agreed
+  `role_evaluation_fingerprint` (tampered or internally inconsistent
+  evidence)
 - durable qualification evidence cannot be persisted and re-read from
   `ContentStore` before issuance (missing store, kind mismatch, hash
-  mismatch, or fingerprint mismatch on the persisted spec)
+  mismatch, or fingerprint mismatch on the persisted specs)
 
 ## Evidence reference
 
 `planning.qualification` durably stores nothing of its own. This module
 persists a bounded canonical JSON document via
 `planning.qualification_evidence` *before* recording the certificate,
-and stores that blob's content hash as `evidence_ref`. The document
-contains the canonical `runtime-config-spec-v1` (so the fingerprint is
-later recomputable from durable state), each instance outcome, and the
-already-bounded `AttemptProvenance` records — never raw prompt or model
-text. A one-way fingerprint without that document is not sufficient
-forensic evidence; a document whose recomputed fingerprint does not
-match the certificate's `runtime_config_fingerprint` is refused. Existing
-certificates are never rewritten; their `evidence_ref` values stay as
-originally recorded."""
+and stores that blob's content hash as `evidence_ref`. The v2 document
+contains the canonical `runtime-identity-spec-v2` and
+`role-evaluation-spec-v1` (so both fingerprints are later recomputable
+from durable state), each instance outcome, and the already-bounded
+`AttemptProvenance` records — never raw prompt or model text. A
+one-way fingerprint without that document is not sufficient forensic
+evidence; a document whose recomputed fingerprints do not match the
+certificate is refused. Existing certificates are never rewritten;
+their `evidence_ref` values stay as originally recorded. Existing v1
+evidence documents remain readable under v1 semantics and are never
+reinterpreted as v2."""
 
 from __future__ import annotations
 
@@ -113,17 +121,20 @@ from pathlib import Path
 from code_slayer.planning.qualification import QualificationAttemptResult, QualificationOutcome
 from code_slayer.planning.qualification_evidence import (
     QualificationEvidenceError,
-    agreed_runtime_config_spec,
+    agreed_runtime_identity_spec,
     build_planner_qualification_evidence_document,
     persist_planner_qualification_evidence,
-    verify_runtime_config_fingerprint,
+    verify_runtime_identity_fingerprint,
 )
 from code_slayer.store.content_store import ContentStore
 from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleCertificationResult,
+    RoleEvaluationIdentity,
     RoleQualificationOutcome,
+    canonical_role_evaluation_spec,
     record_role_certificate,
+    role_evaluation_identity_from_config,
 )
 from code_slayer.workers.security_baseline import RuntimeProfileIdentity
 
@@ -155,7 +166,7 @@ def _agreed_runtime_profile(
     provenance recorded across every attempt in every instance does not
     agree on exactly one `(model_tag, model_digest, endpoint,
     runtime_version, normalizer_id, normalizer_version,
-    runtime_config_fingerprint)` tuple -- see the module docstring."""
+    runtime_identity_fingerprint)` tuple -- see the module docstring."""
     identities: set[
         tuple[str, str | None, str | None, str | None, str | None, int | None, str | None]
     ] = set()
@@ -171,7 +182,7 @@ def _agreed_runtime_profile(
                     attempt.runtime_version,
                     attempt.normalizer_id,
                     attempt.normalizer_version,
-                    attempt.runtime_config_fingerprint,
+                    attempt.runtime_identity_fingerprint,
                 ),
             )
     if len(identities) != 1:
@@ -183,7 +194,7 @@ def _agreed_runtime_profile(
         runtime_version,
         normalizer_id,
         normalizer_version,
-        runtime_config_fingerprint,
+        runtime_identity_fingerprint,
     ) = next(iter(identities))
     try:
         return RuntimeProfileIdentity(
@@ -193,9 +204,41 @@ def _agreed_runtime_profile(
             runtime_version=runtime_version,
             normalizer_id=normalizer_id,
             normalizer_version=normalizer_version,
-            runtime_config_fingerprint=runtime_config_fingerprint,
+            runtime_identity_fingerprint=runtime_identity_fingerprint,
         )
     except ValueError:
+        return None
+
+
+def _agreed_role_evaluation(
+    results: tuple[QualificationAttemptResult, ...],
+    runtime_profile: RuntimeProfileIdentity,
+) -> RoleEvaluationIdentity | None:
+    """`None` if output-token budget or tool-choice enforcement disagree
+    across attempts, or if the common runtime identity is missing.
+    Mixed Planner evaluation configurations are never collapsed into
+    the shared runtime identity."""
+    fingerprint = runtime_profile.runtime_identity_fingerprint
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    tuples: set[tuple[int, str]] = set()
+    for result in results:
+        if not result.provenance:
+            return None
+        for attempt in result.provenance:
+            tuples.add((attempt.output_token_budget, attempt.tool_choice_enforcement))
+    if len(tuples) != 1:
+        return None
+    output_token_budget, tool_choice_enforcement = next(iter(tuples))
+    try:
+        return role_evaluation_identity_from_config(
+            role=ProductionRole.PLANNER,
+            runtime_identity_fingerprint=fingerprint,
+            output_token_budget=output_token_budget,
+            tool_choice_enforcement=tool_choice_enforcement,
+            policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+        )
+    except (TypeError, ValueError):
         return None
 
 
@@ -218,6 +261,7 @@ def _persist_evidence(
     *,
     results: tuple[QualificationAttemptResult, ...],
     runtime_profile: RuntimeProfileIdentity,
+    role_evaluation: RoleEvaluationIdentity,
     classification: str,
 ) -> str:
     """Build, persist, and re-verify durable qualification evidence.
@@ -225,15 +269,24 @@ def _persist_evidence(
     `QualificationEvidenceError` on any fail-closed condition."""
     if not isinstance(blobs_dir, (str, Path)) or not str(blobs_dir).strip():
         raise QualificationEvidenceError("missing_durable_qualification_evidence")
-    fingerprint = runtime_profile.runtime_config_fingerprint
-    if not isinstance(fingerprint, str) or not fingerprint:
-        raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
-    spec = agreed_runtime_config_spec(results)
-    verify_runtime_config_fingerprint(spec, fingerprint)
+    identity_fingerprint = runtime_profile.runtime_identity_fingerprint
+    if not isinstance(identity_fingerprint, str) or not identity_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    identity_spec = agreed_runtime_identity_spec(results)
+    verify_runtime_identity_fingerprint(identity_spec, identity_fingerprint)
+    evaluation_spec = canonical_role_evaluation_spec(
+        role=role_evaluation.role,
+        runtime_identity_fingerprint=role_evaluation.runtime_identity_fingerprint,
+        output_token_budget=role_evaluation.output_token_budget,
+        tool_choice_enforcement=role_evaluation.tool_choice_enforcement,
+        policy_version=role_evaluation.policy_version,
+    )
     document = build_planner_qualification_evidence_document(
         results=results,
-        runtime_config_spec=spec,
-        runtime_config_fingerprint=fingerprint,
+        runtime_identity_spec=identity_spec,
+        runtime_identity_fingerprint=identity_fingerprint,
+        role_evaluation_spec=evaluation_spec,
+        role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
         policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
         classification=classification,
     )
@@ -241,7 +294,8 @@ def _persist_evidence(
     return persist_planner_qualification_evidence(
         store,
         document,
-        expected_runtime_config_fingerprint=fingerprint,
+        expected_runtime_identity_fingerprint=identity_fingerprint,
+        expected_role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
     )
 
 
@@ -264,9 +318,10 @@ def certify_planner_from_qualification(
     Durable qualification evidence is persisted to `blobs_dir` (the
     existing `ContentStore`) BEFORE the certificate row is written.
     Issuance refuses if that document cannot be stored and re-read with
-    a recomputed runtime-config fingerprint matching the certificate.
-    Never mutates `planning`'s own state and never re-invokes the
-    planner itself; this function performs no inference of its own."""
+    recomputed runtime-identity and role-evaluation fingerprints
+    matching the certificate. Never mutates `planning`'s own state and
+    never re-invokes the planner itself; this function performs no
+    inference of its own."""
     if not isinstance(results, tuple) or not results:
         return _deny("empty_qualification_evidence")
     if not all(isinstance(result, QualificationAttemptResult) for result in results):
@@ -279,6 +334,9 @@ def certify_planner_from_qualification(
         return _deny("ambiguous_or_unverified_runtime_profile_in_evidence")
     if not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
+    role_evaluation = _agreed_role_evaluation(results, runtime_profile)
+    if role_evaluation is None:
+        return _deny("ambiguous_or_unverified_role_evaluation_in_evidence")
     if runtime_profile.normalizer_id is None and any(
         attempt.tool_call_transport == "NORMALIZED"
         for result in results
@@ -296,6 +354,7 @@ def certify_planner_from_qualification(
             blobs_dir,
             results=results,
             runtime_profile=runtime_profile,
+            role_evaluation=role_evaluation,
             classification=classification,
         )
     except QualificationEvidenceError as exc:
@@ -314,5 +373,6 @@ def certify_planner_from_qualification(
         classification=classification,
         evidence_ref=evidence_ref,
         reason=reason,
+        role_evaluation=role_evaluation,
         **kwargs,
     )

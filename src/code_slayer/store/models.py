@@ -166,11 +166,11 @@ class WorkerBaselineSecurityCertificate:
 
     Append-only: a re-evaluation, or the same worker evaluated under a
     changed `model_tag`/`model_digest`/`endpoint`/`runtime_version`/
-    compatibility-normalizer identity/`runtime_config_fingerprint`,
-    always creates a new row. The current certificate for a given
-    `(worker_id, runtime profile)` binding is *derived* by finding the
-    most recent row whose profile fields match exactly — see
-    `code_slayer.workers.production_eligibility`.
+    compatibility-normalizer identity/`runtime_config_fingerprint`/
+    `runtime_identity_fingerprint`, always creates a new row. The current
+    certificate for a given `(worker_id, runtime profile)` binding is
+    *derived* by finding the most recent row whose common runtime-identity
+    fields match exactly — see `code_slayer.workers.production_eligibility`.
 
     `evidence_ref` is required on every row, `PASS`/`FAIL`/
     `HARD_DISQUALIFIED` alike — a certificate is never a bare boolean
@@ -194,6 +194,7 @@ class WorkerBaselineSecurityCertificate:
     normalizer_id: str | None = None
     normalizer_version: int | None = None
     runtime_config_fingerprint: str | None = None
+    runtime_identity_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -208,11 +209,12 @@ class WorkerRoleCertificate:
     `code_slayer.workers.role_qualification`'s module docstring.
 
     Append-only: a re-evaluation, a different role, or the same
-    `(worker_id, role)` evaluated under a changed runtime profile or
-    `policy_version`, always creates a new row. The current certificate
-    for a given `(worker_id, role, runtime profile)` binding is
-    *derived* by finding the most recent row whose profile fields match
-    exactly — see `code_slayer.workers.production_eligibility`.
+    `(worker_id, role)` evaluated under a changed runtime profile,
+    role/evaluation profile, or `policy_version`, always creates a new
+    row. The current certificate for a given `(worker_id, role, common
+    runtime identity, role/evaluation profile)` binding is *derived* by
+    finding the most recent row whose identity fields match exactly —
+    see `code_slayer.workers.production_eligibility`.
 
     `evidence_ref` is required on every row, `PASS`/`FAIL` alike — a
     certificate is never a bare boolean with no referenceable evidence.
@@ -237,6 +239,8 @@ class WorkerRoleCertificate:
     normalizer_id: str | None = None
     normalizer_version: int | None = None
     runtime_config_fingerprint: str | None = None
+    runtime_identity_fingerprint: str | None = None
+    role_evaluation_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)

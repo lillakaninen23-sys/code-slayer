@@ -32,11 +32,11 @@ from code_slayer.planning.qualification_evidence import (
     QUALIFICATION_EVIDENCE_KIND,
     QUALIFICATION_EVIDENCE_SPEC_VERSION,
     QualificationEvidenceError,
-    agreed_runtime_config_spec,
+    agreed_runtime_identity_spec,
     build_planner_qualification_evidence_document,
     persist_planner_qualification_evidence,
     read_planner_qualification_evidence,
-    verify_runtime_config_fingerprint,
+    verify_runtime_identity_fingerprint,
 )
 from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
@@ -45,10 +45,15 @@ from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import connect, migrate
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
-from code_slayer.workers.role_qualification import ProductionRole
+from code_slayer.workers.role_qualification import (
+    ProductionRole,
+    canonical_role_evaluation_spec,
+    fingerprint_role_evaluation,
+    role_evaluation_identity_from_config,
+)
 from code_slayer.workers.security_baseline import (
-    RUNTIME_CONFIG_SPEC_VERSION,
-    fingerprint_runtime_config,
+    RUNTIME_IDENTITY_SPEC_VERSION,
+    fingerprint_runtime_identity,
     runtime_profile_identity_from_config,
 )
 
@@ -68,6 +73,42 @@ _PROFILE = RuntimeContextProfile(
     runtime_version="0.1.0",
     temperature=0.0,
 )
+
+
+def _identity_and_eval(results, profile=_PROFILE):
+    identity_spec = agreed_runtime_identity_spec(results)
+    identity_fp = fingerprint_runtime_identity(identity_spec)
+    evaluation = role_evaluation_identity_from_config(
+        role=ProductionRole.PLANNER,
+        runtime_identity_fingerprint=identity_fp,
+        output_token_budget=profile.output_token_budget,
+        tool_choice_enforcement=profile.tool_choice_enforcement,
+        policy_version="planner-certification-v1",
+    )
+    evaluation_spec = canonical_role_evaluation_spec(
+        role=evaluation.role,
+        runtime_identity_fingerprint=evaluation.runtime_identity_fingerprint,
+        output_token_budget=evaluation.output_token_budget,
+        tool_choice_enforcement=evaluation.tool_choice_enforcement,
+        policy_version=evaluation.policy_version,
+    )
+    return identity_spec, identity_fp, evaluation_spec, evaluation.role_evaluation_fingerprint
+
+
+def _build_document(results, profile=_PROFILE, *, classification="PASS_FIRST_TRY"):
+    identity_spec, identity_fp, evaluation_spec, evaluation_fp = _identity_and_eval(
+        results,
+        profile,
+    )
+    return build_planner_qualification_evidence_document(
+        results=results,
+        runtime_identity_spec=identity_spec,
+        runtime_identity_fingerprint=identity_fp,
+        role_evaluation_spec=evaluation_spec,
+        role_evaluation_fingerprint=evaluation_fp,
+        policy_version="planner-certification-v1",
+        classification=classification,
+    ), identity_fp, evaluation_fp
 
 
 def _structured(*, transport=ToolCallTransport.NATIVE) -> PlannerResponse:
@@ -146,13 +187,16 @@ def test_canonical_runtime_spec_round_trips_durably(conn, blobs_dir):
         conn,
         blobs_dir,
         result.certificate.evidence_ref,
-        expected_runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
     )
     assert document["spec_version"] == QUALIFICATION_EVIDENCE_SPEC_VERSION
-    spec = document["runtime_config_spec"]
-    assert spec["spec_version"] == RUNTIME_CONFIG_SPEC_VERSION
-    expected = agreed_runtime_config_spec((evidence,))
+    spec = document["runtime_identity_spec"]
+    assert spec["spec_version"] == RUNTIME_IDENTITY_SPEC_VERSION
+    expected = agreed_runtime_identity_spec((evidence,))
     assert spec == expected
+    assert "output_token_budget" not in spec
+    assert "tool_choice_enforcement" not in spec
     assert document["model_tag"] == _PROFILE.model_tag
     assert document["model_digest"] == _PROFILE.model_digest
     assert document["endpoint"] == _PROFILE.endpoint
@@ -163,6 +207,7 @@ def test_canonical_runtime_spec_round_trips_durably(conn, blobs_dir):
     assert document["temperature"] == _PROFILE.temperature
     assert document["output_token_budget"] == _PROFILE.output_token_budget
     assert document["tool_choice_enforcement"] == _PROFILE.tool_choice_enforcement
+    assert document["role_evaluation_spec"]["output_token_budget"] == _PROFILE.output_token_budget
 
 
 # -- 2. recomputed fingerprint equals the certificate runtime fingerprint ----
@@ -175,27 +220,29 @@ def test_recomputed_spec_fingerprint_equals_certificate_fingerprint(conn, blobs_
         conn,
         blobs_dir,
         result.certificate.evidence_ref,
-        expected_runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
     )
-    recomputed = fingerprint_runtime_config(document["runtime_config_spec"])
-    assert recomputed == result.certificate.runtime_config_fingerprint
-    assert recomputed == document["runtime_config_fingerprint"]
+    recomputed = fingerprint_runtime_identity(document["runtime_identity_spec"])
+    assert recomputed == result.certificate.runtime_identity_fingerprint
+    assert recomputed == document["runtime_identity_fingerprint"]
     expected = runtime_profile_identity_from_config(
         model_tag=_PROFILE.model_tag,
         model_digest=_PROFILE.model_digest,
         endpoint=_PROFILE.endpoint,
         runtime_version=_PROFILE.runtime_version,
         effective_context_tokens=_PROFILE.effective_context_tokens,
-        output_token_budget=_PROFILE.output_token_budget,
         temperature=_PROFILE.temperature,
-        tool_choice_enforcement=_PROFILE.tool_choice_enforcement,
         normalizer_id=_PROFILE.normalizer_id,
         normalizer_version=_PROFILE.normalizer_version,
     )
-    assert recomputed == expected.runtime_config_fingerprint
-    verify_runtime_config_fingerprint(
-        document["runtime_config_spec"],
-        result.certificate.runtime_config_fingerprint,
+    assert recomputed == expected.runtime_identity_fingerprint
+    verify_runtime_identity_fingerprint(
+        document["runtime_identity_spec"],
+        result.certificate.runtime_identity_fingerprint,
+    )
+    assert fingerprint_role_evaluation(document["role_evaluation_spec"]) == (
+        result.certificate.role_evaluation_fingerprint
     )
 
 
@@ -204,25 +251,18 @@ def test_recomputed_spec_fingerprint_equals_certificate_fingerprint(conn, blobs_
 
 def test_tampered_spec_fails_closed_before_persist(conn, blobs_dir):
     evidence = _pass_result()
-    spec = agreed_runtime_config_spec((evidence,))
-    fingerprint = fingerprint_runtime_config(spec)
-    document = build_planner_qualification_evidence_document(
-        results=(evidence,),
-        runtime_config_spec=spec,
-        runtime_config_fingerprint=fingerprint,
-        policy_version="planner-certification-v1",
-        classification="PASS_FIRST_TRY",
-    )
+    document, identity_fp, evaluation_fp = _build_document((evidence,))
     tampered = dict(document)
-    tampered_spec = dict(spec)
+    tampered_spec = dict(document["runtime_identity_spec"])
     tampered_spec["temperature"] = 1.5
-    tampered["runtime_config_spec"] = tampered_spec
+    tampered["runtime_identity_spec"] = tampered_spec
     store = ContentStore(conn, blobs_dir)
-    with pytest.raises(QualificationEvidenceError, match="runtime_config_fingerprint_mismatch"):
+    with pytest.raises(QualificationEvidenceError, match="runtime_identity_fingerprint_mismatch"):
         persist_planner_qualification_evidence(
             store,
             tampered,
-            expected_runtime_config_fingerprint=fingerprint,
+            expected_runtime_identity_fingerprint=identity_fp,
+            expected_role_evaluation_fingerprint=evaluation_fp,
         )
     assert conn.execute("SELECT count(*) AS c FROM content_blobs").fetchone()["c"] == 0
     assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
@@ -230,26 +270,20 @@ def test_tampered_spec_fails_closed_before_persist(conn, blobs_dir):
 
 def test_mismatched_expected_fingerprint_fails_closed(conn, blobs_dir):
     evidence = _pass_result()
-    spec = agreed_runtime_config_spec((evidence,))
-    fingerprint = fingerprint_runtime_config(spec)
-    document = build_planner_qualification_evidence_document(
-        results=(evidence,),
-        runtime_config_spec=spec,
-        runtime_config_fingerprint=fingerprint,
-        policy_version="planner-certification-v1",
-        classification="PASS_FIRST_TRY",
-    )
-    other = dict(spec)
+    document, identity_fp, evaluation_fp = _build_document((evidence,))
+    other = dict(document["runtime_identity_spec"])
     other["temperature"] = 1.5
-    other_fp = fingerprint_runtime_config(other)
+    other_fp = fingerprint_runtime_identity(other)
     store = ContentStore(conn, blobs_dir)
-    with pytest.raises(QualificationEvidenceError, match="runtime_config_fingerprint_mismatch"):
+    with pytest.raises(QualificationEvidenceError, match="runtime_identity_fingerprint_mismatch"):
         persist_planner_qualification_evidence(
             store,
             document,
-            expected_runtime_config_fingerprint=other_fp,
+            expected_runtime_identity_fingerprint=other_fp,
+            expected_role_evaluation_fingerprint=evaluation_fp,
         )
     assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
+    assert identity_fp != other_fp
 
 
 # -- 4. qualification attempt provenance survives process restart ------------
@@ -266,7 +300,8 @@ def test_qualification_attempt_provenance_survives_process_restart(tmp_path):
     issued = _certify(conn, blobs, (evidence,))
     assert issued.ok
     evidence_ref = issued.certificate.evidence_ref
-    fingerprint = issued.certificate.runtime_config_fingerprint
+    identity_fp = issued.certificate.runtime_identity_fingerprint
+    evaluation_fp = issued.certificate.role_evaluation_fingerprint
     original_transport = evidence.provenance[0].tool_call_transport
     original_request_fp = evidence.provenance[0].request_fingerprint
     conn.close()
@@ -277,13 +312,16 @@ def test_qualification_attempt_provenance_survives_process_restart(tmp_path):
             reopened,
             blobs,
             evidence_ref,
-            expected_runtime_config_fingerprint=fingerprint,
+            expected_runtime_identity_fingerprint=identity_fp,
+            expected_role_evaluation_fingerprint=evaluation_fp,
         )
         cert = RoleCertificatesRepo(reopened).get(issued.certificate.certificate_id)
         assert cert is not None
         assert cert.evidence_ref == evidence_ref
-        assert cert.runtime_config_fingerprint == fingerprint
-        assert fingerprint_runtime_config(document["runtime_config_spec"]) == fingerprint
+        assert cert.runtime_identity_fingerprint == identity_fp
+        assert cert.role_evaluation_fingerprint == evaluation_fp
+        assert fingerprint_runtime_identity(document["runtime_identity_spec"]) == identity_fp
+        assert fingerprint_role_evaluation(document["role_evaluation_spec"]) == evaluation_fp
         attempt = document["instances"][0]["provenance"][0]
         assert attempt["request_fingerprint"] == original_request_fp
         assert attempt["task_fingerprint"] == evidence.provenance[0].task_fingerprint
@@ -292,6 +330,7 @@ def test_qualification_attempt_provenance_survives_process_restart(tmp_path):
         assert attempt["schema_fingerprint"] == evidence.provenance[0].schema_fingerprint
         assert attempt["tool_call_transport"] == original_transport
         assert attempt["full_input_preservation_verified"] is False
+        assert attempt["runtime_identity_fingerprint"] == identity_fp
     finally:
         reopened.close()
 
@@ -338,7 +377,8 @@ def test_native_vs_normalized_transport_is_retained_in_evidence(conn, blobs_dir)
         conn,
         blobs_dir,
         result.certificate.evidence_ref,
-        expected_runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
     )
     assert document["instances"][0]["provenance"][0]["tool_call_transport"] == "NATIVE"
     assert document["normalizer_id"] is None
@@ -365,13 +405,14 @@ def test_native_vs_normalized_transport_is_retained_in_evidence(conn, blobs_dir)
         conn,
         blobs_dir,
         norm_result.certificate.evidence_ref,
-        expected_runtime_config_fingerprint=norm_result.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=norm_result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=norm_result.certificate.role_evaluation_fingerprint,
     )
     assert norm_doc["instances"][0]["provenance"][0]["tool_call_transport"] == "NORMALIZED"
     assert norm_doc["normalizer_id"] == "qwen_textual_tool_v1"
     assert norm_doc["normalizer_version"] == 1
-    assert result.certificate.runtime_config_fingerprint != (
-        norm_result.certificate.runtime_config_fingerprint
+    assert result.certificate.runtime_identity_fingerprint != (
+        norm_result.certificate.runtime_identity_fingerprint
     )
 
 
@@ -431,19 +472,12 @@ def test_qualification_evidence_blob_does_not_grant_authority(conn, blobs_dir):
     """Persisting the evidence document alone, without certification,
     must not create any certificate, trust event, or permission."""
     evidence = _pass_result()
-    spec = agreed_runtime_config_spec((evidence,))
-    fingerprint = fingerprint_runtime_config(spec)
-    document = build_planner_qualification_evidence_document(
-        results=(evidence,),
-        runtime_config_spec=spec,
-        runtime_config_fingerprint=fingerprint,
-        policy_version="planner-certification-v1",
-        classification="PASS_FIRST_TRY",
-    )
+    document, identity_fp, evaluation_fp = _build_document((evidence,))
     persist_planner_qualification_evidence(
         ContentStore(conn, blobs_dir),
         document,
-        expected_runtime_config_fingerprint=fingerprint,
+        expected_runtime_identity_fingerprint=identity_fp,
+        expected_role_evaluation_fingerprint=evaluation_fp,
     )
     assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
     _assert_no_unrelated_authority(conn)
@@ -487,7 +521,8 @@ def test_document_records_attempt_count_correction_and_classification(conn, blob
         conn,
         blobs_dir,
         result.certificate.evidence_ref,
-        expected_runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
     )
     assert document["final_classification"] == "PASS_AFTER_FEEDBACK"
     assert document["attempt_count"] == 2

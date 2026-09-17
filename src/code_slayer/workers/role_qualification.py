@@ -59,12 +59,24 @@ DIFFERENT role's certificate — there is no code path whereby, e.g., a
 
 ## Identity and runtime-profile binding
 
-Reuses `workers.security_baseline.RuntimeProfileIdentity` unchanged —
-the same identity vocabulary, the same exact-match-no-wildcard
-`.matches()` semantics, for the same reason (see that module's own
-docstring, including `.is_fully_specified` for why `workers.
-production_eligibility` demands a completely specified profile before
-ever trusting either certificate kind for a real decision).
+Reuses `workers.security_baseline.RuntimeProfileIdentity` unchanged as
+the COMMON, role-independent runtime identity — the same exact-match-
+no-wildcard `.matches()` semantics, for the same reason (see that
+module's own docstring, including `.is_fully_specified` for why
+`workers.production_eligibility` demands a completely specified common
+runtime profile before ever trusting either certificate kind for a real
+decision).
+
+A role certificate additionally binds a `RoleEvaluationIdentity`: the
+canonical, versioned evaluation configuration that materially affected
+that role's qualification (common runtime-identity fingerprint, output-
+token budget, tool-choice enforcement, role, policy/version). This is
+generic enough for future CODER / REVIEWER / REPAIRER / SECURITY role
+qualification. Baseline Security must never reuse a Planner (or any
+other role) evaluation profile — it matches only the common runtime
+identity. `None` for `role_evaluation_fingerprint` is a complete
+statement of absence, not a wildcard: a legacy v1 Planner certificate
+cannot authorize a current fully specified role/evaluation profile.
 
 ## No fabrication, ever
 
@@ -101,18 +113,25 @@ recent certificate matching the current profile.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
+from code_slayer.audit.canonical import canonical_json
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.models import WorkerRoleCertificate
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
-from code_slayer.workers.security_baseline import RuntimeProfileIdentity
+from code_slayer.workers.security_baseline import (
+    RuntimeProfileIdentity,
+    require_sha256_hex,
+)
+
+ROLE_EVALUATION_SPEC_VERSION = "role-evaluation-spec-v1"
 
 
 class ProductionRole(StrEnum):
@@ -140,6 +159,154 @@ class RoleQualificationOutcome(StrEnum):
     FAIL = "FAIL"
 
 
+def _non_negative_int(name: str, value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def canonical_role_evaluation_spec(
+    *,
+    role: ProductionRole,
+    runtime_identity_fingerprint: str,
+    output_token_budget: int,
+    tool_choice_enforcement: str,
+    policy_version: str,
+) -> dict:
+    """The one canonical, versioned role/evaluation document a role
+    certificate binds in addition to the common runtime identity.
+    Callers never supply this as free-form JSON from a model; every
+    field is a caller-verified value.
+
+    Generic across PLANNER / CODER / REVIEWER / REPAIRER / SECURITY:
+    the role name and that role's own policy/version are part of the
+    identity, so a Planner evaluation profile can never silently
+    authorize a Coder (or Baseline Security) decision. The common
+    runtime-identity fingerprint is included so a role profile is
+    never detached from the runtime it was evaluated on."""
+    if not isinstance(role, ProductionRole):
+        raise TypeError("role must be a ProductionRole")
+    require_sha256_hex("runtime_identity_fingerprint", runtime_identity_fingerprint)
+    if not isinstance(tool_choice_enforcement, str) or not tool_choice_enforcement.strip():
+        raise ValueError("tool_choice_enforcement must be a non-empty string")
+    if not isinstance(policy_version, str) or not policy_version.strip():
+        raise ValueError("policy_version must be a non-empty string")
+    return {
+        "spec_version": ROLE_EVALUATION_SPEC_VERSION,
+        "role": role.value,
+        "runtime_identity_fingerprint": runtime_identity_fingerprint,
+        "output_token_budget": _non_negative_int("output_token_budget", output_token_budget),
+        "tool_choice_enforcement": tool_choice_enforcement,
+        "policy_version": policy_version,
+    }
+
+
+def fingerprint_role_evaluation(spec: dict) -> str:
+    """SHA-256 of `canonical_json(spec)`. Exact-match identity: any
+    evaluation-relevant field change, or a spec-version bump, produces
+    a different fingerprint. Never a wildcard. A common-runtime v2
+    document is refused — that identity space is separate."""
+    if not isinstance(spec, dict):
+        raise TypeError("role evaluation spec must be a dict")
+    if spec.get("spec_version") != ROLE_EVALUATION_SPEC_VERSION:
+        raise ValueError("role evaluation spec_version is missing or unsupported")
+    digest = hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
+    return require_sha256_hex("role_evaluation_fingerprint", digest)
+
+
+def role_evaluation_identity_from_config(
+    *,
+    role: ProductionRole,
+    runtime_identity_fingerprint: str,
+    output_token_budget: int,
+    tool_choice_enforcement: str,
+    policy_version: str,
+) -> RoleEvaluationIdentity:
+    """The one production-grade constructor: the fingerprint is derived
+    from the canonical spec, never supplied independently, and never
+    read from a model response."""
+    spec = canonical_role_evaluation_spec(
+        role=role,
+        runtime_identity_fingerprint=runtime_identity_fingerprint,
+        output_token_budget=output_token_budget,
+        tool_choice_enforcement=tool_choice_enforcement,
+        policy_version=policy_version,
+    )
+    return RoleEvaluationIdentity(
+        role=role,
+        runtime_identity_fingerprint=runtime_identity_fingerprint,
+        output_token_budget=spec["output_token_budget"],
+        tool_choice_enforcement=tool_choice_enforcement,
+        policy_version=policy_version,
+        role_evaluation_fingerprint=fingerprint_role_evaluation(spec),
+    )
+
+
+@dataclass(frozen=True)
+class RoleEvaluationIdentity:
+    """The evaluation configuration that materially affected one role
+    qualification — bound to the common runtime identity, never a
+    substitute for it.
+
+    `None` is not representable for the fingerprint: a missing
+    evaluation identity is expressed by omitting this object (recording
+    stores NULL; production eligibility fails closed). Direct
+    construction is for reconstructing a stored fingerprint; the
+    production-grade constructor is `role_evaluation_identity_from_config`."""
+
+    role: ProductionRole
+    runtime_identity_fingerprint: str
+    output_token_budget: int
+    tool_choice_enforcement: str
+    policy_version: str
+    role_evaluation_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, ProductionRole):
+            raise TypeError("role must be a ProductionRole")
+        require_sha256_hex(
+            "runtime_identity_fingerprint",
+            self.runtime_identity_fingerprint,
+        )
+        require_sha256_hex(
+            "role_evaluation_fingerprint",
+            self.role_evaluation_fingerprint,
+        )
+        if (
+            not isinstance(self.output_token_budget, int)
+            or isinstance(self.output_token_budget, bool)
+            or self.output_token_budget < 0
+        ):
+            raise ValueError("output_token_budget must be a non-negative integer")
+        if (
+            not isinstance(self.tool_choice_enforcement, str)
+            or not self.tool_choice_enforcement.strip()
+        ):
+            raise ValueError("tool_choice_enforcement must be a non-empty string")
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise ValueError("policy_version must be a non-empty string")
+
+    def matches(self, other: RoleEvaluationIdentity) -> bool:
+        """Exact match on every field — never a wildcard."""
+        if not isinstance(other, RoleEvaluationIdentity):
+            return False
+        return (
+            self.role == other.role
+            and self.runtime_identity_fingerprint == other.runtime_identity_fingerprint
+            and self.output_token_budget == other.output_token_budget
+            and self.tool_choice_enforcement == other.tool_choice_enforcement
+            and self.policy_version == other.policy_version
+            and self.role_evaluation_fingerprint == other.role_evaluation_fingerprint
+        )
+
+    @property
+    def is_fully_specified(self) -> bool:
+        """A constructed `RoleEvaluationIdentity` is fully specified by
+        construction: missing identity is expressed by the absence of
+        this object, never by NULL fields acting as wildcards."""
+        return True
+
+
 @dataclass(frozen=True)
 class RoleCertificationResult:
     ok: bool
@@ -162,6 +329,7 @@ def record_role_certificate(
     classification: str,
     evidence_ref: str,
     reason: str,
+    role_evaluation: RoleEvaluationIdentity | None = None,
     now_fn=utcnow_iso,
 ) -> RoleCertificationResult:
     """Durably record one role-qualification certification decision —
@@ -175,12 +343,16 @@ def record_role_certificate(
     unknown worker, a non-`ProductionRole` role, a non-
     `RuntimeProfileIdentity` profile, a blank `policy_version`, an
     `outcome` not in `RoleQualificationOutcome`, a blank `classification`,
-    a blank `evidence_ref`, or a blank `reason`. Nothing here decides
-    that the worker IS qualified for the role — it decides only whether
-    the caller's already-computed decision is well-formed enough to
-    durably trust as evidence. Models never self-certify: this function
-    has no notion of a model's own claim about itself, only whatever the
-    caller (a code-owned certification boundary) already verified."""
+    a blank `evidence_ref`, a blank `reason`, or a `role_evaluation`
+    that disagrees with `role`/`policy_version`/the common runtime
+    identity. Recording remains honest about a missing evaluation
+    identity (`role_evaluation is None` stores NULL, which is never a
+    wildcard). Nothing here decides that the worker IS qualified for
+    the role — it decides only whether the caller's already-computed
+    decision is well-formed enough to durably trust as evidence. Models
+    never self-certify: this function has no notion of a model's own
+    claim about itself, only whatever the caller (a code-owned
+    certification boundary) already verified."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_certificate_request")
     if not isinstance(role, ProductionRole):
@@ -197,6 +369,19 @@ def record_role_certificate(
         return _deny("missing_evidence_reference")
     if not isinstance(reason, str) or not reason.strip():
         return _deny("malformed_certificate_request")
+    if role_evaluation is not None:
+        if not isinstance(role_evaluation, RoleEvaluationIdentity):
+            return _deny("malformed_certificate_request")
+        if role_evaluation.role != role:
+            return _deny("malformed_certificate_request")
+        if role_evaluation.policy_version != policy_version:
+            return _deny("malformed_certificate_request")
+        if (
+            runtime_profile.runtime_identity_fingerprint is None
+            or role_evaluation.runtime_identity_fingerprint
+            != runtime_profile.runtime_identity_fingerprint
+        ):
+            return _deny("malformed_certificate_request")
 
     with transaction(conn):
         if WorkersRepo(conn).get(worker_id) is None:
@@ -215,6 +400,10 @@ def record_role_certificate(
             normalizer_id=runtime_profile.normalizer_id,
             normalizer_version=runtime_profile.normalizer_version,
             runtime_config_fingerprint=runtime_profile.runtime_config_fingerprint,
+            runtime_identity_fingerprint=runtime_profile.runtime_identity_fingerprint,
+            role_evaluation_fingerprint=(
+                None if role_evaluation is None else role_evaluation.role_evaluation_fingerprint
+            ),
             outcome=outcome.value,
             classification=classification,
             evidence_ref=evidence_ref,
@@ -238,6 +427,12 @@ def record_role_certificate(
                 "normalizer_id": runtime_profile.normalizer_id,
                 "normalizer_version": runtime_profile.normalizer_version,
                 "runtime_config_fingerprint": runtime_profile.runtime_config_fingerprint,
+                "runtime_identity_fingerprint": runtime_profile.runtime_identity_fingerprint,
+                "role_evaluation_fingerprint": (
+                    None
+                    if role_evaluation is None
+                    else role_evaluation.role_evaluation_fingerprint
+                ),
                 "outcome": outcome.value,
                 "classification": classification,
                 "evidence_ref": evidence_ref,

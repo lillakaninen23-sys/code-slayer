@@ -31,6 +31,7 @@ from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleQualificationOutcome,
     record_role_certificate,
+    role_evaluation_identity_from_config,
 )
 from code_slayer.workers.security_baseline import (
     HardDisqualifierCategory,
@@ -41,6 +42,7 @@ from code_slayer.workers.security_baseline import (
 )
 
 POLICY_VERSION = "planner-certification-v1"
+_UNSET = object()
 
 
 class _FakeClock:
@@ -64,12 +66,22 @@ def _full_profile(**overrides) -> RuntimeProfileIdentity:
         endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
         effective_context_tokens=16384,
-        output_token_budget=4096,
         temperature=0.0,
-        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
     )
     kwargs.update(overrides)
     return runtime_profile_identity_from_config(**kwargs)
+
+
+def _role_eval(profile: RuntimeProfileIdentity, role=ProductionRole.PLANNER, **overrides):
+    kwargs = dict(
+        role=role,
+        runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        output_token_budget=4096,
+        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        policy_version=POLICY_VERSION,
+    )
+    kwargs.update(overrides)
+    return role_evaluation_identity_from_config(**kwargs)
 
 
 @pytest.fixture
@@ -117,44 +129,84 @@ def _security_hard_disqualified(conn, worker_id, profile, *, now_fn=None, eviden
     )
 
 
-def _role_pass(conn, worker_id, role, profile, *, now_fn=None, evidence_ref="role-ev"):
+def _role_pass(
+    conn,
+    worker_id,
+    role,
+    profile,
+    *,
+    now_fn=None,
+    evidence_ref="role-ev",
+    role_evaluation=_UNSET,
+):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
+    evaluation = _role_eval(profile, role=role) if role_evaluation is _UNSET else role_evaluation
+    extra = {} if evaluation is None else {"role_evaluation": evaluation}
+    policy_version = POLICY_VERSION if evaluation is None else evaluation.policy_version
     return record_role_certificate(
         conn,
         worker_id=worker_id,
         role=role,
         runtime_profile=profile,
-        policy_version=POLICY_VERSION,
+        policy_version=policy_version,
         outcome=RoleQualificationOutcome.PASS,
         classification="PASS_FIRST_TRY",
         evidence_ref=evidence_ref,
         reason="ok",
+        **extra,
         **kwargs,
     )
 
 
-def _role_fail(conn, worker_id, role, profile, *, now_fn=None, evidence_ref="role-ev"):
+def _role_fail(
+    conn,
+    worker_id,
+    role,
+    profile,
+    *,
+    now_fn=None,
+    evidence_ref="role-ev",
+    role_evaluation=_UNSET,
+):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
+    evaluation = _role_eval(profile, role=role) if role_evaluation is _UNSET else role_evaluation
+    extra = {} if evaluation is None else {"role_evaluation": evaluation}
+    policy_version = POLICY_VERSION if evaluation is None else evaluation.policy_version
     return record_role_certificate(
         conn,
         worker_id=worker_id,
         role=role,
         runtime_profile=profile,
-        policy_version=POLICY_VERSION,
+        policy_version=policy_version,
         outcome=RoleQualificationOutcome.FAIL,
         classification="FAIL_POLICY",
         evidence_ref=evidence_ref,
         reason="bad",
+        **extra,
         **kwargs,
     )
 
 
-def _evaluate(conn, worker_id, role, profile, *, policy_version=POLICY_VERSION):
+def _evaluate(
+    conn,
+    worker_id,
+    role,
+    profile,
+    *,
+    policy_version=POLICY_VERSION,
+    role_evaluation=None,
+):
+    evaluation = role_evaluation or _role_eval(
+        profile,
+        role=role,
+        policy_version=policy_version,
+    )
     return evaluate_production_eligibility(
         conn,
         worker_id=worker_id,
         role=role,
         runtime_profile=profile,
+        role_evaluation=evaluation,
         expected_role_policy_version=policy_version,
     )
 
@@ -336,7 +388,7 @@ def test_role_certificate_for_a_different_profile_is_denied(db_conn, registered_
 
 def test_role_certificate_with_wrong_policy_version_is_denied(db_conn, registered_worker, profile):
     security = _security_pass(db_conn, registered_worker, profile)
-    role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(
         db_conn,
         registered_worker,
@@ -346,9 +398,8 @@ def test_role_certificate_with_wrong_policy_version_is_denied(db_conn, registere
     )
     assert decision == EligibilityDecision(
         False,
-        "role_certificate_policy_version_stale",
+        "role_certificate_evaluation_profile_mismatch",
         security_certificate_id=security.certificate.certificate_id,
-        role_certificate_id=role.certificate.certificate_id,
     )
 
 
@@ -374,6 +425,8 @@ def test_role_certificate_recorded_under_a_stale_prior_policy_version_is_denied(
             normalizer_id=profile.normalizer_id,
             normalizer_version=profile.normalizer_version,
             runtime_config_fingerprint=profile.runtime_config_fingerprint,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+            role_evaluation_fingerprint=_role_eval(profile).role_evaluation_fingerprint,
             outcome=RoleQualificationOutcome.PASS.value,
             classification="PASS_FIRST_TRY",
             evidence_ref="ev",
@@ -406,6 +459,7 @@ def test_security_certificate_recorded_under_a_stale_baseline_version_is_denied(
             normalizer_id=profile.normalizer_id,
             normalizer_version=profile.normalizer_version,
             runtime_config_fingerprint=profile.runtime_config_fingerprint,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
             outcome=SecurityBaselineOutcome.PASS.value,
             hard_disqualifiers_json="[]",
             evidence_ref="ev",
@@ -442,6 +496,8 @@ def test_role_certificate_with_unknown_persisted_outcome_fails_closed(
             normalizer_id=profile.normalizer_id,
             normalizer_version=profile.normalizer_version,
             runtime_config_fingerprint=profile.runtime_config_fingerprint,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+            role_evaluation_fingerprint=_role_eval(profile).role_evaluation_fingerprint,
             outcome="SOMETHING_UNEXPECTED",
             classification="corrupted",
             evidence_ref="ev",
@@ -474,6 +530,7 @@ def test_security_certificate_with_unknown_persisted_outcome_fails_closed(
             normalizer_id=profile.normalizer_id,
             normalizer_version=profile.normalizer_version,
             runtime_config_fingerprint=profile.runtime_config_fingerprint,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
             outcome="SOMETHING_UNEXPECTED",
             hard_disqualifiers_json="[]",
             evidence_ref="ev",
@@ -521,6 +578,7 @@ def test_evaluate_production_eligibility_accepts_no_role_verdict_parameter():
         "worker_id",
         "role",
         "runtime_profile",
+        "role_evaluation",
         "expected_role_policy_version",
     }
 
@@ -578,20 +636,29 @@ def test_malformed_role_type_is_denied(db_conn, registered_worker, profile):
         worker_id=registered_worker,
         role="planner",  # a plain string, not the enum
         runtime_profile=profile,
+        role_evaluation=_role_eval(profile),
         expected_role_policy_version=POLICY_VERSION,
     )
     assert decision == EligibilityDecision(False, "malformed_eligibility_request")
 
 
-def test_incompletely_specified_runtime_profile_is_denied(db_conn, registered_worker):
+def test_incompletely_specified_runtime_profile_is_denied(db_conn, registered_worker, profile):
     weak_profile = RuntimeProfileIdentity(model_tag="devstral:24b")
-    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, weak_profile)
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=weak_profile,
+        role_evaluation=_role_eval(profile),
+        expected_role_policy_version=POLICY_VERSION,
+    )
     assert decision == EligibilityDecision(False, "insufficient_runtime_profile_identity")
 
 
 def test_incompletely_specified_profile_is_denied_even_with_a_matching_weak_certificate(
     db_conn,
     registered_worker,
+    profile,
 ):
     """A certificate CAN legitimately be recorded against a loosely
     specified profile (recording stays honest about what was actually
@@ -599,8 +666,21 @@ def test_incompletely_specified_profile_is_denied_even_with_a_matching_weak_cert
     treat it as authoritative."""
     weak_profile = RuntimeProfileIdentity(model_tag="devstral:24b")
     _security_pass(db_conn, registered_worker, weak_profile)
-    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, weak_profile)
-    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, weak_profile)
+    _role_pass(
+        db_conn,
+        registered_worker,
+        ProductionRole.PLANNER,
+        weak_profile,
+        role_evaluation=None,
+    )
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=weak_profile,
+        role_evaluation=_role_eval(profile),
+        expected_role_policy_version=POLICY_VERSION,
+    )
     assert decision == EligibilityDecision(False, "insufficient_runtime_profile_identity")
 
 
@@ -708,11 +788,23 @@ def test_effective_context_mismatch_is_denied(db_conn, registered_worker, profil
 
 
 def test_output_token_budget_mismatch_is_denied(db_conn, registered_worker, profile):
-    _security_pass(db_conn, registered_worker, profile)
+    """Output-token budget is role/evaluation identity, not common
+    runtime identity: Baseline Security still matches, Planner does not."""
+    security = _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
-    smaller = _full_profile(output_token_budget=1024)
-    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, smaller)
-    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+    smaller = _role_eval(profile, output_token_budget=1024)
+    decision = _evaluate(
+        db_conn,
+        registered_worker,
+        ProductionRole.PLANNER,
+        profile,
+        role_evaluation=smaller,
+    )
+    assert decision == EligibilityDecision(
+        False,
+        "role_certificate_evaluation_profile_mismatch",
+        security_certificate_id=security.certificate.certificate_id,
+    )
 
 
 def test_legacy_null_fingerprint_does_not_authorize_fully_specified_runtime(
@@ -720,9 +812,11 @@ def test_legacy_null_fingerprint_does_not_authorize_fully_specified_runtime(
     registered_worker,
     profile,
 ):
-    """A pre-v14 certificate (NULL fingerprint) with otherwise identical
-    model/endpoint/runtime/normalizer fields must not authorize a
-    current fully-specified runtime. None is never a wildcard."""
+    """A pre-v15 certificate (NULL runtime_identity_fingerprint) with
+    otherwise identical model/endpoint/runtime/normalizer fields must
+    not authorize a current fully-specified runtime. None is never a
+    wildcard. Historical v1 runtime_config_fingerprint is not
+    reinterpreted as v2 identity."""
     legacy = RuntimeProfileIdentity(
         model_tag=profile.model_tag,
         model_digest=profile.model_digest,
@@ -730,26 +824,48 @@ def test_legacy_null_fingerprint_does_not_authorize_fully_specified_runtime(
         runtime_version=profile.runtime_version,
         normalizer_id=profile.normalizer_id,
         normalizer_version=profile.normalizer_version,
-        runtime_config_fingerprint=None,
+        runtime_config_fingerprint="6db4abb1296545e63bf422fb40d52222bc44cc4e4e20287ae8f4f006d2832855",
+        runtime_identity_fingerprint=None,
     )
     assert not legacy.is_fully_specified
     _security_pass(db_conn, registered_worker, legacy)
-    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, legacy)
+    _role_pass(
+        db_conn,
+        registered_worker,
+        ProductionRole.PLANNER,
+        legacy,
+        role_evaluation=None,
+    )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
 
 
-def test_missing_runtime_config_fingerprint_is_insufficient(db_conn, registered_worker):
-    """Tag/digest/endpoint/runtime_version without a fingerprint is not
-    a production-authoritative identity, even if certificates exist for
-    that incomplete profile."""
+def test_missing_runtime_identity_fingerprint_is_insufficient(db_conn, registered_worker, profile):
+    """Tag/digest/endpoint/runtime_version without a v2 identity
+    fingerprint is not a production-authoritative identity, even if
+    certificates exist for that incomplete profile. A historical v1
+    fingerprint does not substitute."""
     incomplete = RuntimeProfileIdentity(
         model_tag="devstral:24b",
         model_digest="sha256:abc",
         endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
+        runtime_config_fingerprint="6db4abb1296545e63bf422fb40d52222bc44cc4e4e20287ae8f4f006d2832855",
     )
     _security_pass(db_conn, registered_worker, incomplete)
-    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, incomplete)
-    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, incomplete)
+    _role_pass(
+        db_conn,
+        registered_worker,
+        ProductionRole.PLANNER,
+        incomplete,
+        role_evaluation=None,
+    )
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=incomplete,
+        role_evaluation=_role_eval(profile),
+        expected_role_policy_version=POLICY_VERSION,
+    )
     assert decision == EligibilityDecision(False, "insufficient_runtime_profile_identity")

@@ -329,12 +329,15 @@ explicit note on what prior decision this supersedes.
 `build_attempt_provenance()` binds one attempt to the exact request/
 runtime/profile that produced it, including the token measurement's own
 source/method, the expected-vs-actual input comparison, output-budget
-exhaustion evidence, sampling temperature, and the canonical
-runtime-config fingerprint when qualification-relevant inference
-configuration was established. Raw repository text is never stored —
-only bounded sha256 fingerprints. The fingerprint is derived from the
-same `workers.security_baseline.runtime_profile_identity_from_config`
+exhaustion evidence, sampling temperature, the historical v1
+runtime-config fingerprint, and the v2 common runtime-identity
+fingerprint when qualification-relevant inference configuration was
+established. Raw repository text is never stored — only bounded sha256
+fingerprints. The common runtime identity is derived from the same
+`workers.security_baseline.runtime_profile_identity_from_config`
 constructor production eligibility consults; a model never supplies it.
+The historical v1 fingerprint is retained as forensic evidence of that
+identity space and is never reinterpreted as the v2 common identity.
 """
 
 from __future__ import annotations
@@ -871,10 +874,41 @@ class RuntimeContextProfile:
         return self.required_context_tokens(measured_input_tokens) <= self.effective_context_tokens
 
     def runtime_config_fingerprint(self) -> str | None:
-        """The canonical runtime-config fingerprint for this profile, or
-        `None` when qualification-relevant inference configuration was
-        not established (no temperature) and a production identity
-        cannot be derived. Never supplied by a model."""
+        """Historical `runtime-config-spec-v1` fingerprint for this
+        profile, or `None` when qualification-relevant inference
+        configuration was not established (no temperature). Never
+        supplied by a model. This is NOT the production common-runtime
+        identity — see `runtime_identity_fingerprint()`."""
+        if self.temperature is None:
+            return None
+        from code_slayer.workers.security_baseline import (
+            canonical_runtime_config_spec,
+            fingerprint_runtime_config,
+        )
+
+        try:
+            return fingerprint_runtime_config(
+                canonical_runtime_config_spec(
+                    model_tag=self.model_tag,
+                    model_digest=self.model_digest,
+                    endpoint=self.endpoint,
+                    runtime_version=self.runtime_version,
+                    normalizer_id=self.normalizer_id,
+                    normalizer_version=self.normalizer_version,
+                    effective_context_tokens=self.effective_context_tokens,
+                    output_token_budget=self.output_token_budget,
+                    temperature=float(self.temperature),
+                    tool_choice_enforcement=self.tool_choice_enforcement,
+                ),
+            )
+        except ValueError:
+            return None
+
+    def runtime_identity_fingerprint(self) -> str | None:
+        """The canonical v2 common-runtime fingerprint for this profile,
+        or `None` when the common runtime identity cannot be derived
+        (no temperature). Never supplied by a model. Does not include
+        output-token budget or tool-choice enforcement."""
         if self.temperature is None:
             return None
         from code_slayer.workers.security_baseline import runtime_profile_identity_from_config
@@ -888,10 +922,8 @@ class RuntimeContextProfile:
                 normalizer_id=self.normalizer_id,
                 normalizer_version=self.normalizer_version,
                 effective_context_tokens=self.effective_context_tokens,
-                output_token_budget=self.output_token_budget,
                 temperature=float(self.temperature),
-                tool_choice_enforcement=self.tool_choice_enforcement,
-            ).runtime_config_fingerprint
+            ).runtime_identity_fingerprint
         except ValueError:
             return None
 
@@ -1518,6 +1550,7 @@ class AttemptProvenance:
     tool_call_transport: str | None = None
     temperature: float | None = None
     runtime_config_fingerprint: str | None = None
+    runtime_identity_fingerprint: str | None = None
 
 
 def build_attempt_provenance(
@@ -1603,6 +1636,7 @@ def build_attempt_provenance(
         ),
         temperature=profile.temperature,
         runtime_config_fingerprint=profile.runtime_config_fingerprint(),
+        runtime_identity_fingerprint=profile.runtime_identity_fingerprint(),
     )
 
 

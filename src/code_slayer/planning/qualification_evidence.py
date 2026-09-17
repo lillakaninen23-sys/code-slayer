@@ -3,11 +3,10 @@
 ## Purpose: reconstructable evidence, never authority
 
 `planning.qualification` is intentionally non-durable: it never writes
-Code Slayer's control-plane database. A one-way
-`runtime_config_fingerprint` on a role certificate is enough for exact
-matching, but not enough to later answer *which canonical runtime-config
-spec produced that fingerprint*, or *which qualification attempts
-supported the certificate*, without process memory, logs, or an
+Code Slayer's control-plane database. Fingerprints on a role certificate
+are enough for exact matching, but not enough to later answer *which
+canonical specs produced those fingerprints*, or *which qualification
+attempts supported the certificate*, without process memory, logs, or an
 external report.
 
 This module is the missing forensic record. It persists one bounded,
@@ -15,24 +14,36 @@ canonical JSON document in the existing `ContentStore` and returns its
 content hash. `planning.planner_certification` writes that document
 BEFORE calling `workers.role_qualification.record_role_certificate()`,
 and stores the content hash as the certificate's existing `evidence_ref`.
-That is the smallest clean extension: no new certificate column, no
-rewrite of already-applied migrations, no change to parser acceptance,
-permissions, trust, or Baseline Security certificates.
+That is the smallest clean extension: no new certificate column for the
+blob itself.
+
+New documents use `planner-qualification-evidence-v2` and durably
+contain enough canonical information to reconstruct and independently
+verify BOTH:
+
+- the common runtime identity (`runtime-identity-spec-v2` + fingerprint)
+- the Planner role/evaluation profile (`role-evaluation-spec-v1` +
+  fingerprint)
+
+Existing `planner-qualification-evidence-v1` documents remain readable
+and verifiable under the v1 semantics that produced them
+(`runtime-config-spec-v1`). They are never rewritten, migrated, or
+reinterpreted as v2. Holding a v1 blob does not grant a v2 identity.
 
 The document never grants authority itself. Holding a blob of kind
 `planner_qualification_evidence` does not certify anyone, does not
-widen permission, and does not substitute for a role certificate. A
-model cannot supply runtime-identity fields: every identity value
-folded in here is copied from caller-verified
-`planning.qualification.AttemptProvenance` (which itself copies
-`RuntimeContextProfile`), never from `PlannerResponse` identity claims.
+widen permission, does not issue a Baseline Security certificate, and
+does not substitute for a role certificate. A model cannot supply
+runtime-identity fields: every identity value folded in here is copied
+from caller-verified `planning.qualification.AttemptProvenance` (which
+itself copies `RuntimeContextProfile`), never from `PlannerResponse`
+identity claims.
 
 ## What is persisted, and what is not
 
 Persisted (canonical JSON, content-addressed, internal, non-exportable):
 
-- the canonical `runtime-config-spec-v1` document and its spec version
-- the SHA-256 `runtime_config_fingerprint` of that spec
+- the canonical common-runtime and role/evaluation specs and fingerprints
 - model tag / digest / endpoint / runtime version
 - compatibility-normalizer id/version (`None`/`None` = native-only)
 - effective context tokens, temperature, output-token budget,
@@ -54,16 +65,17 @@ authoritative for raw/internal evidence where applicable.
 
 ## Fail closed
 
-The recorded fingerprint MUST be recomputable from the persisted spec
-and MUST match the certificate's `runtime_config_fingerprint` before
-issuance. A missing store, a spec/fingerprint mismatch, a wrong
-`source_kind`, an exportable blob, a hash mismatch on re-read, or a
-document that contains a forbidden raw-text key is a certification-
-boundary refusal — no certificate is recorded.
+Recorded fingerprints MUST be recomputable from the persisted specs
+and MUST match the certificate's identity columns before issuance. A
+missing store, a spec/fingerprint mismatch, a wrong `source_kind`, an
+exportable blob, a hash mismatch on re-read, or a document that
+contains a forbidden raw-text key is a certification-boundary refusal
+— no certificate is recorded.
 
-No schema migration: `content_blobs` (schema v1) already stores the
-bytes; `worker_role_certificates.evidence_ref` (schema v12) already
-references them. Existing certificates are never rewritten.
+No schema migration for the blob itself: `content_blobs` (schema v1)
+already stores the bytes; `worker_role_certificates.evidence_ref`
+(schema v12) already references them. Existing certificates and their
+evidence blobs are never rewritten.
 """
 
 from __future__ import annotations
@@ -81,12 +93,18 @@ from code_slayer.planning.qualification import (
     QualificationOutcome,
 )
 from code_slayer.store.content_store import BlobTooLargeError, ContentStore
+from code_slayer.workers.role_qualification import (
+    fingerprint_role_evaluation,
+)
 from code_slayer.workers.security_baseline import (
     canonical_runtime_config_spec,
+    canonical_runtime_identity_spec,
     fingerprint_runtime_config,
+    fingerprint_runtime_identity,
 )
 
-QUALIFICATION_EVIDENCE_SPEC_VERSION = "planner-qualification-evidence-v1"
+QUALIFICATION_EVIDENCE_SPEC_VERSION_V1 = "planner-qualification-evidence-v1"
+QUALIFICATION_EVIDENCE_SPEC_VERSION = "planner-qualification-evidence-v2"
 QUALIFICATION_EVIDENCE_KIND = "planner_qualification_evidence"
 MAX_QUALIFICATION_EVIDENCE_BYTES = 256 * 1024
 
@@ -121,10 +139,10 @@ class QualificationEvidenceError(ValueError):
 
 
 def runtime_config_spec_from_provenance(attempt: AttemptProvenance) -> dict:
-    """Rebuild the canonical `runtime-config-spec-v1` document from one
-    bounded attempt's caller-verified provenance. Never reads a model
-    response. Raises `QualificationEvidenceError` if the attempt did not
-    establish qualification-relevant inference configuration."""
+    """Rebuild the historical canonical `runtime-config-spec-v1` document
+    from one bounded attempt's caller-verified provenance. Never reads a
+    model response. Raises `QualificationEvidenceError` if the attempt
+    did not establish qualification-relevant inference configuration."""
     if attempt.temperature is None:
         raise QualificationEvidenceError("runtime_config_spec_not_established")
     try:
@@ -144,18 +162,34 @@ def runtime_config_spec_from_provenance(attempt: AttemptProvenance) -> dict:
         raise QualificationEvidenceError("runtime_config_spec_not_established") from exc
 
 
-def agreed_runtime_config_spec(
-    results: tuple[QualificationAttemptResult, ...],
-) -> dict:
-    """The one canonical spec every attempt in every instance agrees on.
-    Disagreement, or an attempt that cannot produce a spec, fails
-    closed — never resolved by picking one."""
+def runtime_identity_spec_from_provenance(attempt: AttemptProvenance) -> dict:
+    """Rebuild the canonical `runtime-identity-spec-v2` document from
+    one bounded attempt's caller-verified provenance. Never reads a
+    model response."""
+    if attempt.temperature is None:
+        raise QualificationEvidenceError("runtime_identity_spec_not_established")
+    try:
+        return canonical_runtime_identity_spec(
+            model_tag=attempt.model_tag,
+            model_digest=attempt.model_digest,
+            endpoint=attempt.endpoint,
+            runtime_version=attempt.runtime_version,
+            normalizer_id=attempt.normalizer_id,
+            normalizer_version=attempt.normalizer_version,
+            effective_context_tokens=attempt.effective_context_tokens,
+            temperature=attempt.temperature,
+        )
+    except (TypeError, ValueError) as exc:
+        raise QualificationEvidenceError("runtime_identity_spec_not_established") from exc
+
+
+def _agreed_spec(results: tuple[QualificationAttemptResult, ...], builder) -> dict:
     specs: list[dict] = []
     for result in results:
         if not result.provenance:
             raise QualificationEvidenceError("runtime_config_spec_not_established")
         for attempt in result.provenance:
-            specs.append(runtime_config_spec_from_provenance(attempt))
+            specs.append(builder(attempt))
     if not specs:
         raise QualificationEvidenceError("runtime_config_spec_not_established")
     first = specs[0]
@@ -164,10 +198,39 @@ def agreed_runtime_config_spec(
     return first
 
 
+def agreed_runtime_config_spec(
+    results: tuple[QualificationAttemptResult, ...],
+) -> dict:
+    """The one historical v1 spec every attempt in every instance agrees
+    on. Disagreement, or an attempt that cannot produce a spec, fails
+    closed — never resolved by picking one."""
+    try:
+        return _agreed_spec(results, runtime_config_spec_from_provenance)
+    except QualificationEvidenceError:
+        raise
+
+
+def agreed_runtime_identity_spec(
+    results: tuple[QualificationAttemptResult, ...],
+) -> dict:
+    """The one canonical v2 common-runtime spec every attempt in every
+    instance agrees on. Disagreement fails closed — never resolved by
+    picking one."""
+    try:
+        return _agreed_spec(results, runtime_identity_spec_from_provenance)
+    except QualificationEvidenceError as exc:
+        if exc.reason == "runtime_config_spec_not_established":
+            raise QualificationEvidenceError("runtime_identity_spec_not_established") from exc
+        if exc.reason == "runtime_config_spec_mismatch":
+            raise QualificationEvidenceError("runtime_identity_spec_mismatch") from exc
+        raise
+
+
 def verify_runtime_config_fingerprint(spec: dict, expected_fingerprint: str) -> str:
-    """Recompute the fingerprint from `spec` and require it to equal
-    `expected_fingerprint`. Returns the recomputed digest. Mismatch or
-    an unsupported spec fails closed."""
+    """Recompute the historical v1 fingerprint from `spec` and require
+    it to equal `expected_fingerprint`. Returns the recomputed digest.
+    Mismatch or an unsupported spec fails closed. A v2 document is
+    refused rather than reinterpreted as v1."""
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
         raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
     try:
@@ -176,6 +239,35 @@ def verify_runtime_config_fingerprint(spec: dict, expected_fingerprint: str) -> 
         raise QualificationEvidenceError("runtime_config_fingerprint_mismatch") from exc
     if recomputed != expected_fingerprint:
         raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
+    return recomputed
+
+
+def verify_runtime_identity_fingerprint(spec: dict, expected_fingerprint: str) -> str:
+    """Recompute the v2 common-runtime fingerprint from `spec` and
+    require it to equal `expected_fingerprint`. A v1 document is
+    refused rather than reinterpreted as v2."""
+    if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    try:
+        recomputed = fingerprint_runtime_identity(spec)
+    except (TypeError, ValueError) as exc:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch") from exc
+    if recomputed != expected_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    return recomputed
+
+
+def verify_role_evaluation_fingerprint(spec: dict, expected_fingerprint: str) -> str:
+    """Recompute the role/evaluation fingerprint from `spec` and
+    require it to equal `expected_fingerprint`."""
+    if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    try:
+        recomputed = fingerprint_role_evaluation(spec)
+    except (TypeError, ValueError) as exc:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch") from exc
+    if recomputed != expected_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     return recomputed
 
 
@@ -229,6 +321,7 @@ def _provenance_to_dict(attempt: AttemptProvenance) -> dict:
         "tool_call_transport": attempt.tool_call_transport,
         "temperature": attempt.temperature,
         "runtime_config_fingerprint": attempt.runtime_config_fingerprint,
+        "runtime_identity_fingerprint": attempt.runtime_identity_fingerprint,
     }
 
 
@@ -248,12 +341,14 @@ def _instance_to_dict(result: QualificationAttemptResult) -> dict:
 def build_planner_qualification_evidence_document(
     *,
     results: tuple[QualificationAttemptResult, ...],
-    runtime_config_spec: dict,
-    runtime_config_fingerprint: str,
+    runtime_identity_spec: dict,
+    runtime_identity_fingerprint: str,
+    role_evaluation_spec: dict,
+    role_evaluation_fingerprint: str,
     policy_version: str,
     classification: str,
 ) -> dict:
-    """Pure. Builds the canonical document; does not write anything.
+    """Pure. Builds the canonical v2 document; does not write anything.
     Fingerprint mismatch fails closed before a caller can persist."""
     if not isinstance(results, tuple) or not results:
         raise QualificationEvidenceError("empty_qualification_evidence")
@@ -261,15 +356,26 @@ def build_planner_qualification_evidence_document(
         raise QualificationEvidenceError("malformed_qualification_evidence")
     if not isinstance(classification, str) or not classification.strip():
         raise QualificationEvidenceError("malformed_qualification_evidence")
-    verify_runtime_config_fingerprint(runtime_config_spec, runtime_config_fingerprint)
-    agreed = agreed_runtime_config_spec(results)
-    if agreed != runtime_config_spec:
-        raise QualificationEvidenceError("runtime_config_spec_mismatch")
-    verify_runtime_config_fingerprint(agreed, runtime_config_fingerprint)
+    verify_runtime_identity_fingerprint(runtime_identity_spec, runtime_identity_fingerprint)
+    verify_role_evaluation_fingerprint(role_evaluation_spec, role_evaluation_fingerprint)
+    agreed = agreed_runtime_identity_spec(results)
+    if agreed != runtime_identity_spec:
+        raise QualificationEvidenceError("runtime_identity_spec_mismatch")
+    verify_runtime_identity_fingerprint(agreed, runtime_identity_fingerprint)
+    if role_evaluation_spec.get("runtime_identity_fingerprint") != runtime_identity_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_runtime_identity_mismatch")
+    if role_evaluation_spec.get("policy_version") != policy_version:
+        raise QualificationEvidenceError("malformed_qualification_evidence")
     for result in results:
         for attempt in result.provenance:
-            if attempt.runtime_config_fingerprint != runtime_config_fingerprint:
-                raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
+            if attempt.runtime_identity_fingerprint != runtime_identity_fingerprint:
+                raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+            if attempt.output_token_budget != role_evaluation_spec.get("output_token_budget"):
+                raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+            if attempt.tool_choice_enforcement != role_evaluation_spec.get(
+                "tool_choice_enforcement",
+            ):
+                raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
 
     total_attempts = sum(result.attempt_count for result in results)
     correction_used = any(
@@ -280,18 +386,20 @@ def build_planner_qualification_evidence_document(
         "spec_version": QUALIFICATION_EVIDENCE_SPEC_VERSION,
         "role": "PLANNER",
         "policy_version": policy_version,
-        "runtime_config_spec": runtime_config_spec,
-        "runtime_config_fingerprint": runtime_config_fingerprint,
-        "model_tag": runtime_config_spec["model_tag"],
-        "model_digest": runtime_config_spec["model_digest"],
-        "endpoint": runtime_config_spec["endpoint"],
-        "runtime_version": runtime_config_spec["runtime_version"],
-        "normalizer_id": runtime_config_spec["normalizer_id"],
-        "normalizer_version": runtime_config_spec["normalizer_version"],
-        "effective_context_tokens": runtime_config_spec["effective_context_tokens"],
-        "temperature": runtime_config_spec["temperature"],
-        "output_token_budget": runtime_config_spec["output_token_budget"],
-        "tool_choice_enforcement": runtime_config_spec["tool_choice_enforcement"],
+        "runtime_identity_spec": runtime_identity_spec,
+        "runtime_identity_fingerprint": runtime_identity_fingerprint,
+        "role_evaluation_spec": role_evaluation_spec,
+        "role_evaluation_fingerprint": role_evaluation_fingerprint,
+        "model_tag": runtime_identity_spec["model_tag"],
+        "model_digest": runtime_identity_spec["model_digest"],
+        "endpoint": runtime_identity_spec["endpoint"],
+        "runtime_version": runtime_identity_spec["runtime_version"],
+        "normalizer_id": runtime_identity_spec["normalizer_id"],
+        "normalizer_version": runtime_identity_spec["normalizer_version"],
+        "effective_context_tokens": runtime_identity_spec["effective_context_tokens"],
+        "temperature": runtime_identity_spec["temperature"],
+        "output_token_budget": role_evaluation_spec["output_token_budget"],
+        "tool_choice_enforcement": role_evaluation_spec["tool_choice_enforcement"],
         "final_classification": classification,
         "instance_count": len(results),
         "attempt_count": total_attempts,
@@ -302,22 +410,11 @@ def build_planner_qualification_evidence_document(
     return document
 
 
-def _verify_document_bytes(
-    data: bytes,
+def _verify_v1_document(
+    document: dict,
     *,
     expected_runtime_config_fingerprint: str,
 ) -> dict:
-    if len(data) > MAX_QUALIFICATION_EVIDENCE_BYTES:
-        raise QualificationEvidenceError("qualification_evidence_too_large")
-    try:
-        document = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise QualificationEvidenceError("malformed_qualification_evidence") from exc
-    if not isinstance(document, dict):
-        raise QualificationEvidenceError("malformed_qualification_evidence")
-    if document.get("spec_version") != QUALIFICATION_EVIDENCE_SPEC_VERSION:
-        raise QualificationEvidenceError("unsupported_qualification_evidence_spec")
-    _forbid_raw_text_keys(document)
     spec = document.get("runtime_config_spec")
     claimed = document.get("runtime_config_fingerprint")
     if not isinstance(spec, dict) or not isinstance(claimed, str):
@@ -330,23 +427,100 @@ def _verify_document_bytes(
     return document
 
 
+def _verify_v2_document(
+    document: dict,
+    *,
+    expected_runtime_identity_fingerprint: str,
+    expected_role_evaluation_fingerprint: str,
+) -> dict:
+    identity_spec = document.get("runtime_identity_spec")
+    claimed_identity = document.get("runtime_identity_fingerprint")
+    evaluation_spec = document.get("role_evaluation_spec")
+    claimed_evaluation = document.get("role_evaluation_fingerprint")
+    if (
+        not isinstance(identity_spec, dict)
+        or not isinstance(claimed_identity, str)
+        or not isinstance(evaluation_spec, dict)
+        or not isinstance(claimed_evaluation, str)
+    ):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    recomputed_identity = verify_runtime_identity_fingerprint(identity_spec, claimed_identity)
+    if recomputed_identity != expected_runtime_identity_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    if claimed_identity != expected_runtime_identity_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    recomputed_evaluation = verify_role_evaluation_fingerprint(
+        evaluation_spec,
+        claimed_evaluation,
+    )
+    if recomputed_evaluation != expected_role_evaluation_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    if claimed_evaluation != expected_role_evaluation_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    if evaluation_spec.get("runtime_identity_fingerprint") != claimed_identity:
+        raise QualificationEvidenceError("role_evaluation_runtime_identity_mismatch")
+    return document
+
+
+def _verify_document_bytes(
+    data: bytes,
+    *,
+    expected_runtime_identity_fingerprint: str | None = None,
+    expected_role_evaluation_fingerprint: str | None = None,
+    expected_runtime_config_fingerprint: str | None = None,
+) -> dict:
+    if len(data) > MAX_QUALIFICATION_EVIDENCE_BYTES:
+        raise QualificationEvidenceError("qualification_evidence_too_large")
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QualificationEvidenceError("malformed_qualification_evidence") from exc
+    if not isinstance(document, dict):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    spec_version = document.get("spec_version")
+    _forbid_raw_text_keys(document)
+    if spec_version == QUALIFICATION_EVIDENCE_SPEC_VERSION_V1:
+        if not isinstance(expected_runtime_config_fingerprint, str):
+            raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
+        return _verify_v1_document(
+            document,
+            expected_runtime_config_fingerprint=expected_runtime_config_fingerprint,
+        )
+    if spec_version != QUALIFICATION_EVIDENCE_SPEC_VERSION:
+        raise QualificationEvidenceError("unsupported_qualification_evidence_spec")
+    if not isinstance(expected_runtime_identity_fingerprint, str):
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    if not isinstance(expected_role_evaluation_fingerprint, str):
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    return _verify_v2_document(
+        document,
+        expected_runtime_identity_fingerprint=expected_runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=expected_role_evaluation_fingerprint,
+    )
+
+
 def persist_planner_qualification_evidence(
     store: ContentStore,
     document: dict,
     *,
-    expected_runtime_config_fingerprint: str,
+    expected_runtime_identity_fingerprint: str,
+    expected_role_evaluation_fingerprint: str,
 ) -> str:
-    """Write the canonical document as an internal, non-exportable
+    """Write the canonical v2 document as an internal, non-exportable
     content-addressed blob and return its content hash. Re-reads and
-    re-verifies the fingerprint from the persisted spec before
-    returning. Never grants a certificate."""
+    re-verifies both fingerprints from the persisted specs before
+    returning. Never grants a certificate. v1 documents cannot be
+    persisted through this path — historical evidence stays immutable."""
     if not isinstance(store, ContentStore):
         raise QualificationEvidenceError("missing_durable_qualification_evidence")
+    if document.get("spec_version") != QUALIFICATION_EVIDENCE_SPEC_VERSION:
+        raise QualificationEvidenceError("unsupported_qualification_evidence_spec")
     _forbid_raw_text_keys(document)
     payload = canonical_json(document).encode("utf-8")
     _verify_document_bytes(
         payload,
-        expected_runtime_config_fingerprint=expected_runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=expected_runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=expected_role_evaluation_fingerprint,
     )
     if len(payload) > MAX_QUALIFICATION_EVIDENCE_BYTES:
         raise QualificationEvidenceError("qualification_evidence_too_large")
@@ -366,7 +540,8 @@ def persist_planner_qualification_evidence(
         raise QualificationEvidenceError("durable_qualification_evidence_hash_mismatch")
     _verify_document_bytes(
         reread,
-        expected_runtime_config_fingerprint=expected_runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=expected_runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=expected_role_evaluation_fingerprint,
     )
     return blob.content_hash
 
@@ -376,12 +551,16 @@ def read_planner_qualification_evidence(
     blobs_dir: Path | str,
     content_hash: str,
     *,
+    expected_runtime_identity_fingerprint: str | None = None,
+    expected_role_evaluation_fingerprint: str | None = None,
     expected_runtime_config_fingerprint: str | None = None,
 ) -> dict:
     """Reconstruct the canonical document from durable state. Fails
     closed on missing blob, wrong kind, exportable classification, hash
     mismatch, or (when supplied) fingerprint mismatch. Survives process
-    restart because it only reads `content_blobs` plus the blob file."""
+    restart because it only reads `content_blobs` plus the blob file.
+    v1 documents verify against `expected_runtime_config_fingerprint`;
+    v2 documents verify against both new fingerprints."""
     if not isinstance(content_hash, str) or not content_hash.strip():
         raise QualificationEvidenceError("missing_durable_qualification_evidence")
     store = ContentStore(conn, blobs_dir)
@@ -393,11 +572,28 @@ def read_planner_qualification_evidence(
     data = store.read(content_hash)
     if hashlib.sha256(data).hexdigest() != content_hash:
         raise QualificationEvidenceError("durable_qualification_evidence_hash_mismatch")
-    document = json.loads(data.decode("utf-8"))
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QualificationEvidenceError("malformed_qualification_evidence") from exc
     if not isinstance(document, dict):
         raise QualificationEvidenceError("malformed_qualification_evidence")
-    claimed = document.get("runtime_config_fingerprint")
-    expected = expected_runtime_config_fingerprint or claimed
-    if not isinstance(expected, str):
-        raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
-    return _verify_document_bytes(data, expected_runtime_config_fingerprint=expected)
+    if document.get("spec_version") == QUALIFICATION_EVIDENCE_SPEC_VERSION_V1:
+        claimed = document.get("runtime_config_fingerprint")
+        expected = expected_runtime_config_fingerprint or claimed
+        if not isinstance(expected, str):
+            raise QualificationEvidenceError("runtime_config_fingerprint_mismatch")
+        return _verify_document_bytes(data, expected_runtime_config_fingerprint=expected)
+    claimed_identity = document.get("runtime_identity_fingerprint")
+    claimed_evaluation = document.get("role_evaluation_fingerprint")
+    expected_identity = expected_runtime_identity_fingerprint or claimed_identity
+    expected_evaluation = expected_role_evaluation_fingerprint or claimed_evaluation
+    if not isinstance(expected_identity, str):
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    if not isinstance(expected_evaluation, str):
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    return _verify_document_bytes(
+        data,
+        expected_runtime_identity_fingerprint=expected_identity,
+        expected_role_evaluation_fingerprint=expected_evaluation,
+    )

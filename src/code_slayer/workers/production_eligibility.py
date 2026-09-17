@@ -49,31 +49,40 @@ own distinct reason code for audit/provenance clarity.
 
 ## Runtime-profile binding: no silent stale reuse, and no weak binding
 
-A certificate (of either kind) is consulted only if its own recorded
-`RuntimeProfileIdentity` matches the CALLER-SUPPLIED current profile
-exactly (`RuntimeProfileIdentity.matches()`). A certificate for a
-*different* profile bound to the same `worker_id`/role is treated
-exactly the same as no certificate at all, never silently reused. Among
-certificates that DO match, the most recent one always wins (`store.
+A Baseline Security certificate is consulted only if its own recorded
+COMMON runtime identity (`RuntimeProfileIdentity.matches()`) matches
+the CALLER-SUPPLIED current common runtime exactly. A role certificate
+is consulted only if it matches that same common runtime identity AND
+its recorded `role_evaluation_fingerprint` matches the CALLER-SUPPLIED
+current `RoleEvaluationIdentity`. A certificate for a *different*
+common runtime, or a role certificate for a *different* evaluation
+profile, bound to the same `worker_id`/role is treated exactly the same
+as no certificate at all, never silently reused. Among certificates
+that DO match, the most recent one always wins (`store.
 *_certificates_repo`'s own `issued_at DESC` ordering): an older,
 superseded certificate is never preferred over a newer one, even if the
 newer one reversed the verdict.
 
 **This function additionally refuses to evaluate eligibility at all
-against an incompletely-specified `runtime_profile`**
-(`RuntimeProfileIdentity.is_fully_specified` — every one of `model_tag`/
-`model_digest`/`endpoint`/`runtime_version`/`runtime_config_fingerprint`
-must be populated). A certificate MAY legitimately be recorded with only
-`model_tag` known, or without a runtime-config fingerprint
-(`workers.security_baseline`/`workers.role_qualification` still accept
-that — recording should stay honest about what evaluation time actually
-established), but a real PRODUCTION decision must never pretend a
-loosely-specified profile is a strong enough runtime-profile binding:
-two meaningfully different runtimes could otherwise share the same
-`model_tag`-only profile, or a pre-v14 NULL-fingerprint certificate
-could otherwise authorize a later temperature/context/output-budget
-change, and be silently confused for each other. Unknown identity fails
-closed here rather than wildcard-matching.
+against an incompletely-specified `runtime_profile` or
+`role_evaluation`** (`RuntimeProfileIdentity.is_fully_specified` —
+every one of `model_tag`/`model_digest`/`endpoint`/`runtime_version`/
+`runtime_identity_fingerprint` must be populated; `RoleEvaluationIdentity`
+is fully specified by construction). A certificate MAY legitimately be
+recorded with only `model_tag` known, or without a v2 runtime-identity
+fingerprint or role-evaluation fingerprint (`workers.security_baseline`/
+`workers.role_qualification` still accept that — recording should stay
+honest about what evaluation time actually established), but a real
+PRODUCTION decision must never pretend a loosely-specified profile is a
+strong enough runtime-profile binding: two meaningfully different
+runtimes could otherwise share the same `model_tag`-only profile, a
+pre-v15 NULL-identity certificate could otherwise authorize a later
+temperature/context change, or a legacy v1 Planner certificate
+(`runtime_config_fingerprint` only) could otherwise wildcard-match a
+current fully specified common identity plus role/evaluation profile.
+Unknown identity fails closed here rather than wildcard-matching.
+Historical v1 `runtime_config_fingerprint` values are never
+reinterpreted as v2 common-runtime identity.
 
 ## No trust/qualification mutation, ever
 
@@ -133,7 +142,11 @@ from code_slayer.store.baseline_security_certificates_repo import (
 )
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
-from code_slayer.workers.role_qualification import ProductionRole, RoleQualificationOutcome
+from code_slayer.workers.role_qualification import (
+    ProductionRole,
+    RoleEvaluationIdentity,
+    RoleQualificationOutcome,
+)
 from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
     RuntimeProfileIdentity,
@@ -153,23 +166,47 @@ def _deny(reason: str, **kwargs) -> EligibilityDecision:
     return EligibilityDecision(False, reason, **kwargs)
 
 
-def _matching_certificate(certificates, runtime_profile):
-    """The first (most recent, by the repo's own ordering) certificate
-    whose recorded profile matches `runtime_profile` exactly, or `None`.
-    Shared logic for both certificate kinds — both repos already return
-    their rows most-recent-first."""
+def _profile_from_certificate(certificate) -> RuntimeProfileIdentity:
+    """Rebuild the COMMON runtime identity a certificate recorded.
+    Historical `runtime_config_fingerprint` is preserved on the object
+    but is not part of `.matches()` — v1 hashes are never reinterpreted
+    as v2 common-runtime identity."""
+    return RuntimeProfileIdentity(
+        model_tag=certificate.model_tag,
+        model_digest=certificate.model_digest,
+        endpoint=certificate.endpoint,
+        runtime_version=certificate.runtime_version,
+        normalizer_id=certificate.normalizer_id,
+        normalizer_version=certificate.normalizer_version,
+        runtime_config_fingerprint=certificate.runtime_config_fingerprint,
+        runtime_identity_fingerprint=certificate.runtime_identity_fingerprint,
+    )
+
+
+def _matching_security_certificate(certificates, runtime_profile):
+    """The first (most recent, by the repo's own ordering) Baseline
+    Security certificate whose recorded COMMON runtime identity matches
+    `runtime_profile` exactly, or `None`."""
     for certificate in certificates:
-        candidate = RuntimeProfileIdentity(
-            model_tag=certificate.model_tag,
-            model_digest=certificate.model_digest,
-            endpoint=certificate.endpoint,
-            runtime_version=certificate.runtime_version,
-            normalizer_id=certificate.normalizer_id,
-            normalizer_version=certificate.normalizer_version,
-            runtime_config_fingerprint=certificate.runtime_config_fingerprint,
-        )
-        if candidate.matches(runtime_profile):
+        if _profile_from_certificate(certificate).matches(runtime_profile):
             return certificate
+    return None
+
+
+def _matching_role_certificate(certificates, runtime_profile, role_evaluation):
+    """The first (most recent) role certificate whose recorded COMMON
+    runtime identity matches `runtime_profile` AND whose recorded
+    role/evaluation fingerprint matches `role_evaluation`. A NULL
+    `role_evaluation_fingerprint` never wildcards a current fully
+    specified evaluation profile."""
+    expected = role_evaluation.role_evaluation_fingerprint
+    for certificate in certificates:
+        if not _profile_from_certificate(certificate).matches(runtime_profile):
+            continue
+        recorded = certificate.role_evaluation_fingerprint
+        if recorded is None or recorded != expected:
+            continue
+        return certificate
     return None
 
 
@@ -179,6 +216,7 @@ def evaluate_production_eligibility(
     worker_id: str,
     role: ProductionRole,
     runtime_profile: RuntimeProfileIdentity,
+    role_evaluation: RoleEvaluationIdentity,
     expected_role_policy_version: str,
 ) -> EligibilityDecision:
     """The one production-eligibility gate a future router should query
@@ -187,12 +225,16 @@ def evaluate_production_eligibility(
     staleness" for `expected_role_policy_version`. Read-only: never opens
     a write transaction, never mutates any durable state, and never
     accepts a caller-supplied verdict for either certificate kind — both
-    are loaded here from durable, backend-owned evidence."""
+    are loaded here from durable, backend-owned evidence. Identity
+    fingerprints are taken from caller-verified `runtime_profile` /
+    `role_evaluation` objects, never from model output."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_eligibility_request")
     if not isinstance(role, ProductionRole):
         return _deny("malformed_eligibility_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
+        return _deny("malformed_eligibility_request")
+    if not isinstance(role_evaluation, RoleEvaluationIdentity):
         return _deny("malformed_eligibility_request")
     if (
         not isinstance(expected_role_policy_version, str)
@@ -201,6 +243,17 @@ def evaluate_production_eligibility(
         return _deny("malformed_eligibility_request")
     if not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
+    if not role_evaluation.is_fully_specified:
+        return _deny("insufficient_role_evaluation_identity")
+    if role_evaluation.role != role:
+        return _deny("role_evaluation_role_mismatch")
+    if role_evaluation.policy_version != expected_role_policy_version:
+        return _deny("role_evaluation_policy_version_mismatch")
+    if (
+        role_evaluation.runtime_identity_fingerprint
+        != runtime_profile.runtime_identity_fingerprint
+    ):
+        return _deny("role_evaluation_runtime_identity_mismatch")
 
     if WorkersRepo(conn).get(worker_id) is None:
         return _deny("unknown_worker")
@@ -208,7 +261,10 @@ def evaluate_production_eligibility(
     security_certificates = BaselineSecurityCertificatesRepo(conn).list_for_worker(worker_id)
     if not security_certificates:
         return _deny("no_baseline_security_certificate")
-    security_certificate = _matching_certificate(security_certificates, runtime_profile)
+    security_certificate = _matching_security_certificate(
+        security_certificates,
+        runtime_profile,
+    )
     if security_certificate is None:
         return _deny("baseline_security_certificate_profile_mismatch")
     if security_certificate.baseline_version != BASELINE_VERSION:
@@ -237,10 +293,23 @@ def evaluate_production_eligibility(
             "no_role_certificate",
             security_certificate_id=security_certificate.certificate_id,
         )
-    role_certificate = _matching_certificate(role_certificates, runtime_profile)
+    role_certificate = _matching_role_certificate(
+        role_certificates,
+        runtime_profile,
+        role_evaluation,
+    )
     if role_certificate is None:
+        # Distinguish common-runtime mismatch from evaluation-profile
+        # mismatch so a Planner budget change cannot be confused with a
+        # different model/runtime.
+        common_match = _matching_security_certificate(role_certificates, runtime_profile)
+        reason = (
+            "role_certificate_evaluation_profile_mismatch"
+            if common_match is not None
+            else "role_certificate_profile_mismatch"
+        )
         return _deny(
-            "role_certificate_profile_mismatch",
+            reason,
             security_certificate_id=security_certificate.certificate_id,
         )
     if role_certificate.policy_version != expected_role_policy_version:

@@ -51,6 +51,8 @@ class RoleCertificatesRepo:
         normalizer_id: str | None = None,
         normalizer_version: int | None = None,
         runtime_config_fingerprint: str | None = None,
+        runtime_identity_fingerprint: str | None = None,
+        role_evaluation_fingerprint: str | None = None,
     ) -> WorkerRoleCertificate:
         if not self._conn.in_transaction:
             raise RuntimeError(
@@ -60,9 +62,10 @@ class RoleCertificatesRepo:
             "INSERT INTO worker_role_certificates "
             "(certificate_id, worker_id, role, policy_version, model_tag, model_digest, "
             "endpoint, runtime_version, normalizer_id, normalizer_version, "
-            "runtime_config_fingerprint, outcome, "
+            "runtime_config_fingerprint, runtime_identity_fingerprint, "
+            "role_evaluation_fingerprint, outcome, "
             "classification, evidence_ref, reason, issued_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 certificate_id,
                 worker_id,
@@ -75,6 +78,8 @@ class RoleCertificatesRepo:
                 normalizer_id,
                 normalizer_version,
                 runtime_config_fingerprint,
+                runtime_identity_fingerprint,
+                role_evaluation_fingerprint,
                 outcome,
                 classification,
                 evidence_ref,
@@ -128,4 +133,6 @@ def _row_to_certificate(row: sqlite3.Row) -> WorkerRoleCertificate:
         normalizer_id=row["normalizer_id"],
         normalizer_version=row["normalizer_version"],
         runtime_config_fingerprint=row["runtime_config_fingerprint"],
+        runtime_identity_fingerprint=row["runtime_identity_fingerprint"],
+        role_evaluation_fingerprint=row["role_evaluation_fingerprint"],
     )

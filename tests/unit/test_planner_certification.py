@@ -40,7 +40,7 @@ from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.workers.security_baseline import (
     RuntimeProfileIdentity,
-    fingerprint_runtime_config,
+    fingerprint_runtime_identity,
     runtime_profile_identity_from_config,
 )
 
@@ -408,10 +408,11 @@ def test_evidence_ref_is_deterministic_and_never_contains_raw_text(conn, blobs_d
         conn,
         blobs_dir,
         fingerprint_1,
-        expected_runtime_config_fingerprint=result_1.certificate.runtime_config_fingerprint,
+        expected_runtime_identity_fingerprint=result_1.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result_1.certificate.role_evaluation_fingerprint,
     )
-    assert fingerprint_runtime_config(document["runtime_config_spec"]) == (
-        result_1.certificate.runtime_config_fingerprint
+    assert fingerprint_runtime_identity(document["runtime_identity_spec"]) == (
+        result_1.certificate.runtime_identity_fingerprint
     )
     assert _REQUEST.original_request not in str(document)
 
@@ -434,9 +435,7 @@ def test_certificate_binds_the_agreed_runtime_profile_from_evidence(conn, blobs_
         endpoint=_PROFILE.endpoint,
         runtime_version=_PROFILE.runtime_version,
         effective_context_tokens=_PROFILE.effective_context_tokens,
-        output_token_budget=_PROFILE.output_token_budget,
         temperature=_PROFILE.temperature,
-        tool_choice_enforcement=_PROFILE.tool_choice_enforcement,
         normalizer_id=_PROFILE.normalizer_id,
         normalizer_version=_PROFILE.normalizer_version,
     )
@@ -447,10 +446,11 @@ def test_certificate_binds_the_agreed_runtime_profile_from_evidence(conn, blobs_
         runtime_version=cert.runtime_version,
         normalizer_id=cert.normalizer_id,
         normalizer_version=cert.normalizer_version,
-        runtime_config_fingerprint=cert.runtime_config_fingerprint,
+        runtime_identity_fingerprint=cert.runtime_identity_fingerprint,
     )
     assert identity == expected
     assert identity.is_fully_specified
+    assert cert.role_evaluation_fingerprint is not None
 
 
 def test_certification_boundary_has_no_override_parameter_for_its_own_decision():
@@ -566,9 +566,7 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn, blobs
         endpoint=normalized_profile.endpoint,
         runtime_version=normalized_profile.runtime_version,
         effective_context_tokens=normalized_profile.effective_context_tokens,
-        output_token_budget=normalized_profile.output_token_budget,
         temperature=normalized_profile.temperature,
-        tool_choice_enforcement=normalized_profile.tool_choice_enforcement,
         normalizer_id=normalized_profile.normalizer_id,
         normalizer_version=normalized_profile.normalizer_version,
     )
@@ -579,7 +577,7 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn, blobs
         runtime_version=result.certificate.runtime_version,
         normalizer_id=result.certificate.normalizer_id,
         normalizer_version=result.certificate.normalizer_version,
-        runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
+        runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
     )
     assert identity.matches(expected)
     assert identity.is_fully_specified
@@ -724,4 +722,4 @@ def test_output_budget_mismatch_across_instances_is_ambiguous(conn, blobs_dir):
         early_stopped=False,
     )
     assert not result.ok
-    assert result.reason == "ambiguous_or_unverified_runtime_profile_in_evidence"
+    assert result.reason == "ambiguous_or_unverified_role_evaluation_in_evidence"
