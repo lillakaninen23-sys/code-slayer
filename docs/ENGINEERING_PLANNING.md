@@ -160,7 +160,16 @@ effective context capacity, Planner output-token budget, sampling
 temperature, and tool-choice enforcement — exact-match only, so a
 later temperature/context/budget change, or a pre-fingerprint
 certificate, cannot silently authorize a newly fully-specified
-runtime. Native vs. normalized behavior is recorded
+runtime. Before a Planner role certificate is recorded, the
+certification boundary persists a bounded canonical qualification-
+evidence document in `ContentStore` (`source_kind=
+"planner_qualification_evidence"`, non-exportable) containing that
+same `runtime-config-spec-v1` plus each instance's bounded attempt
+provenance; the certificate's `evidence_ref` is the blob's content
+hash. The fingerprint is recomputed from the persisted spec and must
+match before issuance. The document never contains raw prompts or
+model output, never grants authority itself, and never affects parser
+acceptance, permissions, or trust. Native vs. normalized behavior is recorded
 distinctly in `planning.provenance.store_planner_output` via
 `PlannerResponse.tool_call_transport`. For a `NORMALIZED` turn the
 original provider/model textual payload is persisted as a distinct,
