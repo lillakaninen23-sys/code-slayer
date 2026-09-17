@@ -38,6 +38,7 @@ from code_slayer.workers.production_eligibility import (
 )
 from code_slayer.workers.role_qualification import (
     ProductionRole,
+    RoleEvaluationIdentity,
     RoleQualificationOutcome,
     canonical_role_evaluation_spec,
     fingerprint_role_evaluation,
@@ -53,6 +54,7 @@ from code_slayer.workers.security_baseline import (
     fingerprint_runtime_config,
     fingerprint_runtime_identity,
     record_baseline_certificate,
+    runtime_profile_binding_from_stored,
     runtime_profile_identity_from_config,
 )
 from code_slayer.workers.trust import TrustLevel, WorkerTrustManager
@@ -378,6 +380,7 @@ def test_missing_new_identity_fields_fail_closed(db_conn, registered_worker):
 def test_factories_do_not_accept_caller_or_model_supplied_fingerprints():
     common_params = set(inspect.signature(runtime_profile_identity_from_config).parameters)
     eval_params = set(inspect.signature(role_evaluation_identity_from_config).parameters)
+    stored_params = set(inspect.signature(runtime_profile_binding_from_stored).parameters)
     for forbidden in (
         "runtime_config_fingerprint",
         "runtime_identity_fingerprint",
@@ -387,6 +390,8 @@ def test_factories_do_not_accept_caller_or_model_supplied_fingerprints():
         assert forbidden not in common_params
     assert "role_evaluation_fingerprint" not in eval_params
     assert "runtime_config_fingerprint" not in eval_params
+    assert "effective_context_tokens" not in stored_params
+    assert "temperature" not in stored_params
     eligibility_params = set(inspect.signature(evaluate_production_eligibility).parameters)
     assert "outcome" not in eligibility_params
     assert "role_status" not in eligibility_params
@@ -706,3 +711,237 @@ def test_generic_role_evaluation_identity_is_not_planner_specific():
     )
     assert spec["role"] == "REVIEWER"
     assert spec["spec_version"] == "role-evaluation-spec-v1"
+
+
+# -- adversarial: identities are structurally self-verifying -----------------
+
+_FORGED_SHA256 = "0" * 64
+
+
+def test_direct_role_evaluation_identity_rejects_mismatched_fingerprint():
+    profile = _common()
+    genuine = _eval_for(profile)
+    with pytest.raises(ValueError, match="role_evaluation_fingerprint"):
+        RoleEvaluationIdentity(
+            role=genuine.role,
+            runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
+            output_token_budget=genuine.output_token_budget,
+            tool_choice_enforcement=genuine.tool_choice_enforcement,
+            policy_version=genuine.policy_version,
+            role_evaluation_fingerprint=_FORGED_SHA256,
+        )
+
+
+def test_role_evaluation_identity_rejects_budget_change_retaining_old_fingerprint():
+    profile = _common()
+    genuine = _eval_for(profile, output_token_budget=4096)
+    with pytest.raises(ValueError, match="role_evaluation_fingerprint"):
+        RoleEvaluationIdentity(
+            role=genuine.role,
+            runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
+            output_token_budget=1024,
+            tool_choice_enforcement=genuine.tool_choice_enforcement,
+            policy_version=genuine.policy_version,
+            role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
+        )
+
+
+def test_role_evaluation_identity_rejects_tool_choice_change_retaining_old_fingerprint():
+    profile = _common()
+    genuine = _eval_for(profile, tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED")
+    with pytest.raises(ValueError, match="role_evaluation_fingerprint"):
+        RoleEvaluationIdentity(
+            role=genuine.role,
+            runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
+            output_token_budget=genuine.output_token_budget,
+            tool_choice_enforcement="REQUIRED_STRUCTURED_TOOL",
+            policy_version=genuine.policy_version,
+            role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
+        )
+
+
+def test_current_runtime_identity_cannot_be_forged_with_arbitrary_fingerprint(
+    db_conn,
+    registered_worker,
+):
+    profile = _common()
+    forged = RuntimeProfileIdentity(
+        model_tag=profile.model_tag,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id=profile.normalizer_id,
+        normalizer_version=profile.normalizer_version,
+        runtime_identity_fingerprint=_FORGED_SHA256,
+    )
+    assert not forged.is_verified_current
+    assert not forged.is_fully_specified
+    recorded = record_baseline_certificate(
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=forged,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="forged-sec",
+        reason="ok",
+    )
+    assert not recorded.ok
+    assert recorded.reason == "unverified_runtime_identity"
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=forged,
+        role_evaluation=_eval_for(profile),
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert decision.reason == "insufficient_runtime_profile_identity"
+    with pytest.raises(ValueError, match="runtime_identity_fingerprint"):
+        RuntimeProfileIdentity(
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_identity_fingerprint=_FORGED_SHA256,
+            effective_context_tokens=16384,
+            temperature=0.0,
+        )
+
+
+def test_context_tokens_change_retaining_old_fingerprint_cannot_pass_eligibility(
+    db_conn,
+    registered_worker,
+):
+    profile = _common(effective_context_tokens=16384)
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, profile, _eval_for(profile))
+    with pytest.raises(ValueError, match="runtime_identity_fingerprint"):
+        RuntimeProfileIdentity(
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+            effective_context_tokens=8192,
+            temperature=0.0,
+        )
+    smaller = _common(effective_context_tokens=8192)
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=smaller,
+        role_evaluation=_eval_for(smaller),
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert decision.reason == "baseline_security_certificate_profile_mismatch"
+
+
+def test_temperature_change_retaining_old_fingerprint_cannot_pass_eligibility(
+    db_conn,
+    registered_worker,
+):
+    profile = _common(temperature=0.0)
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, profile, _eval_for(profile))
+    with pytest.raises(ValueError, match="runtime_identity_fingerprint"):
+        RuntimeProfileIdentity(
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+            effective_context_tokens=16384,
+            temperature=1.5,
+        )
+    hotter = _common(temperature=1.5)
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=hotter,
+        role_evaluation=_eval_for(hotter),
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert decision.reason == "baseline_security_certificate_profile_mismatch"
+
+
+def test_persisted_certificate_reconstruction_is_not_a_current_identity(
+    db_conn,
+    registered_worker,
+):
+    profile = _common()
+    evaluation = _eval_for(profile)
+    security = _security_pass(db_conn, registered_worker, profile)
+    role = _role_pass(db_conn, registered_worker, profile, evaluation)
+    stored = runtime_profile_binding_from_stored(
+        model_tag=security.certificate.model_tag,
+        model_digest=security.certificate.model_digest,
+        endpoint=security.certificate.endpoint,
+        runtime_version=security.certificate.runtime_version,
+        normalizer_id=security.certificate.normalizer_id,
+        normalizer_version=security.certificate.normalizer_version,
+        runtime_config_fingerprint=security.certificate.runtime_config_fingerprint,
+        runtime_identity_fingerprint=security.certificate.runtime_identity_fingerprint,
+    )
+    assert stored.matches(profile)
+    assert not stored.is_verified_current
+    assert not stored.is_fully_specified
+    reconstructed_role = record_role_certificate(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=stored,
+        policy_version=POLICY_VERSION,
+        outcome=RoleQualificationOutcome.PASS,
+        classification="PASS_FIRST_TRY",
+        evidence_ref="recon-role",
+        reason="ok",
+        role_evaluation=evaluation,
+    )
+    assert not reconstructed_role.ok
+    assert reconstructed_role.reason == "unverified_runtime_identity"
+    current_decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=stored,
+        role_evaluation=evaluation,
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert current_decision.reason == "insufficient_runtime_profile_identity"
+    live = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=profile,
+        role_evaluation=evaluation,
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert live == EligibilityDecision(
+        True,
+        "eligible",
+        security_certificate_id=security.certificate.certificate_id,
+        role_certificate_id=role.certificate.certificate_id,
+    )
+
+
+def test_matching_direct_role_evaluation_construction_is_accepted():
+    profile = _common()
+    genuine = _eval_for(profile)
+    rebuilt = RoleEvaluationIdentity(
+        role=genuine.role,
+        runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
+        output_token_budget=genuine.output_token_budget,
+        tool_choice_enforcement=genuine.tool_choice_enforcement,
+        policy_version=genuine.policy_version,
+        role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
+    )
+    assert rebuilt.matches(genuine)
+    assert rebuilt.is_fully_specified

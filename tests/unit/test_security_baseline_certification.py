@@ -139,6 +139,15 @@ def test_runtime_profile_identity_is_fully_specified_requires_every_field():
         endpoint="e",
         runtime_version="v",
     ).is_fully_specified
+    forged = RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        runtime_identity_fingerprint="0" * 64,
+    )
+    assert not forged.is_fully_specified
+    assert not forged.is_verified_current
     full = runtime_profile_identity_from_config(
         model_tag="m",
         model_digest="d",
@@ -148,6 +157,7 @@ def test_runtime_profile_identity_is_fully_specified_requires_every_field():
         temperature=0.0,
     )
     assert full.is_fully_specified
+    assert full.is_verified_current
     # Native-only (normalizer None/None) is a complete compatibility-layer
     # identity, not a missing field -- but a v2 fingerprint is still required.
     assert full.normalizer_id is None
@@ -617,7 +627,9 @@ def test_none_fingerprint_never_matches_a_set_fingerprint():
     assert not fingerprinted.matches(legacy)
     assert not legacy.matches(fingerprinted)
     assert fingerprinted.is_fully_specified
+    assert fingerprinted.is_verified_current
     assert not legacy.is_fully_specified
+    assert not legacy.is_verified_current
 
 
 def test_certificate_persists_runtime_identity_fingerprint(db_conn, registered_worker):

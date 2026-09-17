@@ -136,7 +136,10 @@ from code_slayer.workers.role_qualification import (
     record_role_certificate,
     role_evaluation_identity_from_config,
 )
-from code_slayer.workers.security_baseline import RuntimeProfileIdentity
+from code_slayer.workers.security_baseline import (
+    RuntimeProfileIdentity,
+    runtime_profile_identity_from_config,
+)
 
 # The fixed, code-owned identifier of the Planner certification policy
 # this module currently implements -- mirrors `workers.conformance.
@@ -162,52 +165,57 @@ def _deny(reason: str) -> RoleCertificationResult:
 def _agreed_runtime_profile(
     results: tuple[QualificationAttemptResult, ...],
 ) -> RuntimeProfileIdentity | None:
-    """`None` if any instance has no provenance at all, or if the
-    provenance recorded across every attempt in every instance does not
-    agree on exactly one `(model_tag, model_digest, endpoint,
-    runtime_version, normalizer_id, normalizer_version,
-    runtime_identity_fingerprint)` tuple -- see the module docstring."""
-    identities: set[
-        tuple[str, str | None, str | None, str | None, str | None, int | None, str | None]
-    ] = set()
+    """`None` if any instance has no provenance at all, if the
+    caller-verified configuration across every attempt does not agree
+    on exactly one runtime identity, or if a recorded fingerprint
+    disagrees with the fingerprint recomputed from that attempt's own
+    concrete config.
+
+    When temperature (and therefore the v2 identity) was established,
+    the current-runtime side is reconstructed via
+    `runtime_profile_identity_from_config` — a stored hash is never
+    trusted as the current identity. When temperature was not
+    established, an unverified binding is returned so the caller can
+    fail closed on `is_fully_specified` rather than inventing a
+    current identity."""
+    derived: set[RuntimeProfileIdentity] = set()
     for result in results:
         if not result.provenance:
             return None
         for attempt in result.provenance:
-            identities.add(
-                (
-                    attempt.model_tag,
-                    attempt.model_digest,
-                    attempt.endpoint,
-                    attempt.runtime_version,
-                    attempt.normalizer_id,
-                    attempt.normalizer_version,
-                    attempt.runtime_identity_fingerprint,
-                ),
-            )
-    if len(identities) != 1:
+            if attempt.temperature is None:
+                try:
+                    profile = RuntimeProfileIdentity(
+                        model_tag=attempt.model_tag,
+                        model_digest=attempt.model_digest,
+                        endpoint=attempt.endpoint,
+                        runtime_version=attempt.runtime_version,
+                        normalizer_id=attempt.normalizer_id,
+                        normalizer_version=attempt.normalizer_version,
+                        runtime_identity_fingerprint=attempt.runtime_identity_fingerprint,
+                    )
+                except ValueError:
+                    return None
+            else:
+                try:
+                    profile = runtime_profile_identity_from_config(
+                        model_tag=attempt.model_tag,
+                        model_digest=attempt.model_digest,
+                        endpoint=attempt.endpoint,
+                        runtime_version=attempt.runtime_version,
+                        normalizer_id=attempt.normalizer_id,
+                        normalizer_version=attempt.normalizer_version,
+                        effective_context_tokens=attempt.effective_context_tokens,
+                        temperature=attempt.temperature,
+                    )
+                except (TypeError, ValueError):
+                    return None
+                if profile.runtime_identity_fingerprint != attempt.runtime_identity_fingerprint:
+                    return None
+            derived.add(profile)
+    if len(derived) != 1:
         return None
-    (
-        model_tag,
-        model_digest,
-        endpoint,
-        runtime_version,
-        normalizer_id,
-        normalizer_version,
-        runtime_identity_fingerprint,
-    ) = next(iter(identities))
-    try:
-        return RuntimeProfileIdentity(
-            model_tag=model_tag,
-            model_digest=model_digest,
-            endpoint=endpoint,
-            runtime_version=runtime_version,
-            normalizer_id=normalizer_id,
-            normalizer_version=normalizer_version,
-            runtime_identity_fingerprint=runtime_identity_fingerprint,
-        )
-    except ValueError:
-        return None
+    return next(iter(derived))
 
 
 def _agreed_role_evaluation(

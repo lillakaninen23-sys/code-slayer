@@ -250,9 +250,13 @@ class RoleEvaluationIdentity:
 
     `None` is not representable for the fingerprint: a missing
     evaluation identity is expressed by omitting this object (recording
-    stores NULL; production eligibility fails closed). Direct
-    construction is for reconstructing a stored fingerprint; the
-    production-grade constructor is `role_evaluation_identity_from_config`."""
+    stores NULL; production eligibility fails closed). Construction is
+    structurally self-verifying: `__post_init__` recomputes
+    `canonical_role_evaluation_spec` from this object's own fields and
+    refuses a `role_evaluation_fingerprint` that does not match. Direct
+    construction with a caller-supplied hash is therefore not a way to
+    forge identity; the production-grade constructor remains
+    `role_evaluation_identity_from_config`."""
 
     role: ProductionRole
     runtime_identity_fingerprint: str
@@ -262,29 +266,18 @@ class RoleEvaluationIdentity:
     role_evaluation_fingerprint: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.role, ProductionRole):
-            raise TypeError("role must be a ProductionRole")
-        require_sha256_hex(
-            "runtime_identity_fingerprint",
-            self.runtime_identity_fingerprint,
+        spec = canonical_role_evaluation_spec(
+            role=self.role,
+            runtime_identity_fingerprint=self.runtime_identity_fingerprint,
+            output_token_budget=self.output_token_budget,
+            tool_choice_enforcement=self.tool_choice_enforcement,
+            policy_version=self.policy_version,
         )
-        require_sha256_hex(
-            "role_evaluation_fingerprint",
-            self.role_evaluation_fingerprint,
-        )
-        if (
-            not isinstance(self.output_token_budget, int)
-            or isinstance(self.output_token_budget, bool)
-            or self.output_token_budget < 0
-        ):
-            raise ValueError("output_token_budget must be a non-negative integer")
-        if (
-            not isinstance(self.tool_choice_enforcement, str)
-            or not self.tool_choice_enforcement.strip()
-        ):
-            raise ValueError("tool_choice_enforcement must be a non-empty string")
-        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
-            raise ValueError("policy_version must be a non-empty string")
+        expected = fingerprint_role_evaluation(spec)
+        if self.role_evaluation_fingerprint != expected:
+            raise ValueError(
+                "role_evaluation_fingerprint does not match canonical role-evaluation-spec-v1",
+            )
 
     def matches(self, other: RoleEvaluationIdentity) -> bool:
         """Exact match on every field — never a wildcard."""
@@ -301,10 +294,22 @@ class RoleEvaluationIdentity:
 
     @property
     def is_fully_specified(self) -> bool:
-        """A constructed `RoleEvaluationIdentity` is fully specified by
-        construction: missing identity is expressed by the absence of
-        this object, never by NULL fields acting as wildcards."""
-        return True
+        """`True` only when this object's fingerprint recomputes from
+        its own fields. Construction already refuses a mismatch, so a
+        successfully constructed instance is fully specified; this
+        property still rechecks so a later mutation cannot silently
+        become authoritative."""
+        try:
+            spec = canonical_role_evaluation_spec(
+                role=self.role,
+                runtime_identity_fingerprint=self.runtime_identity_fingerprint,
+                output_token_budget=self.output_token_budget,
+                tool_choice_enforcement=self.tool_choice_enforcement,
+                policy_version=self.policy_version,
+            )
+        except (TypeError, ValueError):
+            return False
+        return self.role_evaluation_fingerprint == fingerprint_role_evaluation(spec)
 
 
 @dataclass(frozen=True)
@@ -359,6 +364,11 @@ def record_role_certificate(
         return _deny("malformed_certificate_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
         return _deny("malformed_certificate_request")
+    if (
+        runtime_profile.runtime_identity_fingerprint is not None
+        and not runtime_profile.is_verified_current
+    ):
+        return _deny("unverified_runtime_identity")
     if not isinstance(policy_version, str) or not policy_version.strip():
         return _deny("malformed_certificate_request")
     if not isinstance(outcome, RoleQualificationOutcome):
@@ -372,6 +382,8 @@ def record_role_certificate(
     if role_evaluation is not None:
         if not isinstance(role_evaluation, RoleEvaluationIdentity):
             return _deny("malformed_certificate_request")
+        if not runtime_profile.is_verified_current:
+            return _deny("unverified_runtime_identity")
         if role_evaluation.role != role:
             return _deny("malformed_certificate_request")
         if role_evaluation.policy_version != policy_version:
@@ -381,6 +393,20 @@ def record_role_certificate(
             or role_evaluation.runtime_identity_fingerprint
             != runtime_profile.runtime_identity_fingerprint
         ):
+            return _deny("malformed_certificate_request")
+        try:
+            expected_eval = fingerprint_role_evaluation(
+                canonical_role_evaluation_spec(
+                    role=role_evaluation.role,
+                    runtime_identity_fingerprint=role_evaluation.runtime_identity_fingerprint,
+                    output_token_budget=role_evaluation.output_token_budget,
+                    tool_choice_enforcement=role_evaluation.tool_choice_enforcement,
+                    policy_version=role_evaluation.policy_version,
+                ),
+            )
+        except (TypeError, ValueError):
+            return _deny("malformed_certificate_request")
+        if role_evaluation.role_evaluation_fingerprint != expected_eval:
             return _deny("malformed_certificate_request")
 
     with transaction(conn):

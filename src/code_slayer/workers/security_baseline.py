@@ -125,9 +125,17 @@ None`) is fully specified with respect to the compatibility layer;
 enabling a normalizer is a different identity, never a missing one.
 This keeps recording lenient/honest and production consultation strict,
 without changing what this module itself accepts. The production-grade
-constructor is `runtime_profile_identity_from_config()`: it derives the
-v2 fingerprint from caller-verified configuration, never from a model
-response, and never as a caller-supplied hash.
+constructor is `runtime_profile_identity_from_config()`:
+it derives the v2 fingerprint from caller-verified configuration, never
+from a model response, and never as a caller-supplied hash. The returned
+object retains `effective_context_tokens` and `temperature` so the
+fingerprint stays recomputable from the object's own fields
+(`is_verified_current`). A persisted certificate binding reconstructed
+from stored columns (`runtime_profile_binding_from_stored`) carries only
+the stored fingerprint and must never masquerade as that current
+identity: production eligibility requires the *current* runtime side to
+be verified from concrete configuration, and `record_baseline_certificate()`
+refuses to persist a v2 fingerprint that was not derived that way.
 
 ## No fabrication, ever
 
@@ -396,11 +404,14 @@ def runtime_profile_identity_from_config(
     normalizer_id: str | None = None,
     normalizer_version: int | None = None,
 ) -> RuntimeProfileIdentity:
-    """The one production-grade constructor for COMMON runtime identity:
-    the v2 fingerprint is derived from the canonical spec, never
-    supplied independently, and never read from a model response.
+    """The one production-grade constructor for a CURRENT, verified
+    COMMON runtime identity: the v2 fingerprint is derived from the
+    canonical spec of caller-verified configuration, never supplied
+    independently, and never read from a model response.
     Role/request-specific fields are not parameters: they cannot be
-    smuggled into the shared runtime identity."""
+    smuggled into the shared runtime identity. The returned object
+    retains `effective_context_tokens` and `temperature` so the
+    fingerprint stays recomputable from its own fields."""
     spec = canonical_runtime_identity_spec(
         model_tag=model_tag,
         model_digest=model_digest,
@@ -419,6 +430,39 @@ def runtime_profile_identity_from_config(
         normalizer_id=normalizer_id,
         normalizer_version=normalizer_version,
         runtime_identity_fingerprint=fingerprint_runtime_identity(spec),
+        effective_context_tokens=spec["effective_context_tokens"],
+        temperature=spec["temperature"],
+    )
+
+
+def runtime_profile_binding_from_stored(
+    *,
+    model_tag: str,
+    model_digest: str | None,
+    endpoint: str | None,
+    runtime_version: str | None,
+    normalizer_id: str | None = None,
+    normalizer_version: int | None = None,
+    runtime_config_fingerprint: str | None = None,
+    runtime_identity_fingerprint: str | None = None,
+) -> RuntimeProfileIdentity:
+    """Reconstruct a persisted certificate binding from stored columns.
+
+    Concrete inference configuration is intentionally absent: a stored
+    fingerprint is historical evidence of what was recorded, not a
+    freshly verified current-runtime identity. `is_verified_current` is
+    therefore False, and this object cannot masquerade as one produced
+    by `runtime_profile_identity_from_config`. Matching against a
+    current identity still uses `.matches()` on the stored fields."""
+    return RuntimeProfileIdentity(
+        model_tag=model_tag,
+        model_digest=model_digest,
+        endpoint=endpoint,
+        runtime_version=runtime_version,
+        normalizer_id=normalizer_id,
+        normalizer_version=normalizer_version,
+        runtime_config_fingerprint=runtime_config_fingerprint,
+        runtime_identity_fingerprint=runtime_identity_fingerprint,
     )
 
 
@@ -481,8 +525,20 @@ class RuntimeProfileIdentity:
     versioned COMMON runtime identity (effective context capacity,
     sampling temperature, plus the identity fields above) without
     role/request-specific fields. `None` means that component was not
-    established — a complete statement of absence, not a wildcard. A
-    production decision (`is_fully_specified`) requires it.
+    established — a complete statement of absence, not a wildcard.
+
+    A production decision (`is_fully_specified`) requires a *verified
+    current* identity: the object must carry the concrete
+    `effective_context_tokens` and `temperature` the fingerprint was
+    derived from. Direct construction with an arbitrary SHA-256 is a
+    persisted binding, never a current runtime. `record_baseline_
+    certificate()` will not persist that hash as a v2 identity.
+
+    `effective_context_tokens` / `temperature` being both set means this
+    object is a CURRENT runtime identity and its fingerprint is
+    recomputed from those fields at construction (mismatch fails). Both
+    being `None` means this is a persisted certificate binding or a
+    historical/incomplete recording. A mixed pair is refused.
 
     `runtime_config_fingerprint` is the historical SHA-256 of a
     `runtime-config-spec-v1` document. It is NEVER used as the current
@@ -498,6 +554,8 @@ class RuntimeProfileIdentity:
     normalizer_version: int | None = None
     runtime_config_fingerprint: str | None = None
     runtime_identity_fingerprint: str | None = None
+    effective_context_tokens: int | None = None
+    temperature: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag.strip():
@@ -525,6 +583,36 @@ class RuntimeProfileIdentity:
             require_sha256_hex(
                 "runtime_identity_fingerprint",
                 self.runtime_identity_fingerprint,
+            )
+        has_tokens = self.effective_context_tokens is not None
+        has_temperature = self.temperature is not None
+        if has_tokens != has_temperature:
+            raise ValueError(
+                "effective_context_tokens and temperature must both be set "
+                "to verify current runtime identity, or both be None for a "
+                "persisted binding",
+            )
+        if not has_tokens:
+            return
+        spec = canonical_runtime_identity_spec(
+            model_tag=self.model_tag,
+            model_digest=self.model_digest,
+            endpoint=self.endpoint,
+            runtime_version=self.runtime_version,
+            normalizer_id=self.normalizer_id,
+            normalizer_version=self.normalizer_version,
+            effective_context_tokens=self.effective_context_tokens,
+            temperature=self.temperature,
+        )
+        expected = fingerprint_runtime_identity(spec)
+        object.__setattr__(self, "effective_context_tokens", spec["effective_context_tokens"])
+        object.__setattr__(self, "temperature", spec["temperature"])
+        if self.runtime_identity_fingerprint is None:
+            object.__setattr__(self, "runtime_identity_fingerprint", expected)
+        elif self.runtime_identity_fingerprint != expected:
+            raise ValueError(
+                "runtime_identity_fingerprint does not match canonical "
+                "runtime-identity-spec-v2",
             )
 
     def matches(self, other: RuntimeProfileIdentity) -> bool:
@@ -560,10 +648,25 @@ class RuntimeProfileIdentity:
         )
 
     @property
+    def is_verified_current(self) -> bool:
+        """`True` only for a CURRENT runtime identity whose v2
+        fingerprint was derived from this object's own
+        `effective_context_tokens` and `temperature`. A persisted
+        certificate binding reconstructed from stored columns is never
+        this: it cannot masquerade as factory-derived configuration."""
+        return (
+            self.effective_context_tokens is not None
+            and self.temperature is not None
+            and self.runtime_identity_fingerprint is not None
+        )
+
+    @property
     def is_fully_specified(self) -> bool:
-        """`True` only when every *model/runtime* identity field is
-        populated — `model_tag` alone (or any strict subset) is a
-        legitimate binding for a *recorded* certificate
+        """`True` only when this is a verified current identity AND
+        every *model/runtime* identity field is populated.
+        `model_tag` alone (or any strict subset, including all model
+        fields plus a caller-supplied fingerprint without concrete
+        config) is a legitimate binding for a *recorded* certificate
         (`record_baseline_certificate()` never required more, and this
         property does not retroactively change that), but it is NOT a
         strong enough binding for `workers.production_eligibility` to
@@ -571,23 +674,25 @@ class RuntimeProfileIdentity:
         meaningfully different runtimes (different digest, different
         endpoint, different runtime version, different inference
         configuration) could otherwise share the same loosely-specified
-        profile and be silently confused for each other. `workers.
-        production_eligibility` refuses to evaluate eligibility at all
-        against a `runtime_profile` for which this is `False` — unknown
-        identity fails closed rather than wildcard-matching (see that
-        module's own docstring).
+        profile, or an arbitrary SHA-256 could be asserted as the
+        current runtime. `workers.production_eligibility` refuses to
+        evaluate eligibility at all against a `runtime_profile` for
+        which this is `False` — unknown identity fails closed rather
+        than wildcard-matching (see that module's own docstring).
 
         `normalizer_id`/`normalizer_version` being `None` is a complete
         statement of native-only transport, not a missing identity
         field, so it does not make this property `False`. An incomplete
         pair cannot be constructed at all (see `__post_init__`).
-        `runtime_identity_fingerprint` being `None` IS a missing
+        `runtime_identity_fingerprint` being `None`, or being present
+        without the concrete config that produced it, IS a missing
         production-identity component: an old certificate recorded
-        before this field existed, or an evaluation that never
-        established the common runtime identity, cannot authorize a
-        fully-specified current runtime. A historical v1
-        `runtime_config_fingerprint` does not substitute for it."""
-        return None not in (
+        before this field existed, a persisted binding reconstructed
+        from stored columns, or an evaluation that never established
+        the common runtime identity, cannot authorize a fully-specified
+        current runtime. A historical v1 `runtime_config_fingerprint`
+        does not substitute for it."""
+        return self.is_verified_current and None not in (
             self.model_tag,
             self.model_digest,
             self.endpoint,
@@ -637,6 +742,11 @@ def record_baseline_certificate(
         return _deny("malformed_certificate_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
         return _deny("malformed_certificate_request")
+    if (
+        runtime_profile.runtime_identity_fingerprint is not None
+        and not runtime_profile.is_verified_current
+    ):
+        return _deny("unverified_runtime_identity")
     if not isinstance(outcome, SecurityBaselineOutcome):
         return _deny("malformed_certificate_request")
     if not isinstance(evidence_ref, str) or not evidence_ref.strip():

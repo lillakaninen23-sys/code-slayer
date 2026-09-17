@@ -66,23 +66,29 @@ newer one reversed the verdict.
 **This function additionally refuses to evaluate eligibility at all
 against an incompletely-specified `runtime_profile` or
 `role_evaluation`** (`RuntimeProfileIdentity.is_fully_specified` —
-every one of `model_tag`/`model_digest`/`endpoint`/`runtime_version`/
-`runtime_identity_fingerprint` must be populated; `RoleEvaluationIdentity`
-is fully specified by construction). A certificate MAY legitimately be
-recorded with only `model_tag` known, or without a v2 runtime-identity
-fingerprint or role-evaluation fingerprint (`workers.security_baseline`/
-`workers.role_qualification` still accept that — recording should stay
-honest about what evaluation time actually established), but a real
-PRODUCTION decision must never pretend a loosely-specified profile is a
-strong enough runtime-profile binding: two meaningfully different
-runtimes could otherwise share the same `model_tag`-only profile, a
-pre-v15 NULL-identity certificate could otherwise authorize a later
-temperature/context change, or a legacy v1 Planner certificate
-(`runtime_config_fingerprint` only) could otherwise wildcard-match a
-current fully specified common identity plus role/evaluation profile.
-Unknown identity fails closed here rather than wildcard-matching.
-Historical v1 `runtime_config_fingerprint` values are never
-reinterpreted as v2 common-runtime identity.
+the current runtime must be a verified current identity:
+`model_tag`/`model_digest`/`endpoint`/`runtime_version` plus concrete
+`effective_context_tokens`/`temperature` whose recomputed
+`runtime_identity_fingerprint` matches; `RoleEvaluationIdentity`
+self-verifies its fingerprint from its own fields). A certificate MAY
+legitimately be recorded with only `model_tag` known, or without a v2
+runtime-identity fingerprint or role-evaluation fingerprint (`workers.
+security_baseline`/`workers.role_qualification` still accept that —
+recording should stay honest about what evaluation time actually
+established), and a persisted certificate binding reconstructed from
+stored columns may carry only the stored fingerprint — but a real
+PRODUCTION decision must never pretend a loosely-specified profile or
+an arbitrary caller-supplied hash is a strong enough runtime-profile
+binding: two meaningfully different runtimes could otherwise share the
+same `model_tag`-only profile, a pre-v15 NULL-identity certificate
+could otherwise authorize a later temperature/context change, a
+legacy v1 Planner certificate (`runtime_config_fingerprint` only)
+could otherwise wildcard-match a current fully specified common
+identity plus role/evaluation profile, or a forged SHA-256 could be
+asserted as the current runtime. Unknown identity fails closed here
+rather than wildcard-matching. Historical v1
+`runtime_config_fingerprint` values are never reinterpreted as v2
+common-runtime identity.
 
 ## No trust/qualification mutation, ever
 
@@ -151,6 +157,7 @@ from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
     RuntimeProfileIdentity,
     SecurityBaselineOutcome,
+    runtime_profile_binding_from_stored,
 )
 
 
@@ -167,11 +174,13 @@ def _deny(reason: str, **kwargs) -> EligibilityDecision:
 
 
 def _profile_from_certificate(certificate) -> RuntimeProfileIdentity:
-    """Rebuild the COMMON runtime identity a certificate recorded.
-    Historical `runtime_config_fingerprint` is preserved on the object
-    but is not part of `.matches()` — v1 hashes are never reinterpreted
-    as v2 common-runtime identity."""
-    return RuntimeProfileIdentity(
+    """Rebuild the persisted COMMON runtime binding a certificate
+    recorded. This is never a current/verified identity: concrete
+    config is absent, so `is_verified_current` is False. Historical
+    `runtime_config_fingerprint` is preserved on the object but is not
+    part of `.matches()` — v1 hashes are never reinterpreted as v2
+    common-runtime identity."""
+    return runtime_profile_binding_from_stored(
         model_tag=certificate.model_tag,
         model_digest=certificate.model_digest,
         endpoint=certificate.endpoint,
@@ -241,7 +250,7 @@ def evaluate_production_eligibility(
         or not expected_role_policy_version.strip()
     ):
         return _deny("malformed_eligibility_request")
-    if not runtime_profile.is_fully_specified:
+    if not runtime_profile.is_verified_current or not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
     if not role_evaluation.is_fully_specified:
         return _deny("insufficient_role_evaluation_identity")

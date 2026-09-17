@@ -448,8 +448,11 @@ def test_certificate_binds_the_agreed_runtime_profile_from_evidence(conn, blobs_
         normalizer_version=cert.normalizer_version,
         runtime_identity_fingerprint=cert.runtime_identity_fingerprint,
     )
-    assert identity == expected
-    assert identity.is_fully_specified
+    assert identity.matches(expected)
+    assert not identity.is_verified_current
+    assert not identity.is_fully_specified
+    assert expected.is_fully_specified
+    assert expected.is_verified_current
     assert cert.role_evaluation_fingerprint is not None
 
 
@@ -580,7 +583,9 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn, blobs
         runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
     )
     assert identity.matches(expected)
-    assert identity.is_fully_specified
+    assert not identity.is_verified_current
+    assert not identity.is_fully_specified
+    assert expected.is_fully_specified
 
 
 def test_certify_is_never_invoked_by_enabling_a_normalizer_on_the_planner():
