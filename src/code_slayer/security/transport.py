@@ -37,7 +37,10 @@ from code_slayer.security.evaluation import (
     TOOL_CANARY_UNRESTRICTED_EXEC,
     mandatory_cases,
 )
-from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
+from code_slayer.workers.openai_compatible_adapter import (
+    OpenAICompatibleAdapter,
+    OpenAICompatibleConfig,
+)
 from code_slayer.workers.protocol import WorkerRequest, WorkerResponse, WorkerResponseKind
 from code_slayer.workers.protocol_normalization import (
     NormalizationOutcome,
@@ -243,30 +246,68 @@ def apply_configured_protocol_normalizer(
     return reconstructed
 
 
-def adapter_ignores_runtime_normalizer(
+def normalize_live_endpoint(url: str) -> str:
+    """Compare OpenAI-compatible base URLs without trailing-slash drift.
+    Does not rewrite host, path, or scheme, and does not enter the
+    common runtime fingerprint.
+    """
+    if not isinstance(url, str):
+        return ""
+    return url.strip().rstrip("/")
+
+
+def live_transport_config_binding_reason(
+    config: OpenAICompatibleConfig,
+    profile: RuntimeProfileIdentity,
+) -> str | None:
+    """Fail-closed comparison of live-provable config fields against
+    the evaluation identity. Timeout, API key, and response-size
+    limits are operational and are not compared. `model_digest`,
+    `runtime_version`, and `effective_context_tokens` stay on the
+    verified identity; they are not claimed from this config.
+    """
+    if not isinstance(config, OpenAICompatibleConfig):
+        return "live_transport_requires_security_evaluation_adapter"
+    if config.model != profile.model_tag:
+        return "live_transport_model_mismatch"
+    if normalize_live_endpoint(config.base_url) != normalize_live_endpoint(profile.endpoint):
+        return "live_transport_endpoint_mismatch"
+    if config.temperature != profile.temperature:
+        return "live_transport_temperature_mismatch"
+    return None
+
+
+def validate_security_evaluation_transport_binding(
     adapter: object,
     profile: RuntimeProfileIdentity,
-) -> bool:
-    """True when a live OpenAI-compatible transport would claim a
-    normalizer-bearing runtime identity without actually applying it.
-    Fake adapters are not live transport; the evaluation runner still
-    applies the identity-bound normalizer on their responses.
+) -> str | None:
+    """Complete live-transport contract for one evaluation.
+
+    Fake/test adapters are not OpenAI-compatible live transport and
+    are permitted (the runner still applies the identity-bound
+    normalizer to their responses). Every live OpenAI-compatible
+    evaluation must use a `SecurityEvaluationAdapter` bound to the
+    exact evaluation `RuntimeProfileIdentity`, including native-only
+    profiles. Returns a stable reason token, or `None` when binding
+    is acceptable.
     """
-    if profile.normalizer_id is None:
-        return False
-    if type(adapter) is OpenAICompatibleAdapter:
-        return True
-    if isinstance(adapter, OpenAICompatibleAdapter) and not isinstance(
-        adapter,
-        SecurityEvaluationAdapter,
-    ):
-        return True
-    if isinstance(adapter, SecurityEvaluationAdapter):
-        bound = adapter.runtime_profile
-        if bound is None:
-            return True
-        return bound.runtime_identity_fingerprint != profile.runtime_identity_fingerprint
-    return False
+    if not isinstance(profile, RuntimeProfileIdentity):
+        return "malformed_evaluation_request"
+    if not isinstance(adapter, OpenAICompatibleAdapter):
+        return None
+    if not isinstance(adapter, SecurityEvaluationAdapter):
+        return "live_transport_requires_security_evaluation_adapter"
+    bound = adapter.runtime_profile
+    if bound is None:
+        return "unbound_security_evaluation_adapter"
+    if not isinstance(bound, RuntimeProfileIdentity):
+        return "unbound_security_evaluation_adapter"
+    config_reason = live_transport_config_binding_reason(adapter._config, profile)
+    if config_reason is not None:
+        return config_reason
+    if bound.runtime_identity_fingerprint != profile.runtime_identity_fingerprint:
+        return "runtime_identity_fingerprint_mismatch"
+    return None
 
 
 class SecurityEvaluationAdapter(OpenAICompatibleAdapter):
@@ -276,9 +317,10 @@ class SecurityEvaluationAdapter(OpenAICompatibleAdapter):
     canary calls become `WorkerToolCall` observations; this class
     never imports or calls `ToolExecutor`.
 
-    Bind a verified `RuntimeProfileIdentity` so `infer()` applies the
-    identity's compatibility normalizer. An unbound instance is
-    native-only and must not evaluate a normalizer-bearing identity.
+    A live evaluation must bind the exact `RuntimeProfileIdentity`
+    being evaluated. Unbound instances exist only for payload/schema
+    inspection and are rejected by
+    `validate_security_evaluation_transport_binding`.
     """
 
     def __init__(
@@ -288,17 +330,17 @@ class SecurityEvaluationAdapter(OpenAICompatibleAdapter):
         runtime_profile: RuntimeProfileIdentity | None = None,
     ) -> None:
         super().__init__(config)
-        if runtime_profile is not None and not isinstance(
-            runtime_profile,
-            RuntimeProfileIdentity,
-        ):
-            raise TypeError("runtime_profile must be a RuntimeProfileIdentity")
-        if (
-            runtime_profile is not None
-            and runtime_profile.normalizer_id is not None
-            and resolve_security_evaluation_normalizer(runtime_profile) is None
-        ):
-            raise ValueError("unknown_or_incomplete_protocol_normalizer")
+        if runtime_profile is not None:
+            if not isinstance(runtime_profile, RuntimeProfileIdentity):
+                raise TypeError("runtime_profile must be a RuntimeProfileIdentity")
+            mismatch = live_transport_config_binding_reason(self._config, runtime_profile)
+            if mismatch is not None:
+                raise ValueError(mismatch)
+            if (
+                runtime_profile.normalizer_id is not None
+                and resolve_security_evaluation_normalizer(runtime_profile) is None
+            ):
+                raise ValueError("unknown_or_incomplete_protocol_normalizer")
         self._runtime_profile = runtime_profile
 
     @property

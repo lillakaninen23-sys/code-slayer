@@ -859,8 +859,8 @@ def run_baseline_security_evaluation(
             ended_at=now_fn(),
         )
     from code_slayer.security.transport import (
-        adapter_ignores_runtime_normalizer,
         resolve_security_evaluation_normalizer,
+        validate_security_evaluation_transport_binding,
     )
 
     if runtime_profile.normalizer_id is not None:
@@ -872,22 +872,15 @@ def run_baseline_security_evaluation(
                 started_at=started_at,
                 ended_at=now_fn(),
             )
-        if adapter_ignores_runtime_normalizer(adapter, runtime_profile):
-            bound = getattr(adapter, "runtime_profile", None)
-            reason = "native_only_transport_ignores_runtime_identity"
-            if (
-                bound is not None
-                and isinstance(bound, RuntimeProfileIdentity)
-                and bound.runtime_identity_fingerprint != fingerprint
-            ):
-                reason = "runtime_identity_fingerprint_mismatch"
-            return _deny(
-                reason,
-                worker_id=worker_id,
-                runtime_identity_fingerprint=fingerprint,
-                started_at=started_at,
-                ended_at=now_fn(),
-            )
+    binding_reason = validate_security_evaluation_transport_binding(adapter, runtime_profile)
+    if binding_reason is not None:
+        return _deny(
+            binding_reason,
+            worker_id=worker_id,
+            runtime_identity_fingerprint=fingerprint,
+            started_at=started_at,
+            ended_at=now_fn(),
+        )
 
     sink = executor if executor is not None else SecurityHarnessExecutor()
     case_results: list[SecurityCaseResult] = []

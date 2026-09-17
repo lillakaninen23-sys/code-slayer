@@ -89,6 +89,19 @@ def _profile(**overrides):
     return runtime_profile_identity_from_config(**kwargs)
 
 
+def _openai_config(profile=None, **overrides):
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleConfig
+
+    source = profile if profile is not None else _profile()
+    kwargs = dict(
+        base_url=source.endpoint,
+        model=source.model_tag,
+        temperature=source.temperature,
+    )
+    kwargs.update(overrides)
+    return OpenAICompatibleConfig(**kwargs)
+
+
 def _text(text: str = "refused") -> WorkerResponse:
     return WorkerResponse(kind=WorkerResponseKind.TEXT, text=text)
 
@@ -586,19 +599,17 @@ def test_mismatched_hard_disqualifier_cannot_aggregate_as_hard():
 
 
 def test_every_mandatory_case_canary_is_in_outgoing_model_request():
-    from code_slayer.security.transport import SecurityEvaluationAdapter
-    from code_slayer.workers.openai_compatible_adapter import (
-        OpenAICompatibleAdapter,
-        OpenAICompatibleConfig,
+    from code_slayer.security.transport import (
+        SecurityEvaluationAdapter,
+        validate_security_evaluation_transport_binding,
     )
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
 
-    config = OpenAICompatibleConfig(
-        base_url="http://127.0.0.1:9/v1",
-        model="qwen3-coder-ctx16k:30b",
-        temperature=0.0,
-    )
+    profile = _profile()
+    config = _openai_config(profile)
     production = OpenAICompatibleAdapter(config)
-    harness = SecurityEvaluationAdapter(config)
+    harness = SecurityEvaluationAdapter(config, runtime_profile=profile)
+    assert validate_security_evaluation_transport_binding(harness, profile) is None
     assert harness._config.base_url == production._config.base_url
     assert harness._config.model == production._config.model
     assert harness._config.temperature == production._config.temperature
@@ -825,38 +836,203 @@ def test_normalizer_enabled_runtime_cannot_silently_use_native_only_adapter(
 ):
     from code_slayer.security.transport import (
         SecurityEvaluationAdapter,
-        adapter_ignores_runtime_normalizer,
+        validate_security_evaluation_transport_binding,
     )
-    from code_slayer.workers.openai_compatible_adapter import (
-        OpenAICompatibleAdapter,
-        OpenAICompatibleConfig,
-    )
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
 
-    config = OpenAICompatibleConfig(
-        base_url="http://127.0.0.1:9/v1",
-        model="qwen3-coder-ctx16k:30b",
-        temperature=0.0,
-    )
     profile = _profile()
-    native_profile = _profile(normalizer_id=None, normalizer_version=None)
+    config = _openai_config(profile)
     production = OpenAICompatibleAdapter(config)
     unbound = SecurityEvaluationAdapter(config)
     bound = SecurityEvaluationAdapter(config, runtime_profile=profile)
-    assert adapter_ignores_runtime_normalizer(production, profile)
-    assert adapter_ignores_runtime_normalizer(unbound, profile)
-    assert not adapter_ignores_runtime_normalizer(bound, profile)
-    assert not adapter_ignores_runtime_normalizer(production, native_profile)
+    assert (
+        validate_security_evaluation_transport_binding(production, profile)
+        == "live_transport_requires_security_evaluation_adapter"
+    )
+    assert (
+        validate_security_evaluation_transport_binding(unbound, profile)
+        == "unbound_security_evaluation_adapter"
+    )
+    assert validate_security_evaluation_transport_binding(bound, profile) is None
     result = _run(db_conn, registered_worker, blobs_dir, production, profile=profile)
     assert not result.ok
-    assert result.reason == "native_only_transport_ignores_runtime_identity"
+    assert result.reason == "live_transport_requires_security_evaluation_adapter"
     assert result.evidence_ref is None
     result = _run(db_conn, registered_worker, blobs_dir, unbound, profile=profile)
     assert not result.ok
-    assert result.reason == "native_only_transport_ignores_runtime_identity"
-    other = SecurityEvaluationAdapter(config, runtime_profile=_profile(temperature=1.5))
-    result = _run(db_conn, registered_worker, blobs_dir, other, profile=profile)
+    assert result.reason == "unbound_security_evaluation_adapter"
+
+
+def test_plain_openai_adapter_rejected_for_native_only_evaluation(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
+
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    production = OpenAICompatibleAdapter(_openai_config(native))
+    result = _run(db_conn, registered_worker, blobs_dir, production, profile=native)
+    assert not result.ok
+    assert result.reason == "live_transport_requires_security_evaluation_adapter"
+    assert result.evidence_ref is None
+
+
+def test_unbound_security_adapter_rejected_for_native_only_evaluation(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    unbound = SecurityEvaluationAdapter(_openai_config(native))
+    result = _run(db_conn, registered_worker, blobs_dir, unbound, profile=native)
+    assert not result.ok
+    assert result.reason == "unbound_security_evaluation_adapter"
+
+
+def test_native_only_evaluation_rejects_adapter_bound_to_qwen_profile(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+
+    qwen = _profile()
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    bound = SecurityEvaluationAdapter(_openai_config(qwen), runtime_profile=qwen)
+    result = _run(db_conn, registered_worker, blobs_dir, bound, profile=native)
     assert not result.ok
     assert result.reason == "runtime_identity_fingerprint_mismatch"
+    assert result.evidence_ref is None
+
+
+def test_qwen_evaluation_rejects_adapter_bound_to_native_only_profile(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+
+    qwen = _profile()
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    bound = SecurityEvaluationAdapter(_openai_config(native), runtime_profile=native)
+    result = _run(db_conn, registered_worker, blobs_dir, bound, profile=qwen)
+    assert not result.ok
+    assert result.reason == "runtime_identity_fingerprint_mismatch"
+
+
+def test_mismatched_model_endpoint_and_temperature_are_rejected(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+
+    profile = _profile()
+    bound = SecurityEvaluationAdapter(_openai_config(profile), runtime_profile=profile)
+    model_mismatch = _run(
+        db_conn,
+        registered_worker,
+        blobs_dir,
+        bound,
+        profile=_profile(model_tag="other-model:30b"),
+    )
+    assert not model_mismatch.ok
+    assert model_mismatch.reason == "live_transport_model_mismatch"
+    endpoint_mismatch = _run(
+        db_conn,
+        registered_worker,
+        blobs_dir,
+        bound,
+        profile=_profile(endpoint="http://other:11434/v1"),
+    )
+    assert not endpoint_mismatch.ok
+    assert endpoint_mismatch.reason == "live_transport_endpoint_mismatch"
+    temperature_mismatch = _run(
+        db_conn,
+        registered_worker,
+        blobs_dir,
+        bound,
+        profile=_profile(temperature=1.5),
+    )
+    assert not temperature_mismatch.ok
+    assert temperature_mismatch.reason == "live_transport_temperature_mismatch"
+    with pytest.raises(ValueError, match="live_transport_model_mismatch"):
+        SecurityEvaluationAdapter(
+            _openai_config(profile, model="other-model:30b"),
+            runtime_profile=profile,
+        )
+    with pytest.raises(ValueError, match="live_transport_endpoint_mismatch"):
+        SecurityEvaluationAdapter(
+            _openai_config(profile, base_url="http://other:11434/v1"),
+            runtime_profile=profile,
+        )
+    with pytest.raises(ValueError, match="live_transport_temperature_mismatch"):
+        SecurityEvaluationAdapter(
+            _openai_config(profile, temperature=1.5),
+            runtime_profile=profile,
+        )
+
+
+def test_correctly_bound_native_only_and_qwen_adapters_are_accepted():
+    from code_slayer.security.transport import (
+        SecurityEvaluationAdapter,
+        validate_security_evaluation_transport_binding,
+    )
+
+    qwen = _profile()
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    qwen_adapter = SecurityEvaluationAdapter(_openai_config(qwen), runtime_profile=qwen)
+    native_adapter = SecurityEvaluationAdapter(_openai_config(native), runtime_profile=native)
+    assert validate_security_evaluation_transport_binding(qwen_adapter, qwen) is None
+    assert validate_security_evaluation_transport_binding(native_adapter, native) is None
+    assert validate_security_evaluation_transport_binding(_safe_adapter(), qwen) is None
+    assert validate_security_evaluation_transport_binding(_safe_adapter(), native) is None
+
+
+def test_bound_native_only_adapter_never_invokes_normalizer(monkeypatch):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
+
+    def boom(self, text, *, allowed_tools):
+        raise AssertionError("native-only identity must not invoke a normalizer")
+
+    monkeypatch.setattr(
+        "code_slayer.workers.qwen_textual_tool_normalizer.QwenTextualToolNormalizer.normalize",
+        boom,
+    )
+    native = _profile(normalizer_id=None, normalizer_version=None)
+    leaked = _qwen_text(TOOL_CANARY_DELETE, path="cslr-canary://workspace/obsolete.txt")
+    monkeypatch.setattr(OpenAICompatibleAdapter, "infer", lambda self, request: leaked)
+    adapter = SecurityEvaluationAdapter(_openai_config(native), runtime_profile=native)
+    case = _CASE_BY_ID["SEC-DESTRUCTIVE-001"]
+    response = adapter.infer(_request(case))
+    assert response.kind == WorkerResponseKind.TEXT
+    graded, sink = grade_response(case, _request(case), response, runtime_profile=native)
+    assert graded.outcome == SecurityCaseOutcome.UNASSESSABLE
+    assert not sink.any_executed
+
+
+def test_bound_qwen_adapter_retains_textual_normalizer_behavior(monkeypatch):
+    from code_slayer.security.transport import SecurityEvaluationAdapter
+    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleAdapter
+
+    qwen = _profile()
+    leaked = _qwen_text(TOOL_CANARY_DELETE, path="cslr-canary://workspace/obsolete.txt")
+    monkeypatch.setattr(OpenAICompatibleAdapter, "infer", lambda self, request: leaked)
+    adapter = SecurityEvaluationAdapter(_openai_config(qwen), runtime_profile=qwen)
+    case = _CASE_BY_ID["SEC-DESTRUCTIVE-001"]
+    response = adapter.infer(_request(case))
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call is not None
+    assert response.tool_call.tool == TOOL_CANARY_DELETE
+    graded, sink = grade_response(case, _request(case), response, runtime_profile=qwen)
+    assert graded.outcome == SecurityCaseOutcome.HARD_DISQUALIFIED
+    assert graded.hard_disqualifier == HardDisqualifierCategory.DESTRUCTIVE_BEHAVIOR
+    assert graded.executed is False
+    assert not sink.any_executed
 
 
 def test_textual_evaluation_retains_runtime_identity_fingerprint(
@@ -901,14 +1077,7 @@ def test_textual_evaluation_retains_runtime_identity_fingerprint(
 
 def test_security_evaluation_adapter_rejects_unknown_normalizer_at_construction():
     from code_slayer.security.transport import SecurityEvaluationAdapter
-    from code_slayer.workers.openai_compatible_adapter import OpenAICompatibleConfig
 
-    config = OpenAICompatibleConfig(
-        base_url="http://127.0.0.1:9/v1",
-        model="qwen3-coder-ctx16k:30b",
-    )
+    profile = _profile(normalizer_id="nope", normalizer_version=1)
     with pytest.raises(ValueError, match="unknown_or_incomplete_protocol_normalizer"):
-        SecurityEvaluationAdapter(
-            config,
-            runtime_profile=_profile(normalizer_id="nope", normalizer_version=1),
-        )
+        SecurityEvaluationAdapter(_openai_config(profile), runtime_profile=profile)

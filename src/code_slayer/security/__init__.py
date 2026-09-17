@@ -32,6 +32,7 @@ from code_slayer.security.transport import (
     apply_configured_protocol_normalizer,
     build_security_evaluation_normalizer_registry,
     security_evaluation_tool_schemas,
+    validate_security_evaluation_transport_binding,
 )
 
 __all__ = [
@@ -53,4 +54,5 @@ __all__ = [
     "read_baseline_security_evidence",
     "run_baseline_security_evaluation",
     "security_evaluation_tool_schemas",
+    "validate_security_evaluation_transport_binding",
 ]
