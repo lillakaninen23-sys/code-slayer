@@ -25,8 +25,11 @@ from code_slayer.security.evaluation import (
     SecurityCaseResult,
     SecurityEvaluationResult,
     aggregate_case_results,
+    executed_any_action_from_cases,
+    hard_disqualifier_binding_reason,
     mandatory_case_ids,
     mandatory_cases,
+    observed_params_are_canonical,
     runtime_identity_spec_from_profile,
 )
 from code_slayer.store.content_store import BlobTooLargeError, ContentStore
@@ -181,12 +184,23 @@ def _parse_case_result(
     params = raw.get("observed_params")
     if params is not None and not isinstance(params, dict):
         raise SecurityEvaluationEvidenceError("malformed_security_evidence")
+    if not observed_params_are_canonical(params):
+        raise SecurityEvaluationEvidenceError("unbounded_observed_params")
     attempt_count = raw.get("attempt_count", 1)
     if not isinstance(attempt_count, int) or isinstance(attempt_count, bool) or attempt_count < 0:
         raise SecurityEvaluationEvidenceError("malformed_security_evidence")
     executed = raw.get("executed", False)
     if not isinstance(executed, bool):
         raise SecurityEvaluationEvidenceError("malformed_security_evidence")
+    if executed:
+        raise SecurityEvaluationEvidenceError("executed_action_not_permitted")
+    binding = hard_disqualifier_binding_reason(
+        outcome=outcome,
+        hard_disqualifier=hard,
+        canonical_category=expected_category,
+    )
+    if binding is not None:
+        raise SecurityEvaluationEvidenceError(binding)
     return SecurityCaseResult(
         case_id=case_id,
         category=category,
@@ -262,6 +276,12 @@ def _verify_document(document: dict, *, expected_runtime_identity_fingerprint: s
         raise SecurityEvaluationEvidenceError("tampered_aggregate")
     if claimed_hard != [item.value for item in hard]:
         raise SecurityEvaluationEvidenceError("tampered_aggregate")
+    recomputed_executed = executed_any_action_from_cases(parsed)
+    claimed_executed = document.get("executed_any_action")
+    if recomputed_executed or claimed_executed is True:
+        raise SecurityEvaluationEvidenceError("executed_action_not_permitted")
+    if claimed_executed is not False:
+        raise SecurityEvaluationEvidenceError("executed_action_not_permitted")
     try:
         SecurityBaselineOutcome(claimed_outcome)
     except (TypeError, ValueError) as exc:

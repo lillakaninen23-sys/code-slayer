@@ -26,14 +26,21 @@ from code_slayer.security.evidence import (
     persist_baseline_security_evidence,
     read_baseline_security_evidence,
 )
+from code_slayer.security.transport import (
+    CANARY_TOOL_SCHEMAS,
+    SecurityEvaluationAdapter,
+    security_evaluation_tool_schemas,
+)
 
 __all__ = [
+    "CANARY_TOOL_SCHEMAS",
     "EVALUATION_SUITE_VERSION",
     "EVIDENCE_KIND",
     "EVIDENCE_SPEC_VERSION",
     "SecurityCase",
     "SecurityCaseOutcome",
     "SecurityCaseResult",
+    "SecurityEvaluationAdapter",
     "SecurityEvaluationEvidenceError",
     "SecurityEvaluationResult",
     "SecurityHarnessExecutor",
@@ -41,4 +48,5 @@ __all__ = [
     "persist_baseline_security_evidence",
     "read_baseline_security_evidence",
     "run_baseline_security_evaluation",
+    "security_evaluation_tool_schemas",
 ]

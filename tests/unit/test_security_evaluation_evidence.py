@@ -313,3 +313,122 @@ def test_hard_violation_round_trips_disqualifiers(db_conn, registered_worker, bl
     assert document["hard_disqualifiers"] == ["DESTRUCTIVE_BEHAVIOR"]
     assert document["cases"][4]["executed"] is False
     assert document["cases"][4]["observed_tool"] == "security_canary_delete"
+
+
+def _pass_document(db_conn, registered_worker, blobs_dir, profile):
+    result = _run_pass(db_conn, registered_worker, blobs_dir, profile=profile)
+    return read_baseline_security_evidence(
+        db_conn,
+        blobs_dir,
+        result.evidence_ref,
+        expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+    )
+
+
+def test_destructive_case_cannot_bind_secrets_disqualifier(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    destructive = document["cases"][4]
+    assert destructive["case_id"] == "SEC-DESTRUCTIVE-001"
+    destructive["outcome"] = "HARD_DISQUALIFIED"
+    destructive["hard_disqualifier"] = "SECRETS_HANDLING_VIOLATION"
+    destructive["reason"] = "hard_disqualifying_behavior_observed"
+    document["final_outcome"] = "HARD_DISQUALIFIED"
+    document["final_reason"] = "hard_disqualifier"
+    document["hard_disqualifiers"] = ["SECRETS_HANDLING_VIOLATION"]
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="hard_disqualifier_binding_mismatch"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["PASS", "FAIL", "UNASSESSABLE", "INFRASTRUCTURE_FAILURE"],
+)
+def test_non_hard_outcome_cannot_carry_hard_category(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    outcome,
+):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    document["cases"][0]["outcome"] = outcome
+    document["cases"][0]["hard_disqualifier"] = "TOOL_SCOPE_VIOLATION"
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="hard_disqualifier_binding_mismatch"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
+
+
+def test_executed_true_on_a_case_is_rejected(db_conn, registered_worker, blobs_dir):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    document["cases"][0]["executed"] = True
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="executed_action_not_permitted"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
+
+
+def test_executed_any_action_true_is_rejected(db_conn, registered_worker, blobs_dir):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    document["executed_any_action"] = True
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="executed_action_not_permitted"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
+
+
+def test_extra_observed_params_are_rejected(db_conn, registered_worker, blobs_dir):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    document["cases"][0]["observed_params"] = {
+        "path": "cslr-canary://workspace/README.md",
+        "nested": {"foo": "bar"},
+        "extra": "unbounded",
+    }
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="unbounded_observed_params"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
+
+
+def test_overlong_observed_param_is_rejected(db_conn, registered_worker, blobs_dir):
+    profile = _profile()
+    document = _pass_document(db_conn, registered_worker, blobs_dir, profile)
+    document["cases"][0]["observed_params"] = {"path": "cslr-canary://workspace/" + ("a" * 300)}
+    content_hash = _put_document(db_conn, blobs_dir, document)
+    with pytest.raises(SecurityEvaluationEvidenceError, match="unbounded_observed_params"):
+        read_baseline_security_evidence(
+            db_conn,
+            blobs_dir,
+            content_hash,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        )
