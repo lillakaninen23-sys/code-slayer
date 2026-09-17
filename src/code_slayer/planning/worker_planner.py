@@ -211,6 +211,7 @@ class WorkerAdapterPlanner:
         used_normalizer_id: str | None = None
         used_normalizer_version: int | None = None
         normalization_reason: str | None = None
+        original_transport_text: str | None = None
 
         if not validation.executable or validation.tool_call is None:
             if validation.reason != _LEAKAGE_REASON:
@@ -258,6 +259,11 @@ class WorkerAdapterPlanner:
                     usage=response.usage,
                     finish_reason=response.finish_reason,
                 )
+            # Exact original textual payload -- distinct from the
+            # canonical structured params written to `.raw` after
+            # re-validation. Provenance persists this separately;
+            # nothing downstream of this module treats it as authority.
+            original_transport_text = response.text
             # Re-enter the EXACT SAME validator every native tool call
             # already goes through -- a normalized WorkerToolCall is not
             # a validator bypass.
@@ -281,6 +287,7 @@ class WorkerAdapterPlanner:
                     normalizer_id=normalizer.normalizer_id,
                     normalizer_version=normalizer.normalizer_version,
                     normalization_reason=decoded.reason,
+                    original_transport_text=original_transport_text,
                 )
             transport = ToolCallTransport.NORMALIZED
             used_normalizer_id = normalizer.normalizer_id
@@ -298,6 +305,7 @@ class WorkerAdapterPlanner:
                 normalizer_id=used_normalizer_id,
                 normalizer_version=used_normalizer_version,
                 normalization_reason=normalization_reason,
+                original_transport_text=original_transport_text,
             )
         raw_params = json.dumps(dict(validation.tool_call.params), sort_keys=True, default=str)
         structured = parse_planner_output(validation.tool_call.params)
@@ -313,6 +321,7 @@ class WorkerAdapterPlanner:
                 normalizer_id=used_normalizer_id,
                 normalizer_version=used_normalizer_version,
                 normalization_reason=normalization_reason,
+                original_transport_text=original_transport_text,
             )
         return PlannerResponse(
             PlannerOutcome.STRUCTURED,
@@ -324,6 +333,7 @@ class WorkerAdapterPlanner:
             normalizer_id=used_normalizer_id,
             normalizer_version=used_normalizer_version,
             normalization_reason=normalization_reason,
+            original_transport_text=original_transport_text,
         )
 
 

@@ -155,7 +155,14 @@ then re-enters the same `validate_response()` +
 model-selected decoder, and never a silent change to runtime-profile
 identity or certificates. Native vs. normalized behavior is recorded
 distinctly in `planning.provenance.store_planner_output` via
-`PlannerResponse.tool_call_transport`. `planning.planner.
+`PlannerResponse.tool_call_transport`. For a `NORMALIZED` turn the
+original provider/model textual payload is persisted as a distinct,
+internal-only, non-exportable content-addressed blob (`source_kind=
+"engineering_plan_original_transport"`), referenced from the planner-
+output document by hash; canonical structured params remain in
+`PlannerResponse.raw`. Neither is surfaced through `PlanRecord` or the
+HTTP API, and neither influences permissions, trust, certification,
+parser acceptance, or execution authority. `planning.planner.
 parse_planner_output()` then does strict, whole-shape schema validation
 of the resulting structured payload — an unrecognized field, wrong
 type, or non-mapping/non-list shape rejects the whole thing
@@ -275,7 +282,10 @@ in the content-addressed `planner_output_blob`
 (`planning.provenance.store_planner_output()`, `source_kind=
 "engineering_plan_planner_output"`) — inspectable by a caller with
 direct `ContentStore` access, never surfaced through `planning.service.
-PlanRecord` or the HTTP API by default.
+PlanRecord` or the HTTP API by default. A successful `NORMALIZED` turn
+additionally stores the original textual transport as a separate
+internal blob (`source_kind="engineering_plan_original_transport"`);
+that blob is also non-exportable and is never copied onto `PlanRecord`.
 
 ## Question Gate integration
 

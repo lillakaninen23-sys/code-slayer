@@ -21,12 +21,16 @@ made).
 
 ## No prose recovery, structurally
 
-Classification here never inspects `PlannerResponse.raw`/`.error`'s free
-text for anything resembling a plan, and never re-derives a tool call from
-`WorkerResponse.text`. The sole inputs to `classify_planner_response()` are
-`PlannerResponse.outcome`/`.output`/`.failure_category`/`.finish_reason`,
-plus the original task text for a deliberately weak, generic lexical-
-relevance check (see "Qualification success semantics" below).
+Classification here never inspects `PlannerResponse.raw`/`.error`/
+`.original_transport_text`'s free text for anything resembling a plan,
+and never re-derives a tool call from `WorkerResponse.text`. The sole
+inputs to `classify_planner_response()` are `PlannerResponse.outcome`/
+`.output`/`.failure_category`/`.finish_reason`, plus the original task
+text for a deliberately weak, generic lexical-relevance check (see
+"Qualification success semantics" below). Original provider/model
+transport text retained for forensic provenance is never classification
+input, never hashed into `AttemptProvenance` fingerprints, and never a
+capability grant.
 
 ## This module never touches trust, policy, leases, or checkpoints
 
@@ -544,7 +548,10 @@ def classify_planner_response(
     truth for classifying what the model actually claimed. Omitting it
     (the default) skips scope checking entirely -- byte-for-byte the
     same behavior as before this parameter existed. The universal policy
-    check below always runs regardless."""
+    check below always runs regardless.
+
+    `response.original_transport_text` is never read here -- forensic
+    provenance of a NORMALIZED turn does not influence classification."""
     if not isinstance(response, PlannerResponse):
         raise TypeError("classify_planner_response requires a PlannerResponse")
     if snapshot is not None and not isinstance(snapshot, Snapshot):

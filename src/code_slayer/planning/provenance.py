@@ -6,10 +6,11 @@ No parallel logging system, no schema beyond `content_blobs`/
 `audit_events` plus the small `engineering_plans` pointer row
 (`store.migrations.0008_engineering_planning`). Every large document —
 the original request, the bounded planner input, the planner's raw
-structured output, the evidence-validation result, the final validated
-plan content — is persisted exactly once each, content-addressed, in the
-same `store.content_store.ContentStore` every other durable evidence
-record in this codebase already lives in.
+structured output, the original textual transport of a `NORMALIZED`
+turn (when one occurred), the evidence-validation result, the final
+validated plan content — is persisted exactly once each, content-
+addressed, in the same `store.content_store.ContentStore` every other
+durable evidence record in this codebase already lives in.
 
 This module performs no planning decisions of its own — only durable
 recording of decisions `planning.service.EngineeringPlanningService`
@@ -37,17 +38,24 @@ from code_slayer.planning.models import (
     plan_content_from_dict,
     plan_content_to_dict,
 )
-from code_slayer.planning.planner import PlannerRequest, PlannerResponse, render_bounded_context
+from code_slayer.planning.planner import (
+    PlannerRequest,
+    PlannerResponse,
+    ToolCallTransport,
+    render_bounded_context,
+)
 from code_slayer.store.content_store import ContentBlob, ContentStore
 from code_slayer.workers.protocol import (
     WorkerSupplementalKind,
     WorkerSupplementalResolution,
     WorkerSupplementalSource,
 )
+from code_slayer.workers.protocol_normalization import MAX_NORMALIZER_INPUT_CHARS
 
 REQUEST_EVIDENCE_KIND = "engineering_plan_request"
 PLANNER_INPUT_EVIDENCE_KIND = "engineering_plan_planner_input"
 PLANNER_OUTPUT_EVIDENCE_KIND = "engineering_plan_planner_output"
+ORIGINAL_TRANSPORT_EVIDENCE_KIND = "engineering_plan_original_transport"
 VALIDATION_EVIDENCE_KIND = "engineering_plan_validation"
 PLAN_CONTENT_EVIDENCE_KIND = "engineering_plan_content"
 PLAN_HUMAN_ANSWER_EVIDENCE_KIND = "engineering_plan_human_answer"
@@ -128,7 +136,16 @@ def store_planner_output(store: ContentStore, response: PlannerResponse) -> Cont
     what of that survived validation. Internal-only: `raw`/`error` are
     never surfaced through `planning.service.PlanRecord`/the HTTP API
     (Phase 8.2b) — only the coarse `failure_category` is (via
-    `planning.service`'s durable `reason` field)."""
+    `planning.service`'s durable `reason` field).
+
+    For a `NORMALIZED` turn, the original provider/model textual
+    payload is persisted as a *separate* internal-only blob
+    (`ORIGINAL_TRANSPORT_EVIDENCE_KIND`) and referenced here by hash.
+    `document["raw"]` remains the canonical structured params (or the
+    coarse failure payload) — never replaced by the original text.
+    Native turns do not grow this document and do not create a
+    transport blob. This evidence never influences permissions, trust,
+    certification, parser acceptance, or execution authority."""
     document = {
         "outcome": response.outcome.value,
         "raw": response.raw,
@@ -143,12 +160,47 @@ def store_planner_output(store: ContentStore, response: PlannerResponse) -> Cont
         "normalizer_version": response.normalizer_version,
         "normalization_reason": response.normalization_reason,
     }
+    if response.tool_call_transport == ToolCallTransport.NORMALIZED:
+        if not isinstance(response.original_transport_text, str):
+            raise ValueError("NORMALIZED planner output requires original_transport_text")
+        transport_blob = store_original_transport(store, response.original_transport_text)
+        document["original_transport_content_hash"] = transport_blob.content_hash
+    elif response.original_transport_text is not None:
+        raise ValueError("original_transport_text is only valid for NORMALIZED transport")
     return store.put(
         _canonical(document),
         media_type="application/json",
         source_kind=PLANNER_OUTPUT_EVIDENCE_KIND,
         exportable=False,
     )
+
+
+def store_original_transport(store: ContentStore, text: str) -> ContentBlob:
+    """Exact original provider/model textual payload for one NORMALIZED
+    turn — internal-only, non-exportable, bounded to the compatibility
+    layer's own maximum input size. Truncation is recorded on the blob
+    (`truncated=True`) rather than silently dropped; a successful
+    decoder path never produces a payload above this bound."""
+    if not isinstance(text, str):
+        raise TypeError("original transport text must be a str")
+    truncated = len(text) > MAX_NORMALIZER_INPUT_CHARS
+    bounded = text[:MAX_NORMALIZER_INPUT_CHARS]
+    return store.put(
+        bounded.encode("utf-8"),
+        media_type="text/plain",
+        source_kind=ORIGINAL_TRANSPORT_EVIDENCE_KIND,
+        exportable=False,
+        truncated=truncated,
+    )
+
+
+def read_original_transport(
+    conn: sqlite3.Connection,
+    blobs_dir: Path | str,
+    content_hash: str,
+) -> str:
+    store = ContentStore(conn, blobs_dir)
+    return _read_verified(store, content_hash, ORIGINAL_TRANSPORT_EVIDENCE_KIND).decode("utf-8")
 
 
 def store_validation_result(store: ContentStore, result: EvidenceValidationResult) -> ContentBlob:

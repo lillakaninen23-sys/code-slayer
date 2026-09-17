@@ -308,7 +308,17 @@ class PlannerResponse:
     `ToolCallTransport`. `normalizer_id`/`normalizer_version`/
     `normalization_reason` are populated only for `NORMALIZED` turns,
     and only with the code-owned identity/reason of the decoder that
-    actually ran — never raw model text."""
+    actually ran — never raw model text.
+
+    `original_transport_text` is populated only for `NORMALIZED` turns:
+    the exact provider/model textual payload that required
+    normalization, retained solely so `planning.provenance.
+    store_planner_output()` can persist it as distinct, internal-only,
+    content-addressed evidence. It is never the canonical structured
+    output (`raw` remains that), never inspected by
+    `parse_planner_output()` / `classify_planner_response()` /
+    certification / permissions / trust, and never surfaced through
+    `planning.service.PlanRecord` or the HTTP API."""
 
     outcome: PlannerOutcome
     output: PlannerStructuredOutput | None = None
@@ -321,6 +331,7 @@ class PlannerResponse:
     normalizer_id: str | None = None
     normalizer_version: int | None = None
     normalization_reason: str | None = None
+    original_transport_text: str | None = None
 
 
 class Planner(Protocol):

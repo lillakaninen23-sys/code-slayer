@@ -17,6 +17,7 @@ from code_slayer.planning.planner import (
     PlannerFailureCategory,
     PlannerOutcome,
     PlannerRequest,
+    PlannerResponse,
     ToolCallTransport,
     parse_planner_output,
 )
@@ -32,6 +33,7 @@ from code_slayer.workers.protocol import (
     WorkerToolCall,
 )
 from code_slayer.workers.protocol_normalization import (
+    MAX_NORMALIZER_INPUT_CHARS,
     NormalizationOutcome,
     ToolProtocolNormalizerRegistry,
 )
@@ -322,6 +324,11 @@ def test_enabled_normalizer_accepts_real_qwen_shape_then_existing_schema():
     assert response.normalizer_id == NORMALIZER_ID
     assert response.normalizer_version == NORMALIZER_VERSION
     assert response.normalization_reason == "qwen_textual_tool_v1_normalized"
+    original = _qwen_document()
+    assert response.original_transport_text == original
+    assert response.raw is not None
+    assert response.raw != original
+    assert json.loads(response.raw)["goal"] == "Add a read-only endpoint"
 
 
 def test_native_tool_call_takes_precedence_over_enabled_normalizer():
@@ -346,6 +353,7 @@ def test_native_tool_call_takes_precedence_over_enabled_normalizer():
     assert response.output.goal == "native wins"
     assert response.tool_call_transport == ToolCallTransport.NATIVE
     assert response.normalizer_id is None
+    assert response.original_transport_text is None
 
 
 def test_enabled_normalizer_still_rejects_non_matching_leakage():
@@ -448,7 +456,11 @@ def test_canonical_json_round_trip_of_normalized_params():
 
 
 def test_planner_output_provenance_distinguishes_native_from_normalized(db_conn, tmp_path):
-    from code_slayer.planning.provenance import store_planner_output
+    from code_slayer.planning.provenance import (
+        ORIGINAL_TRANSPORT_EVIDENCE_KIND,
+        read_original_transport,
+        store_planner_output,
+    )
     from code_slayer.store.content_store import ContentStore
 
     store = ContentStore(db_conn, tmp_path / "blobs")
@@ -486,3 +498,238 @@ def test_planner_output_provenance_distinguishes_native_from_normalized(db_conn,
     assert leaked_doc["normalizer_id"] == NORMALIZER_ID
     assert leaked_doc["normalizer_version"] == NORMALIZER_VERSION
     assert native_blob.content_hash != leaked_blob.content_hash
+    assert native_response.original_transport_text is None
+    assert "original_transport_content_hash" not in native_doc
+    original = _qwen_document(goal="normalized")
+    assert leaked_response.original_transport_text == original
+    assert leaked_response.raw is not None
+    assert leaked_response.raw != original
+    assert json.loads(leaked_response.raw)["goal"] == "normalized"
+    assert leaked_doc["raw"] == leaked_response.raw
+    transport_hash = leaked_doc["original_transport_content_hash"]
+    meta = store.get_meta(transport_hash)
+    assert meta is not None
+    assert meta.source_kind == ORIGINAL_TRANSPORT_EVIDENCE_KIND
+    assert meta.exportable is False
+    assert meta.truncated is False
+    assert read_original_transport(db_conn, tmp_path / "blobs", transport_hash) == original
+    assert original not in leaked_doc["raw"]
+    assert "<function=" not in json.dumps(leaked_doc)
+    assert set(native_doc) == {
+        "outcome",
+        "raw",
+        "error",
+        "failure_category",
+        "tool_call_transport",
+        "normalizer_id",
+        "normalizer_version",
+        "normalization_reason",
+    }
+
+
+def test_normalized_schema_invalid_still_preserves_original_transport(db_conn, tmp_path):
+    from code_slayer.planning.provenance import read_original_transport, store_planner_output
+    from code_slayer.store.content_store import ContentStore
+
+    original = f"<function={TOOL_NAME}>\n<parameter=affected_files>\n[]\n</parameter>\n</function>"
+    response = WorkerAdapterPlanner(
+        FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text=original)]),
+        task_id="z",
+        normalizer_registry=build_default_normalizer_registry(),
+        normalizer_id=NORMALIZER_ID,
+        normalizer_version=NORMALIZER_VERSION,
+    ).plan(PlannerRequest(original_request="Do it"))
+    assert response.outcome == PlannerOutcome.MALFORMED
+    assert response.failure_category == PlannerFailureCategory.SCHEMA_INVALID
+    assert response.tool_call_transport == ToolCallTransport.NORMALIZED
+    assert response.original_transport_text == original
+    assert response.raw is not None
+    assert response.raw != original
+    store = ContentStore(db_conn, tmp_path / "blobs")
+    blob = store_planner_output(store, response)
+    doc = json.loads(store.read(blob.content_hash))
+    assert doc["raw"] == response.raw
+    assert (
+        read_original_transport(db_conn, tmp_path / "blobs", doc["original_transport_content_hash"])
+        == original
+    )
+
+
+def test_native_provenance_rejects_original_transport_text(db_conn, tmp_path):
+    from code_slayer.planning.provenance import store_planner_output
+    from code_slayer.store.content_store import ContentStore
+
+    output = parse_planner_output({"goal": "native"})
+    assert output is not None
+    store = ContentStore(db_conn, tmp_path / "blobs")
+    with pytest.raises(ValueError, match="only valid for NORMALIZED"):
+        store_planner_output(
+            store,
+            PlannerResponse(
+                PlannerOutcome.STRUCTURED,
+                output=output,
+                raw='{"goal":"native"}',
+                tool_call_transport=ToolCallTransport.NATIVE,
+                original_transport_text=_qwen_document(),
+            ),
+        )
+
+
+def test_normalized_provenance_requires_original_transport_text(db_conn, tmp_path):
+    from code_slayer.planning.provenance import store_planner_output
+    from code_slayer.store.content_store import ContentStore
+
+    output = parse_planner_output({"goal": "normalized"})
+    assert output is not None
+    store = ContentStore(db_conn, tmp_path / "blobs")
+    with pytest.raises(ValueError, match="requires original_transport_text"):
+        store_planner_output(
+            store,
+            PlannerResponse(
+                PlannerOutcome.STRUCTURED,
+                output=output,
+                raw='{"goal":"normalized"}',
+                tool_call_transport=ToolCallTransport.NORMALIZED,
+                normalizer_id=NORMALIZER_ID,
+                normalizer_version=NORMALIZER_VERSION,
+            ),
+        )
+
+
+def test_original_transport_store_bounds_to_normalizer_max(db_conn, tmp_path):
+    from code_slayer.planning.provenance import (
+        ORIGINAL_TRANSPORT_EVIDENCE_KIND,
+        store_planner_output,
+    )
+    from code_slayer.store.content_store import ContentStore
+
+    output = parse_planner_output({"goal": "g"})
+    assert output is not None
+    huge = "x" * (MAX_NORMALIZER_INPUT_CHARS + 50)
+    store = ContentStore(db_conn, tmp_path / "blobs")
+    blob = store_planner_output(
+        store,
+        PlannerResponse(
+            PlannerOutcome.STRUCTURED,
+            output=output,
+            raw='{"goal":"g"}',
+            tool_call_transport=ToolCallTransport.NORMALIZED,
+            normalizer_id=NORMALIZER_ID,
+            normalizer_version=NORMALIZER_VERSION,
+            original_transport_text=huge,
+        ),
+    )
+    doc = json.loads(store.read(blob.content_hash))
+    meta = store.get_meta(doc["original_transport_content_hash"])
+    assert meta is not None
+    assert meta.source_kind == ORIGINAL_TRANSPORT_EVIDENCE_KIND
+    assert meta.exportable is False
+    assert meta.truncated is True
+    recovered = store.read(doc["original_transport_content_hash"]).decode("utf-8")
+    assert recovered == huge[:MAX_NORMALIZER_INPUT_CHARS]
+    assert recovered != huge
+    assert doc["raw"] == '{"goal":"g"}'
+
+
+def test_original_transport_does_not_change_classification_or_attempt_provenance():
+    from dataclasses import asdict
+
+    from code_slayer.planning.qualification import (
+        PlannerTrial,
+        RuntimeContextProfile,
+        TrialOutcome,
+        build_attempt_provenance,
+        classify_planner_response,
+    )
+
+    output = parse_planner_output({"goal": "Add a read-only endpoint"})
+    assert output is not None
+    secret = "<function=emit_engineering_plan>\nSECRET_TRANSPORT_PAYLOAD\n</function>"
+    without = PlannerResponse(
+        PlannerOutcome.STRUCTURED,
+        output=output,
+        raw='{"goal":"Add a read-only endpoint"}',
+        tool_call_transport=ToolCallTransport.NORMALIZED,
+        normalizer_id=NORMALIZER_ID,
+        normalizer_version=NORMALIZER_VERSION,
+    )
+    with_text = PlannerResponse(
+        PlannerOutcome.STRUCTURED,
+        output=output,
+        raw='{"goal":"Add a read-only endpoint"}',
+        tool_call_transport=ToolCallTransport.NORMALIZED,
+        normalizer_id=NORMALIZER_ID,
+        normalizer_version=NORMALIZER_VERSION,
+        original_transport_text=secret,
+    )
+    assert classify_planner_response(without) == classify_planner_response(with_text)
+    profile = RuntimeContextProfile(
+        model_tag="qwen3-coder-ctx16k:30b",
+        effective_context_tokens=16384,
+        normalizer_id=NORMALIZER_ID,
+        normalizer_version=NORMALIZER_VERSION,
+    )
+    trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
+    request = PlannerRequest(original_request="Add a read-only endpoint")
+    provenance = build_attempt_provenance(
+        qualification_class="C",
+        request=request,
+        profile=profile,
+        attempt_number=1,
+        trial=trial,
+        response=with_text,
+    )
+    dumped = json.dumps(asdict(provenance))
+    assert secret not in dumped
+    assert "SECRET_TRANSPORT_PAYLOAD" not in dumped
+    assert provenance.tool_call_transport == ToolCallTransport.NORMALIZED.value
+    assert provenance.normalizer_id == NORMALIZER_ID
+
+
+def test_normalized_original_transport_is_not_on_plan_record(git_repo_with_commit, tmp_path):
+    import dataclasses
+
+    from code_slayer.planning.provenance import read_original_transport
+    from code_slayer.planning.service import EngineeringPlanningService
+    from code_slayer.store.content_store import ContentStore
+    from code_slayer.store.planning_repo import PlanningRepo
+
+    original = _qwen_document(goal="Add a read-only endpoint")
+    state_root = tmp_path / "_plan_state"
+    service = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        planner = WorkerAdapterPlanner(
+            FakeWorkerAdapter([WorkerResponse(kind=WorkerResponseKind.TEXT, text=original)]),
+            task_id="plan-x",
+            normalizer_registry=build_default_normalizer_registry(),
+            normalizer_id=NORMALIZER_ID,
+            normalizer_version=NORMALIZER_VERSION,
+        )
+        record = service.create(
+            original_request="Add a read-only endpoint",
+            planner=planner,
+        )
+        assert not hasattr(record, "raw")
+        assert not hasattr(record, "error")
+        assert not hasattr(record, "original_transport_text")
+        dumped = json.dumps(dataclasses.asdict(record))
+        assert "<function=" not in dumped
+        assert "</function>" not in dumped
+        assert "SECRET" not in dumped
+        assert record.content is not None
+        assert record.content.goal == "Add a read-only endpoint"
+
+        row = PlanningRepo(service._conn).get(record.plan_id)
+        assert row.planner_output_content_hash is not None
+        store = ContentStore(service._conn, service._blobs_dir)
+        doc = json.loads(store.read(row.planner_output_content_hash))
+        recovered = read_original_transport(
+            service._conn,
+            service._blobs_dir,
+            doc["original_transport_content_hash"],
+        )
+        assert recovered == original
+        assert doc["raw"] != original
+        assert json.loads(doc["raw"])["goal"] == "Add a read-only endpoint"
+    finally:
+        service.close()

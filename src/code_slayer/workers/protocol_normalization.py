@@ -97,6 +97,13 @@ from typing import Protocol
 
 from code_slayer.workers.protocol import WorkerToolCall
 
+# Shared, layer-wide bound every compatibility decoder (and the
+# provenance store that persists a successful decoder's original
+# transport text) must honor. Distinct from, and much smaller than, the
+# adapter-level transport ceiling
+# (`workers.openai_compatible_adapter._DEFAULT_MAX_RESPONSE_BYTES`).
+MAX_NORMALIZER_INPUT_CHARS = 65536
+
 
 class NormalizationOutcome(StrEnum):
     """The complete, fixed outcome vocabulary one normalization attempt

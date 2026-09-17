@@ -80,6 +80,7 @@ from dataclasses import dataclass
 
 from code_slayer.workers.protocol import WorkerToolCall
 from code_slayer.workers.protocol_normalization import (
+    MAX_NORMALIZER_INPUT_CHARS,
     NormalizationOutcome,
     ToolProtocolNormalizationResult,
 )
@@ -87,13 +88,9 @@ from code_slayer.workers.protocol_normalization import (
 NORMALIZER_ID = "qwen_textual_tool_v1"
 NORMALIZER_VERSION = 1
 
-# A conservative, deterministic bound distinct from (and much smaller
-# than) `workers.openai_compatible_adapter._DEFAULT_MAX_RESPONSE_BYTES`
-# (1 MiB) -- an engineering-plan-shaped textual pseudo-tool-call has no
-# legitimate reason to approach that ceiling, and bounding parsing cost
-# here is a deliberate, separate defense, not a reuse of that adapter-
-# level transport limit.
-_MAX_INPUT_CHARS = 65536
+# Bound is owned by the compatibility layer as a whole -- this decoder
+# honors it rather than inventing a second ceiling.
+_MAX_INPUT_CHARS = MAX_NORMALIZER_INPUT_CHARS
 
 _FUNCTION_OPEN = "<function="
 _FUNCTION_CLOSE = "</function>"
