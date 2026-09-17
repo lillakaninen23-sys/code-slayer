@@ -54,10 +54,12 @@ A certificate binds to the existing canonical worker identity
 `RuntimeProfileIdentity`: `model_tag` (required) and optional
 `model_digest`/`endpoint`/`runtime_version` plus the optional
 compatibility-normalizer identity (`normalizer_id`/`normalizer_version`,
-both `None` meaning native-only transport) — deliberately the same
-identity vocabulary `planning.qualification.RuntimeContextProfile`
-already established for "what runtime was actually verified," reused
-here rather than inventing a second, differently-named identity shape
+both `None` meaning native-only transport) and the optional
+`runtime_config_fingerprint` (SHA-256 of the canonical
+`runtime-config-spec-v1` document) — deliberately the same identity
+vocabulary `planning.qualification.RuntimeContextProfile` already
+established for "what runtime was actually verified," reused here
+rather than inventing a second, differently-named identity shape
 (`docs/CODE_SLAYER_VISION.md` §42/§43's own "model-specific, provider-
 specific, runtime-specific, version-specific" scoping intent).
 
@@ -73,8 +75,14 @@ certificate, is what stops a certificate issued against one runtime from
 silently covering a different one now answering to the same `worker_id`.
 The normalizer identity is part of that exact match: a certificate for a
 native-only runtime must never silently authorize a runtime using a
-compatibility normalizer, and vice versa. This module never issues or
-upgrades a certificate on its own when a normalizer is added or removed.
+compatibility normalizer, and vice versa. The runtime-config fingerprint
+is part of that exact match too: a certificate issued against
+temperature `0.0` / context `16384` / output budget `4096` must never
+silently cover a later adapter temperature, context capacity, or
+Planner output-token budget change, even when the model tag/digest
+stay the same. This module never issues or upgrades a certificate on
+its own when a normalizer is added or removed, or when inference/
+runtime configuration changes.
 
 `model_digest`/`endpoint`/`runtime_version` remain optional here
 deliberately — `record_baseline_certificate()` still accepts a
@@ -83,18 +91,27 @@ fact genuinely available at *evaluation* time, and this module's job is
 recording evidence honestly, not demanding more identity than was
 actually established. `normalizer_id`/`normalizer_version` are optional
 in the same honest-recording sense (`None`/`None` is a complete, exact
-statement of "native-only," not a wildcard). `RuntimeProfileIdentity.
-is_fully_specified` exists for the separate, stricter question a
-*production* decision must ask: `workers.production_eligibility` refuses
-to treat ANY certificate as authoritative for a real eligibility
-decision unless the CURRENT profile it is asked to check against has
-every *model/runtime* field populated — a loosely-specified profile
-(e.g. `model_tag` alone) could otherwise let two meaningfully different
+statement of "native-only," not a wildcard). `runtime_config_fingerprint`
+is optional in that same sense (`None` means the qualification-relevant
+inference/runtime configuration was not established — a complete
+statement of absence, not a wildcard, and not an invitation to treat a
+pre-v14 row as covering a later fully-specified runtime).
+`RuntimeProfileIdentity.is_fully_specified` exists for the separate,
+stricter question a *production* decision must ask: `workers.
+production_eligibility` refuses to treat ANY certificate as
+authoritative for a real eligibility decision unless the CURRENT
+profile it is asked to check against has every *model/runtime* field
+populated AND a runtime-config fingerprint — a loosely-specified
+profile (e.g. `model_tag` alone, or tag/digest/endpoint/runtime
+without a fingerprint) could otherwise let two meaningfully different
 runtimes silently share a certificate. Native-only (`normalizer_id is
 None`) is fully specified with respect to the compatibility layer;
 enabling a normalizer is a different identity, never a missing one.
 This keeps recording lenient/honest and production consultation strict,
-without changing what this module itself accepts.
+without changing what this module itself accepts. The production-grade
+constructor is `runtime_profile_identity_from_config()`: it derives the
+fingerprint from caller-verified configuration, never from a model
+response, and never as a caller-supplied hash.
 
 ## No fabrication, ever
 
@@ -124,12 +141,14 @@ at all.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
+from code_slayer.audit.canonical import canonical_json
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.store.baseline_security_certificates_repo import (
@@ -146,6 +165,152 @@ from code_slayer.store.workers_repo import WorkersRepo
 # certificate was checked against, so a later change to what "baseline
 # security" even means never gets silently applied to old evidence.
 BASELINE_VERSION = "baseline-security-v1"
+
+# Versioned canonical document of qualification-relevant runtime /
+# inference configuration. Bumping this identifier is a new identity
+# space: fingerprints computed under a later spec never match v1, so
+# old certificates cannot silently cover a changed spec.
+RUNTIME_CONFIG_SPEC_VERSION = "runtime-config-spec-v1"
+
+_FINGERPRINT_HEX_LENGTH = 64
+
+
+def _canonical_temperature(value: object) -> float:
+    """Coerce a numeric temperature to float. `bool` is rejected (it is
+    an `int` subclass). Range matches `OpenAICompatibleConfig`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("temperature must be a number")
+    temperature = float(value)
+    if not (0.0 <= temperature <= 2.0):
+        raise ValueError("temperature must be between 0.0 and 2.0")
+    return temperature
+
+
+def _non_negative_int(name: str, value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def canonical_runtime_config_spec(
+    *,
+    model_tag: str,
+    model_digest: str | None,
+    endpoint: str | None,
+    runtime_version: str | None,
+    normalizer_id: str | None,
+    normalizer_version: int | None,
+    effective_context_tokens: int,
+    output_token_budget: int,
+    temperature: float,
+    tool_choice_enforcement: str,
+) -> dict:
+    """The one canonical, versioned runtime-configuration document a
+    production certificate binds to. Callers never supply this as free-
+    form JSON from a model; every field is a caller-verified value.
+
+    Includes the existing identity vocabulary (model tag/digest,
+    endpoint, runtime version, compatibility-normalizer pair) plus the
+    qualification-relevant inference/runtime facts that those columns
+    alone cannot represent: effective context capacity, Planner output-
+    token budget, sampling temperature, and tool-choice enforcement
+    mode. Timeout and similar operational-only adapter settings are
+    deliberately omitted.
+
+    `temperature` is required here (not `None`): omitting it from a
+    request is a different, weaker statement than sending an explicit
+    `0.0`, and a production identity must not leave that ambiguous."""
+    if not isinstance(model_tag, str) or not model_tag.strip():
+        raise ValueError("model_tag must be a non-empty string")
+    for name, value in (
+        ("model_digest", model_digest),
+        ("endpoint", endpoint),
+        ("runtime_version", runtime_version),
+        ("normalizer_id", normalizer_id),
+    ):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{name} must be a non-empty string or None")
+    if (normalizer_id is None) != (normalizer_version is None):
+        raise ValueError(
+            "normalizer_id and normalizer_version must both be set or both be None",
+        )
+    if normalizer_version is not None and (
+        not isinstance(normalizer_version, int)
+        or isinstance(normalizer_version, bool)
+        or normalizer_version < 1
+    ):
+        raise ValueError("normalizer_version must be a positive integer or None")
+    if not isinstance(tool_choice_enforcement, str) or not tool_choice_enforcement.strip():
+        raise ValueError("tool_choice_enforcement must be a non-empty string")
+    return {
+        "spec_version": RUNTIME_CONFIG_SPEC_VERSION,
+        "model_tag": model_tag,
+        "model_digest": model_digest,
+        "endpoint": endpoint,
+        "runtime_version": runtime_version,
+        "normalizer_id": normalizer_id,
+        "normalizer_version": normalizer_version,
+        "effective_context_tokens": _non_negative_int(
+            "effective_context_tokens",
+            effective_context_tokens,
+        ),
+        "output_token_budget": _non_negative_int("output_token_budget", output_token_budget),
+        "temperature": _canonical_temperature(temperature),
+        "tool_choice_enforcement": tool_choice_enforcement,
+    }
+
+
+def fingerprint_runtime_config(spec: dict) -> str:
+    """SHA-256 of `canonical_json(spec)`. Exact-match identity: any
+    behavior-relevant field change, or a spec-version bump, produces a
+    different fingerprint. Never a wildcard."""
+    if not isinstance(spec, dict):
+        raise TypeError("runtime config spec must be a dict")
+    if spec.get("spec_version") != RUNTIME_CONFIG_SPEC_VERSION:
+        raise ValueError("runtime config spec_version is missing or unsupported")
+    digest = hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
+    if len(digest) != _FINGERPRINT_HEX_LENGTH:
+        raise RuntimeError("runtime config fingerprint is not a sha256 hex digest")
+    return digest
+
+
+def runtime_profile_identity_from_config(
+    *,
+    model_tag: str,
+    model_digest: str | None,
+    endpoint: str | None,
+    runtime_version: str | None,
+    effective_context_tokens: int,
+    output_token_budget: int,
+    temperature: float,
+    tool_choice_enforcement: str,
+    normalizer_id: str | None = None,
+    normalizer_version: int | None = None,
+) -> RuntimeProfileIdentity:
+    """The one production-grade constructor: the fingerprint is derived
+    from the canonical spec, never supplied independently, and never
+    read from a model response."""
+    spec = canonical_runtime_config_spec(
+        model_tag=model_tag,
+        model_digest=model_digest,
+        endpoint=endpoint,
+        runtime_version=runtime_version,
+        normalizer_id=normalizer_id,
+        normalizer_version=normalizer_version,
+        effective_context_tokens=effective_context_tokens,
+        output_token_budget=output_token_budget,
+        temperature=temperature,
+        tool_choice_enforcement=tool_choice_enforcement,
+    )
+    return RuntimeProfileIdentity(
+        model_tag=model_tag,
+        model_digest=model_digest,
+        endpoint=endpoint,
+        runtime_version=runtime_version,
+        normalizer_id=normalizer_id,
+        normalizer_version=normalizer_version,
+        runtime_config_fingerprint=fingerprint_runtime_config(spec),
+    )
 
 
 class SecurityBaselineOutcome(StrEnum):
@@ -199,7 +364,18 @@ class RuntimeProfileIdentity:
     transport; both set names the exact `workers.protocol_normalization`
     decoder this runtime is configured to use. An incomplete pair is
     refused at construction — never treated as a wildcard, and never
-    inferred from a model response."""
+    inferred from a model response.
+
+    `runtime_config_fingerprint` is the SHA-256 of the canonical
+    `runtime-config-spec-v1` document (`canonical_runtime_config_spec` /
+    `runtime_profile_identity_from_config`). It is the generic, versioned
+    identity component that binds a certificate to qualification-
+    relevant inference/runtime configuration (effective context
+    capacity, output-token budget, sampling temperature, tool-choice
+    enforcement, plus the identity fields above) without adding a new
+    certificate column per setting. `None` means that component was not
+    established — a complete statement of absence, not a wildcard. A
+    production decision (`is_fully_specified`) requires it."""
 
     model_tag: str
     model_digest: str | None = None
@@ -207,6 +383,7 @@ class RuntimeProfileIdentity:
     runtime_version: str | None = None
     normalizer_id: str | None = None
     normalizer_version: int | None = None
+    runtime_config_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag.strip():
@@ -225,6 +402,16 @@ class RuntimeProfileIdentity:
             or self.normalizer_version < 1
         ):
             raise ValueError("normalizer_version must be a positive integer or None")
+        if self.runtime_config_fingerprint is not None:
+            value = self.runtime_config_fingerprint
+            if (
+                not isinstance(value, str)
+                or len(value) != _FINGERPRINT_HEX_LENGTH
+                or any(ch not in "0123456789abcdef" for ch in value)
+            ):
+                raise ValueError(
+                    "runtime_config_fingerprint must be a 64-char lowercase sha256 hex digest",
+                )
 
     def matches(self, other: RuntimeProfileIdentity) -> bool:
         """Exact match on every field — `None` only ever matches `None`,
@@ -232,9 +419,11 @@ class RuntimeProfileIdentity:
         issued against a partially-described profile (e.g. no digest
         recorded) from being silently treated as covering a DIFFERENT,
         now-current profile that also happens to omit a digest for an
-        unrelated reason, and what stops a native-only certificate from
+        unrelated reason, what stops a native-only certificate from
         silently covering a runtime that uses a compatibility
-        normalizer (or vice versa)."""
+        normalizer (or vice versa), and what stops a certificate issued
+        against one inference/runtime configuration fingerprint from
+        covering a later temperature, context, or output-budget change."""
         if not isinstance(other, RuntimeProfileIdentity):
             return False
         return (
@@ -244,6 +433,7 @@ class RuntimeProfileIdentity:
             and self.runtime_version == other.runtime_version
             and self.normalizer_id == other.normalizer_id
             and self.normalizer_version == other.normalizer_version
+            and self.runtime_config_fingerprint == other.runtime_config_fingerprint
         )
 
     @property
@@ -256,18 +446,30 @@ class RuntimeProfileIdentity:
         strong enough binding for `workers.production_eligibility` to
         treat as authoritative for a real production decision: two
         meaningfully different runtimes (different digest, different
-        endpoint, different runtime version) could otherwise share the
-        same loosely-specified profile and be silently confused for
-        each other. `workers.production_eligibility` refuses to evaluate
-        eligibility at all against a `runtime_profile` for which this is
-        `False` — unknown identity fails closed rather than wildcard-
-        matching (see that module's own docstring).
+        endpoint, different runtime version, different inference
+        configuration) could otherwise share the same loosely-specified
+        profile and be silently confused for each other. `workers.
+        production_eligibility` refuses to evaluate eligibility at all
+        against a `runtime_profile` for which this is `False` — unknown
+        identity fails closed rather than wildcard-matching (see that
+        module's own docstring).
 
         `normalizer_id`/`normalizer_version` being `None` is a complete
         statement of native-only transport, not a missing identity
         field, so it does not make this property `False`. An incomplete
-        pair cannot be constructed at all (see `__post_init__`)."""
-        return None not in (self.model_tag, self.model_digest, self.endpoint, self.runtime_version)
+        pair cannot be constructed at all (see `__post_init__`).
+        `runtime_config_fingerprint` being `None` IS a missing
+        production-identity component: an old certificate recorded
+        before this field existed, or an evaluation that never
+        established qualification-relevant inference configuration,
+        cannot authorize a fully-specified current runtime."""
+        return None not in (
+            self.model_tag,
+            self.model_digest,
+            self.endpoint,
+            self.runtime_version,
+            self.runtime_config_fingerprint,
+        )
 
 
 @dataclass(frozen=True)
@@ -341,6 +543,7 @@ def record_baseline_certificate(
             runtime_version=runtime_profile.runtime_version,
             normalizer_id=runtime_profile.normalizer_id,
             normalizer_version=runtime_profile.normalizer_version,
+            runtime_config_fingerprint=runtime_profile.runtime_config_fingerprint,
             outcome=outcome.value,
             hard_disqualifiers_json=json.dumps([d.value for d in hard_disqualifiers]),
             evidence_ref=evidence_ref,
@@ -362,6 +565,7 @@ def record_baseline_certificate(
                 "runtime_version": runtime_profile.runtime_version,
                 "normalizer_id": runtime_profile.normalizer_id,
                 "normalizer_version": runtime_profile.normalizer_version,
+                "runtime_config_fingerprint": runtime_profile.runtime_config_fingerprint,
                 "outcome": outcome.value,
                 "hard_disqualifiers": [d.value for d in hard_disqualifiers],
                 "evidence_ref": evidence_ref,

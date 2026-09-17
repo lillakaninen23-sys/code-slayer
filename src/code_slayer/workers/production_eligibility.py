@@ -62,15 +62,18 @@ newer one reversed the verdict.
 **This function additionally refuses to evaluate eligibility at all
 against an incompletely-specified `runtime_profile`**
 (`RuntimeProfileIdentity.is_fully_specified` — every one of `model_tag`/
-`model_digest`/`endpoint`/`runtime_version` must be populated). A
-certificate MAY legitimately be recorded with only `model_tag` known
+`model_digest`/`endpoint`/`runtime_version`/`runtime_config_fingerprint`
+must be populated). A certificate MAY legitimately be recorded with only
+`model_tag` known, or without a runtime-config fingerprint
 (`workers.security_baseline`/`workers.role_qualification` still accept
 that — recording should stay honest about what evaluation time actually
 established), but a real PRODUCTION decision must never pretend a
 loosely-specified profile is a strong enough runtime-profile binding:
 two meaningfully different runtimes could otherwise share the same
-`model_tag`-only profile and be silently confused for each other.
-Unknown identity fails closed here rather than wildcard-matching.
+`model_tag`-only profile, or a pre-v14 NULL-fingerprint certificate
+could otherwise authorize a later temperature/context/output-budget
+change, and be silently confused for each other. Unknown identity fails
+closed here rather than wildcard-matching.
 
 ## No trust/qualification mutation, ever
 
@@ -163,6 +166,7 @@ def _matching_certificate(certificates, runtime_profile):
             runtime_version=certificate.runtime_version,
             normalizer_id=certificate.normalizer_id,
             normalizer_version=certificate.normalizer_version,
+            runtime_config_fingerprint=certificate.runtime_config_fingerprint,
         )
         if candidate.matches(runtime_profile):
             return certificate

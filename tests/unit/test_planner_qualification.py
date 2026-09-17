@@ -1363,6 +1363,13 @@ def test_runtime_context_profile_validates_its_own_fields():
             effective_context_tokens=100,
             normalizer_id="x",
         )
+    with pytest.raises(ValueError, match="temperature"):
+        RuntimeContextProfile(model_tag="m", effective_context_tokens=100, temperature=True)
+    with pytest.raises(ValueError, match="temperature"):
+        RuntimeContextProfile(model_tag="m", effective_context_tokens=100, temperature=2.5)
+    coerced = RuntimeContextProfile(model_tag="m", effective_context_tokens=100, temperature=0)
+    assert coerced.temperature == 0.0
+    assert isinstance(coerced.temperature, float)
 
 
 def test_attempt_provenance_records_native_vs_normalized_identity():
@@ -1416,6 +1423,56 @@ def test_attempt_provenance_records_native_vs_normalized_identity():
         normalized.normalizer_id,
         normalized.normalizer_version,
     )
+    assert native.runtime_config_fingerprint is None
+    assert normalized.runtime_config_fingerprint is None
+    assert native.temperature is None
+
+
+def test_attempt_provenance_records_runtime_config_fingerprint_when_temperature_set():
+    trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
+    profile = RuntimeContextProfile(
+        model_tag="qwen3-coder-ctx16k:30b",
+        effective_context_tokens=16384,
+        output_token_budget=4096,
+        model_digest="sha256:abc",
+        endpoint="http://192.168.32.8:11434/v1",
+        runtime_version="0.16.1",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+        temperature=0.0,
+    )
+    prov = build_attempt_provenance(
+        qualification_class="C",
+        request=_REQUEST,
+        profile=profile,
+        attempt_number=1,
+        trial=trial,
+        response=_structured(),
+    )
+    assert prov.temperature == 0.0
+    assert prov.runtime_config_fingerprint == profile.runtime_config_fingerprint()
+    assert prov.runtime_config_fingerprint is not None
+    hotter = RuntimeContextProfile(
+        model_tag=profile.model_tag,
+        effective_context_tokens=profile.effective_context_tokens,
+        output_token_budget=profile.output_token_budget,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id=profile.normalizer_id,
+        normalizer_version=profile.normalizer_version,
+        temperature=1.5,
+    )
+    hot_prov = build_attempt_provenance(
+        qualification_class="C",
+        request=_REQUEST,
+        profile=hotter,
+        attempt_number=1,
+        trial=trial,
+        response=_structured(),
+    )
+    assert hot_prov.runtime_config_fingerprint != prov.runtime_config_fingerprint
+    assert hot_prov.temperature == 1.5
 
 
 def test_aggregate_planner_trials_excludes_invalid_environment_from_rates():

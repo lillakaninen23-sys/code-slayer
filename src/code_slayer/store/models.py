@@ -165,7 +165,8 @@ class WorkerBaselineSecurityCertificate:
     docstring.
 
     Append-only: a re-evaluation, or the same worker evaluated under a
-    changed `model_tag`/`model_digest`/`endpoint`/`runtime_version`,
+    changed `model_tag`/`model_digest`/`endpoint`/`runtime_version`/
+    compatibility-normalizer identity/`runtime_config_fingerprint`,
     always creates a new row. The current certificate for a given
     `(worker_id, runtime profile)` binding is *derived* by finding the
     most recent row whose profile fields match exactly — see
@@ -192,6 +193,7 @@ class WorkerBaselineSecurityCertificate:
     issued_at: str
     normalizer_id: str | None = None
     normalizer_version: int | None = None
+    runtime_config_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,7 @@ class WorkerRoleCertificate:
     issued_at: str
     normalizer_id: str | None = None
     normalizer_version: int | None = None
+    runtime_config_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)

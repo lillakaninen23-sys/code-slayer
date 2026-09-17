@@ -33,7 +33,10 @@ from code_slayer.planning.qualification import (
 from code_slayer.store.db import connect, migrate
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
-from code_slayer.workers.security_baseline import RuntimeProfileIdentity
+from code_slayer.workers.security_baseline import (
+    RuntimeProfileIdentity,
+    runtime_profile_identity_from_config,
+)
 
 _REQUEST = PlannerRequest(original_request="Add a read-only endpoint.")
 
@@ -70,6 +73,7 @@ _PROFILE = RuntimeContextProfile(
     model_digest="sha256:abc",
     endpoint="http://local:11436/v1",
     runtime_version="0.1.0",
+    temperature=0.0,
 )
 
 
@@ -240,6 +244,7 @@ def test_ambiguous_runtime_profile_across_instances_is_refused(conn):
         model_digest="sha256:zzz",
         endpoint="http://other/v1",
         runtime_version="9.9.9",
+        temperature=0.0,
     )
     planner_a = FakePlanner([_structured()])
     result_a = run_planner_case_with_correction(
@@ -270,7 +275,8 @@ def test_insufficiently_specified_profile_in_evidence_is_refused(conn):
     """`workers.security_baseline.RuntimeProfileIdentity.
     is_fully_specified` applies here too -- a Planner qualification run
     that never established `model_digest`/`endpoint`/`runtime_version`
-    is refused, not silently certified against a weak binding."""
+    or a runtime-config fingerprint is refused, not silently certified
+    against a weak binding."""
     loose_profile = RuntimeContextProfile(model_tag="devstral:24b", effective_context_tokens=8192)
     planner = FakePlanner([_structured()])
     result_ = run_planner_case_with_correction(
@@ -288,6 +294,38 @@ def test_insufficiently_specified_profile_in_evidence_is_refused(conn):
     )
     assert not result.ok
     assert result.reason == "insufficient_runtime_profile_identity"
+
+
+def test_missing_temperature_is_insufficient_runtime_profile_identity(conn):
+    """Model tag/digest/endpoint/runtime_version without an established
+    sampling temperature cannot produce a runtime-config fingerprint,
+    so the evidence is not a strong enough production binding."""
+    no_temperature = RuntimeContextProfile(
+        model_tag="devstral:24b",
+        effective_context_tokens=8192,
+        output_token_budget=1024,
+        model_digest="sha256:abc",
+        endpoint="http://local:11436/v1",
+        runtime_version="0.1.0",
+    )
+    planner = FakePlanner([_structured()])
+    evidence = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=no_temperature,
+    )
+    assert evidence.provenance
+    assert evidence.provenance[0].runtime_config_fingerprint is None
+    result = certify_planner_from_qualification(
+        conn,
+        worker_id="w1",
+        results=(evidence,),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "insufficient_runtime_profile_identity"
+    assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
 
 
 def test_malformed_results_type_is_refused(conn):
@@ -337,18 +375,28 @@ def test_certificate_binds_the_agreed_runtime_profile_from_evidence(conn):
         early_stopped=False,
     )
     cert = result.certificate
+    expected = runtime_profile_identity_from_config(
+        model_tag=_PROFILE.model_tag,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        effective_context_tokens=_PROFILE.effective_context_tokens,
+        output_token_budget=_PROFILE.output_token_budget,
+        temperature=_PROFILE.temperature,
+        tool_choice_enforcement=_PROFILE.tool_choice_enforcement,
+        normalizer_id=_PROFILE.normalizer_id,
+        normalizer_version=_PROFILE.normalizer_version,
+    )
     identity = RuntimeProfileIdentity(
         model_tag=cert.model_tag,
         model_digest=cert.model_digest,
         endpoint=cert.endpoint,
         runtime_version=cert.runtime_version,
+        normalizer_id=cert.normalizer_id,
+        normalizer_version=cert.normalizer_version,
+        runtime_config_fingerprint=cert.runtime_config_fingerprint,
     )
-    assert identity == RuntimeProfileIdentity(
-        model_tag="devstral:24b",
-        model_digest="sha256:abc",
-        endpoint="http://local:11436/v1",
-        runtime_version="0.1.0",
-    )
+    assert identity == expected
     assert identity.is_fully_specified
 
 
@@ -407,6 +455,7 @@ def test_native_and_normalized_qualification_evidence_is_ambiguous(conn):
         runtime_version="0.1.0",
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
+        temperature=0.0,
     )
     planner = FakePlanner([_structured()])
     normalized = run_planner_case_with_correction(
@@ -436,6 +485,7 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn):
         runtime_version="0.1.0",
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
+        temperature=0.0,
     )
     planner = FakePlanner([_structured()])
     evidence = run_planner_case_with_correction(
@@ -453,6 +503,18 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn):
     assert result.ok
     assert result.certificate.normalizer_id == "qwen_textual_tool_v1"
     assert result.certificate.normalizer_version == 1
+    expected = runtime_profile_identity_from_config(
+        model_tag=normalized_profile.model_tag,
+        model_digest=normalized_profile.model_digest,
+        endpoint=normalized_profile.endpoint,
+        runtime_version=normalized_profile.runtime_version,
+        effective_context_tokens=normalized_profile.effective_context_tokens,
+        output_token_budget=normalized_profile.output_token_budget,
+        temperature=normalized_profile.temperature,
+        tool_choice_enforcement=normalized_profile.tool_choice_enforcement,
+        normalizer_id=normalized_profile.normalizer_id,
+        normalizer_version=normalized_profile.normalizer_version,
+    )
     identity = RuntimeProfileIdentity(
         model_tag=result.certificate.model_tag,
         model_digest=result.certificate.model_digest,
@@ -460,17 +522,10 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn):
         runtime_version=result.certificate.runtime_version,
         normalizer_id=result.certificate.normalizer_id,
         normalizer_version=result.certificate.normalizer_version,
+        runtime_config_fingerprint=result.certificate.runtime_config_fingerprint,
     )
-    assert identity.matches(
-        RuntimeProfileIdentity(
-            model_tag="devstral:24b",
-            model_digest="sha256:abc",
-            endpoint="http://local:11436/v1",
-            runtime_version="0.1.0",
-            normalizer_id="qwen_textual_tool_v1",
-            normalizer_version=1,
-        )
-    )
+    assert identity.matches(expected)
+    assert identity.is_fully_specified
 
 
 def test_certify_is_never_invoked_by_enabling_a_normalizer_on_the_planner():
@@ -524,3 +579,88 @@ def test_normalized_transport_with_native_only_profile_is_refused(conn):
     assert not result.ok
     assert result.reason == "normalized_transport_without_normalizer_identity"
     assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
+
+
+def test_temperature_mismatch_across_instances_is_ambiguous(conn):
+    """A Planner qualified at temperature=0.0 must not be certified from
+    mixed evidence that also includes temperature=1.5 against the same
+    model tag/digest/endpoint."""
+    hot = RuntimeContextProfile(
+        model_tag=_PROFILE.model_tag,
+        effective_context_tokens=_PROFILE.effective_context_tokens,
+        output_token_budget=_PROFILE.output_token_budget,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        temperature=1.5,
+    )
+    planner = FakePlanner([_structured()])
+    hot_result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=hot,
+    )
+    result = certify_planner_from_qualification(
+        conn,
+        worker_id="w1",
+        results=(_pass_first_try_result(), hot_result),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "ambiguous_or_unverified_runtime_profile_in_evidence"
+    assert RoleCertificatesRepo(conn).list_for_worker_role("w1", "PLANNER") == []
+
+
+def test_context_capacity_mismatch_across_instances_is_ambiguous(conn):
+    other = RuntimeContextProfile(
+        model_tag=_PROFILE.model_tag,
+        effective_context_tokens=16384,
+        output_token_budget=_PROFILE.output_token_budget,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        temperature=_PROFILE.temperature,
+    )
+    planner = FakePlanner([_structured()])
+    other_result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=other,
+    )
+    result = certify_planner_from_qualification(
+        conn,
+        worker_id="w1",
+        results=(_pass_first_try_result(), other_result),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "ambiguous_or_unverified_runtime_profile_in_evidence"
+
+
+def test_output_budget_mismatch_across_instances_is_ambiguous(conn):
+    other = RuntimeContextProfile(
+        model_tag=_PROFILE.model_tag,
+        effective_context_tokens=_PROFILE.effective_context_tokens,
+        output_token_budget=4096,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        temperature=_PROFILE.temperature,
+    )
+    planner = FakePlanner([_structured()])
+    other_result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=other,
+    )
+    result = certify_planner_from_qualification(
+        conn,
+        worker_id="w1",
+        results=(_pass_first_try_result(), other_result),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "ambiguous_or_unverified_runtime_profile_in_evidence"

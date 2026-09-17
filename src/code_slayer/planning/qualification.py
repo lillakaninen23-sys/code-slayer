@@ -328,9 +328,13 @@ explicit note on what prior decision this supersedes.
 
 `build_attempt_provenance()` binds one attempt to the exact request/
 runtime/profile that produced it, including the token measurement's own
-source/method, the expected-vs-actual input comparison, and output-budget
-exhaustion evidence. Raw repository text is never stored — only bounded
-sha256 fingerprints.
+source/method, the expected-vs-actual input comparison, output-budget
+exhaustion evidence, sampling temperature, and the canonical
+runtime-config fingerprint when qualification-relevant inference
+configuration was established. Raw repository text is never stored —
+only bounded sha256 fingerprints. The fingerprint is derived from the
+same `workers.security_baseline.runtime_profile_identity_from_config`
+constructor production eligibility consults; a model never supplies it.
 """
 
 from __future__ import annotations
@@ -825,6 +829,11 @@ class RuntimeContextProfile:
     # configured to use. Never inferred from a model response.
     normalizer_id: str | None = None
     normalizer_version: int | None = None
+    # Sampling temperature actually sent on the adapter request
+    # (`OpenAICompatibleConfig.temperature`). `None` means it was not
+    # established for this qualification run -- production identity
+    # then cannot compute a runtime-config fingerprint.
+    temperature: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag:
@@ -847,12 +856,44 @@ class RuntimeContextProfile:
             or self.normalizer_version < 1
         ):
             raise ValueError("normalizer_version must be a positive integer or None")
+        if self.temperature is not None:
+            if isinstance(self.temperature, bool) or not isinstance(self.temperature, (int, float)):
+                raise ValueError("temperature must be a number or None")
+            temperature = float(self.temperature)
+            if not (0.0 <= temperature <= 2.0):
+                raise ValueError("temperature must be between 0.0 and 2.0")
+            object.__setattr__(self, "temperature", temperature)
 
     def required_context_tokens(self, measured_input_tokens: int) -> int:
         return measured_input_tokens + self.output_token_budget + self.safety_margin_tokens
 
     def fits(self, measured_input_tokens: int) -> bool:
         return self.required_context_tokens(measured_input_tokens) <= self.effective_context_tokens
+
+    def runtime_config_fingerprint(self) -> str | None:
+        """The canonical runtime-config fingerprint for this profile, or
+        `None` when qualification-relevant inference configuration was
+        not established (no temperature) and a production identity
+        cannot be derived. Never supplied by a model."""
+        if self.temperature is None:
+            return None
+        from code_slayer.workers.security_baseline import runtime_profile_identity_from_config
+
+        try:
+            return runtime_profile_identity_from_config(
+                model_tag=self.model_tag,
+                model_digest=self.model_digest,
+                endpoint=self.endpoint,
+                runtime_version=self.runtime_version,
+                normalizer_id=self.normalizer_id,
+                normalizer_version=self.normalizer_version,
+                effective_context_tokens=self.effective_context_tokens,
+                output_token_budget=self.output_token_budget,
+                temperature=float(self.temperature),
+                tool_choice_enforcement=self.tool_choice_enforcement,
+            ).runtime_config_fingerprint
+        except ValueError:
+            return None
 
 
 @dataclass(frozen=True)
@@ -1475,6 +1516,8 @@ class AttemptProvenance:
     normalizer_id: str | None = None
     normalizer_version: int | None = None
     tool_call_transport: str | None = None
+    temperature: float | None = None
+    runtime_config_fingerprint: str | None = None
 
 
 def build_attempt_provenance(
@@ -1558,6 +1601,8 @@ def build_attempt_provenance(
             if response is not None and response.tool_call_transport is not None
             else None
         ),
+        temperature=profile.temperature,
+        runtime_config_fingerprint=profile.runtime_config_fingerprint(),
     )
 
 

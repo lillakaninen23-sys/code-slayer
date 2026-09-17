@@ -69,12 +69,16 @@ verdict about the model) when:
   produced that way was never bound to a specific, verified runtime and
   can never be certified against one)
 - the `(model_tag, model_digest, endpoint, runtime_version,
-  normalizer_id, normalizer_version)` recorded in every attempt's
-  `AttemptProvenance`, across every instance, does not agree exactly —
-  ambiguous evidence about which runtime was actually tested is never
-  resolved by guessing one. Native-only (`normalizer_id is None`) is a
-  different runtime identity from one that uses a compatibility
-  normalizer; a certificate for one must never silently cover the other.
+  normalizer_id, normalizer_version, runtime_config_fingerprint)`
+  recorded in every attempt's `AttemptProvenance`, across every
+  instance, does not agree exactly — ambiguous evidence about which
+  runtime was actually tested is never resolved by guessing one.
+  Native-only (`normalizer_id is None`) is a different runtime identity
+  from one that uses a compatibility normalizer; a certificate for one
+  must never silently cover the other. A missing runtime-config
+  fingerprint is a different identity from one that bound temperature,
+  context capacity, and output-token budget; a pre-fingerprint
+  certificate must never silently cover a fully-specified runtime.
 - the agreed-upon runtime profile is not fully specified (`workers.
   security_baseline.RuntimeProfileIdentity.is_fully_specified`) — see
   that property's own docstring for why a loosely-specified profile is
@@ -132,9 +136,11 @@ def _agreed_runtime_profile(
     """`None` if any instance has no provenance at all, or if the
     provenance recorded across every attempt in every instance does not
     agree on exactly one `(model_tag, model_digest, endpoint,
-    runtime_version, normalizer_id, normalizer_version)` tuple -- see
-    the module docstring."""
-    identities: set[tuple[str, str | None, str | None, str | None, str | None, int | None]] = set()
+    runtime_version, normalizer_id, normalizer_version,
+    runtime_config_fingerprint)` tuple -- see the module docstring."""
+    identities: set[
+        tuple[str, str | None, str | None, str | None, str | None, int | None, str | None]
+    ] = set()
     for result in results:
         if not result.provenance:
             return None
@@ -147,6 +153,7 @@ def _agreed_runtime_profile(
                     attempt.runtime_version,
                     attempt.normalizer_id,
                     attempt.normalizer_version,
+                    attempt.runtime_config_fingerprint,
                 ),
             )
     if len(identities) != 1:
@@ -158,6 +165,7 @@ def _agreed_runtime_profile(
         runtime_version,
         normalizer_id,
         normalizer_version,
+        runtime_config_fingerprint,
     ) = next(iter(identities))
     try:
         return RuntimeProfileIdentity(
@@ -167,6 +175,7 @@ def _agreed_runtime_profile(
             runtime_version=runtime_version,
             normalizer_id=normalizer_id,
             normalizer_version=normalizer_version,
+            runtime_config_fingerprint=runtime_config_fingerprint,
         )
     except ValueError:
         return None

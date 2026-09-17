@@ -22,11 +22,15 @@ from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
+    RUNTIME_CONFIG_SPEC_VERSION,
     HardDisqualifierCategory,
     RuntimeProfileIdentity,
     SecurityBaselineOutcome,
     SecurityCertificationResult,
+    canonical_runtime_config_spec,
+    fingerprint_runtime_config,
     record_baseline_certificate,
+    runtime_profile_identity_from_config,
 )
 from code_slayer.workers.trust import TrustLevel, WorkerTrustManager
 
@@ -126,30 +130,41 @@ def test_runtime_profile_identity_none_never_matches_a_set_value():
 def test_runtime_profile_identity_is_fully_specified_requires_every_field():
     assert not RuntimeProfileIdentity(model_tag="m").is_fully_specified
     assert not RuntimeProfileIdentity(model_tag="m", model_digest="d").is_fully_specified
-    assert RuntimeProfileIdentity(
+    assert not RuntimeProfileIdentity(
         model_tag="m",
         model_digest="d",
         endpoint="e",
         runtime_version="v",
     ).is_fully_specified
+    full = runtime_profile_identity_from_config(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        effective_context_tokens=16384,
+        output_token_budget=4096,
+        temperature=0.0,
+        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+    )
+    assert full.is_fully_specified
     # Native-only (normalizer None/None) is a complete compatibility-layer
-    # identity, not a missing field.
-    assert RuntimeProfileIdentity(
+    # identity, not a missing field -- but a fingerprint is still required.
+    assert full.normalizer_id is None
+    assert full.normalizer_version is None
+    normalized = runtime_profile_identity_from_config(
         model_tag="m",
         model_digest="d",
         endpoint="e",
         runtime_version="v",
-        normalizer_id=None,
-        normalizer_version=None,
-    ).is_fully_specified
-    assert RuntimeProfileIdentity(
-        model_tag="m",
-        model_digest="d",
-        endpoint="e",
-        runtime_version="v",
+        effective_context_tokens=16384,
+        output_token_budget=4096,
+        temperature=0.0,
+        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
-    ).is_fully_specified
+    )
+    assert normalized.is_fully_specified
+    assert not full.matches(normalized)
 
 
 # -- record_baseline_certificate(): fail-closed validation -------------------
@@ -275,6 +290,7 @@ def test_certificate_round_trip_across_reopen(tmp_path):
     assert fetched.model_tag == "devstral:24b"
     assert fetched.runtime_version == "0.1.0"
     assert fetched.model_digest is None
+    assert fetched.runtime_config_fingerprint is None
     assert fetched.outcome == "PASS"
     assert fetched.evidence_ref == "conformance-run-abc"
     assert fetched.baseline_version == BASELINE_VERSION
@@ -317,6 +333,8 @@ def test_recording_a_certificate_is_audited(db_conn, registered_worker, profile)
     assert payload["worker_id"] == registered_worker
     assert payload["outcome"] == "PASS"
     assert payload["evidence_ref"] == "evidence-1"
+    assert "runtime_config_fingerprint" in payload
+    assert payload["runtime_config_fingerprint"] is None
     assert verify_chain(db_conn, task_id=None).ok
 
 
@@ -454,3 +472,123 @@ def test_certificate_persists_normalizer_identity(db_conn, registered_worker):
     )
     assert native.certificate.normalizer_id is None
     assert native.certificate.normalizer_version is None
+
+
+# -- runtime-config fingerprint / spec ---------------------------------------
+
+
+def _spec_kwargs(**overrides) -> dict:
+    kwargs = dict(
+        model_tag="qwen3-coder-ctx16k:30b",
+        model_digest="sha256:abc",
+        endpoint="http://192.168.32.8:11434/v1",
+        runtime_version="0.16.1",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+        effective_context_tokens=16384,
+        output_token_budget=4096,
+        temperature=0.0,
+        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_runtime_config_spec_omits_operational_only_timeout():
+    spec = canonical_runtime_config_spec(**_spec_kwargs())
+    assert spec["spec_version"] == RUNTIME_CONFIG_SPEC_VERSION
+    assert "timeout" not in spec
+    assert "safety_margin_tokens" not in spec
+    assert spec["temperature"] == 0.0
+    assert spec["effective_context_tokens"] == 16384
+    assert spec["output_token_budget"] == 4096
+    assert spec["normalizer_id"] == "qwen_textual_tool_v1"
+    assert spec["normalizer_version"] == 1
+
+
+def test_runtime_config_fingerprint_is_stable_and_canonicalizes_int_temperature():
+    a = fingerprint_runtime_config(canonical_runtime_config_spec(**_spec_kwargs(temperature=0)))
+    b = fingerprint_runtime_config(canonical_runtime_config_spec(**_spec_kwargs(temperature=0.0)))
+    c = runtime_profile_identity_from_config(**_spec_kwargs(temperature=0.0))
+    assert a == b == c.runtime_config_fingerprint
+    assert len(a) == 64
+    assert a == a.lower()
+
+
+def test_runtime_config_fingerprint_changes_with_temperature_context_budget():
+    base = fingerprint_runtime_config(canonical_runtime_config_spec(**_spec_kwargs()))
+    hot = fingerprint_runtime_config(canonical_runtime_config_spec(**_spec_kwargs(temperature=1.5)))
+    ctx = fingerprint_runtime_config(
+        canonical_runtime_config_spec(**_spec_kwargs(effective_context_tokens=8192)),
+    )
+    budget = fingerprint_runtime_config(
+        canonical_runtime_config_spec(**_spec_kwargs(output_token_budget=1024)),
+    )
+    native = fingerprint_runtime_config(
+        canonical_runtime_config_spec(**_spec_kwargs(normalizer_id=None, normalizer_version=None)),
+    )
+    assert len({base, hot, ctx, budget, native}) == 5
+
+
+def test_runtime_config_fingerprint_rejects_unsupported_spec_version():
+    spec = canonical_runtime_config_spec(**_spec_kwargs())
+    spec["spec_version"] = "runtime-config-spec-v2"
+    with pytest.raises(ValueError, match="spec_version"):
+        fingerprint_runtime_config(spec)
+    with pytest.raises(TypeError):
+        fingerprint_runtime_config("not-a-dict")
+
+
+def test_malformed_runtime_config_fingerprint_is_refused_at_construction():
+    with pytest.raises(ValueError, match="sha256"):
+        RuntimeProfileIdentity(model_tag="m", runtime_config_fingerprint="")
+    with pytest.raises(ValueError, match="sha256"):
+        RuntimeProfileIdentity(model_tag="m", runtime_config_fingerprint="abc")
+    with pytest.raises(ValueError, match="sha256"):
+        RuntimeProfileIdentity(model_tag="m", runtime_config_fingerprint="A" * 64)
+    with pytest.raises(ValueError, match="temperature"):
+        canonical_runtime_config_spec(**_spec_kwargs(temperature=None))
+    with pytest.raises(ValueError, match="temperature"):
+        canonical_runtime_config_spec(**_spec_kwargs(temperature=True))
+    with pytest.raises(ValueError, match="temperature"):
+        canonical_runtime_config_spec(**_spec_kwargs(temperature=2.1))
+
+
+def test_none_fingerprint_never_matches_a_set_fingerprint():
+    fingerprinted = runtime_profile_identity_from_config(**_spec_kwargs())
+    legacy = RuntimeProfileIdentity(
+        model_tag=fingerprinted.model_tag,
+        model_digest=fingerprinted.model_digest,
+        endpoint=fingerprinted.endpoint,
+        runtime_version=fingerprinted.runtime_version,
+        normalizer_id=fingerprinted.normalizer_id,
+        normalizer_version=fingerprinted.normalizer_version,
+        runtime_config_fingerprint=None,
+    )
+    assert not fingerprinted.matches(legacy)
+    assert not legacy.matches(fingerprinted)
+    assert fingerprinted.is_fully_specified
+    assert not legacy.is_fully_specified
+
+
+def test_certificate_persists_runtime_config_fingerprint(db_conn, registered_worker):
+    profile = runtime_profile_identity_from_config(**_spec_kwargs())
+    result = _pass(db_conn, registered_worker, profile)
+    assert result.ok
+    assert result.certificate.runtime_config_fingerprint == profile.runtime_config_fingerprint
+    incomplete = _pass(
+        db_conn,
+        registered_worker,
+        RuntimeProfileIdentity(model_tag="m"),
+        evidence_ref="evidence-incomplete",
+    )
+    assert incomplete.certificate.runtime_config_fingerprint is None
+
+
+def test_factory_never_accepts_a_caller_supplied_fingerprint():
+    """The production-grade constructor derives the fingerprint; there
+    is no parameter that would let a caller (or a model) assert one."""
+    import inspect
+
+    params = set(inspect.signature(runtime_profile_identity_from_config).parameters)
+    assert "runtime_config_fingerprint" not in params

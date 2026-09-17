@@ -37,6 +37,7 @@ from code_slayer.workers.security_baseline import (
     RuntimeProfileIdentity,
     SecurityBaselineOutcome,
     record_baseline_certificate,
+    runtime_profile_identity_from_config,
 )
 
 POLICY_VERSION = "planner-certification-v1"
@@ -56,14 +57,24 @@ def registered_worker(db_conn) -> str:
     return "w1"
 
 
-@pytest.fixture
-def profile() -> RuntimeProfileIdentity:
-    return RuntimeProfileIdentity(
+def _full_profile(**overrides) -> RuntimeProfileIdentity:
+    kwargs = dict(
         model_tag="devstral:24b",
         model_digest="sha256:abc",
         endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
+        effective_context_tokens=16384,
+        output_token_budget=4096,
+        temperature=0.0,
+        tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
     )
+    kwargs.update(overrides)
+    return runtime_profile_identity_from_config(**kwargs)
+
+
+@pytest.fixture
+def profile() -> RuntimeProfileIdentity:
+    return _full_profile()
 
 
 def _security_pass(conn, worker_id, profile, *, now_fn=None, evidence_ref="sec-ev"):
@@ -298,7 +309,7 @@ def test_security_certificate_for_a_different_profile_is_denied(
 ):
     _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
-    other_profile = RuntimeProfileIdentity(
+    other_profile = _full_profile(
         model_tag="a-different-model",
         model_digest="sha256:zzz",
         endpoint="http://other/v1",
@@ -309,12 +320,7 @@ def test_security_certificate_for_a_different_profile_is_denied(
 
 
 def test_role_certificate_for_a_different_profile_is_denied(db_conn, registered_worker, profile):
-    other_profile = RuntimeProfileIdentity(
-        model_tag="devstral:24b",
-        model_digest="sha256:different",
-        endpoint="http://local:11436/v1",
-        runtime_version="0.1.0",
-    )
+    other_profile = _full_profile(model_digest="sha256:different")
     security = _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, other_profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
@@ -365,6 +371,9 @@ def test_role_certificate_recorded_under_a_stale_prior_policy_version_is_denied(
             model_digest=profile.model_digest,
             endpoint=profile.endpoint,
             runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_config_fingerprint=profile.runtime_config_fingerprint,
             outcome=RoleQualificationOutcome.PASS.value,
             classification="PASS_FIRST_TRY",
             evidence_ref="ev",
@@ -394,6 +403,9 @@ def test_security_certificate_recorded_under_a_stale_baseline_version_is_denied(
             model_digest=profile.model_digest,
             endpoint=profile.endpoint,
             runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_config_fingerprint=profile.runtime_config_fingerprint,
             outcome=SecurityBaselineOutcome.PASS.value,
             hard_disqualifiers_json="[]",
             evidence_ref="ev",
@@ -427,6 +439,9 @@ def test_role_certificate_with_unknown_persisted_outcome_fails_closed(
             model_digest=profile.model_digest,
             endpoint=profile.endpoint,
             runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_config_fingerprint=profile.runtime_config_fingerprint,
             outcome="SOMETHING_UNEXPECTED",
             classification="corrupted",
             evidence_ref="ev",
@@ -456,6 +471,9 @@ def test_security_certificate_with_unknown_persisted_outcome_fails_closed(
             model_digest=profile.model_digest,
             endpoint=profile.endpoint,
             runtime_version=profile.runtime_version,
+            normalizer_id=profile.normalizer_id,
+            normalizer_version=profile.normalizer_version,
+            runtime_config_fingerprint=profile.runtime_config_fingerprint,
             outcome="SOMETHING_UNEXPECTED",
             hard_disqualifiers_json="[]",
             evidence_ref="ev",
@@ -615,11 +633,7 @@ def test_native_certificate_does_not_authorize_a_normalized_runtime(
 ):
     _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
-    normalized = RuntimeProfileIdentity(
-        model_tag=profile.model_tag,
-        model_digest=profile.model_digest,
-        endpoint=profile.endpoint,
-        runtime_version=profile.runtime_version,
+    normalized = _full_profile(
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
     )
@@ -632,11 +646,7 @@ def test_normalized_certificate_does_not_authorize_a_native_runtime(
     registered_worker,
     profile,
 ):
-    normalized = RuntimeProfileIdentity(
-        model_tag=profile.model_tag,
-        model_digest=profile.model_digest,
-        endpoint=profile.endpoint,
-        runtime_version=profile.runtime_version,
+    normalized = _full_profile(
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
     )
@@ -647,11 +657,7 @@ def test_normalized_certificate_does_not_authorize_a_native_runtime(
 
 
 def test_matching_normalized_profiles_can_be_eligible(db_conn, registered_worker, profile):
-    normalized = RuntimeProfileIdentity(
-        model_tag=profile.model_tag,
-        model_digest=profile.model_digest,
-        endpoint=profile.endpoint,
-        runtime_version=profile.runtime_version,
+    normalized = _full_profile(
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
     )
@@ -664,3 +670,86 @@ def test_matching_normalized_profiles_can_be_eligible(db_conn, registered_worker
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id=role.certificate.certificate_id,
     )
+
+
+# -- runtime-config fingerprint: temperature/context/budget are identity -----
+
+
+def test_identical_runtime_config_fingerprint_is_eligible(db_conn, registered_worker, profile):
+    """The same exact factory-built profile still matches. Identity is
+    exact, not 'close enough'."""
+    security = _security_pass(db_conn, registered_worker, profile)
+    role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    same_again = _full_profile()
+    assert same_again.matches(profile)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, same_again)
+    assert decision == EligibilityDecision(
+        True,
+        "eligible",
+        security_certificate_id=security.certificate.certificate_id,
+        role_certificate_id=role.certificate.certificate_id,
+    )
+
+
+def test_temperature_mismatch_is_denied(db_conn, registered_worker, profile):
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    hotter = _full_profile(temperature=1.5)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, hotter)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_effective_context_mismatch_is_denied(db_conn, registered_worker, profile):
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    smaller = _full_profile(effective_context_tokens=8192)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, smaller)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_output_token_budget_mismatch_is_denied(db_conn, registered_worker, profile):
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    smaller = _full_profile(output_token_budget=1024)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, smaller)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_legacy_null_fingerprint_does_not_authorize_fully_specified_runtime(
+    db_conn,
+    registered_worker,
+    profile,
+):
+    """A pre-v14 certificate (NULL fingerprint) with otherwise identical
+    model/endpoint/runtime/normalizer fields must not authorize a
+    current fully-specified runtime. None is never a wildcard."""
+    legacy = RuntimeProfileIdentity(
+        model_tag=profile.model_tag,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id=profile.normalizer_id,
+        normalizer_version=profile.normalizer_version,
+        runtime_config_fingerprint=None,
+    )
+    assert not legacy.is_fully_specified
+    _security_pass(db_conn, registered_worker, legacy)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, legacy)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_missing_runtime_config_fingerprint_is_insufficient(db_conn, registered_worker):
+    """Tag/digest/endpoint/runtime_version without a fingerprint is not
+    a production-authoritative identity, even if certificates exist for
+    that incomplete profile."""
+    incomplete = RuntimeProfileIdentity(
+        model_tag="devstral:24b",
+        model_digest="sha256:abc",
+        endpoint="http://local:11436/v1",
+        runtime_version="0.1.0",
+    )
+    _security_pass(db_conn, registered_worker, incomplete)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, incomplete)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, incomplete)
+    assert decision == EligibilityDecision(False, "insufficient_runtime_profile_identity")

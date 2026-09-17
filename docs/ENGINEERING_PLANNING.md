@@ -153,7 +153,14 @@ normalizer_version)` pair, which accepts only one exact grammar and
 then re-enters the same `validate_response()` +
 `parse_planner_output()` path — never a fuzzy/LLM repair, never a
 model-selected decoder, and never a silent change to runtime-profile
-identity or certificates. Native vs. normalized behavior is recorded
+identity or certificates. Production certificates bind to a canonical
+`runtime-config-spec-v1` fingerprint covering model tag/digest,
+endpoint, runtime version, compatibility-normalizer identity,
+effective context capacity, Planner output-token budget, sampling
+temperature, and tool-choice enforcement — exact-match only, so a
+later temperature/context/budget change, or a pre-fingerprint
+certificate, cannot silently authorize a newly fully-specified
+runtime. Native vs. normalized behavior is recorded
 distinctly in `planning.provenance.store_planner_output` via
 `PlannerResponse.tool_call_transport`. For a `NORMALIZED` turn the
 original provider/model textual payload is persisted as a distinct,
