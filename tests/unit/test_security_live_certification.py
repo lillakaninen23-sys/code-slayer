@@ -59,6 +59,8 @@ class _Script:
         self.completion_status = 200
         self.completion_posts = 0
         self.default_completion = _text_body()
+        self.models_after_inference: list[dict] | None = None
+        self.version_after_inference: str | None = None
 
 
 def _text_body(text: str = "I refuse.") -> bytes:
@@ -120,16 +122,31 @@ def _make_handler(script: _Script) -> type:
 
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            inferred = script.completion_posts > 0
             if path.rstrip("/") == "/api/version":
                 body = script.version_body
+                version = (
+                    script.version_after_inference
+                    if inferred and script.version_after_inference is not None
+                    else script.version
+                )
                 if body is None:
-                    body = json.dumps({"version": script.version}).encode()
+                    body = json.dumps({"version": version}).encode()
+                elif inferred and script.version_after_inference is not None:
+                    body = json.dumps({"version": script.version_after_inference}).encode()
                 self._write(script.version_status, body)
                 return
             if path.rstrip("/") == "/api/tags":
                 body = script.tags_body
+                models = (
+                    script.models_after_inference
+                    if inferred and script.models_after_inference is not None
+                    else script.models
+                )
                 if body is None:
-                    body = json.dumps({"models": script.models}).encode()
+                    body = json.dumps({"models": models}).encode()
+                elif inferred and script.models_after_inference is not None:
+                    body = json.dumps({"models": script.models_after_inference}).encode()
                 self._write(script.tags_status, body)
                 return
             self._write(404, b"{}")
@@ -891,3 +908,155 @@ def test_ollama_root_cannot_include_openai_path():
             temperature=0.0,
             expected_runtime_identity_fingerprint="a" * 64,
         )
+
+
+def _construct_expected(**overrides):
+    kwargs = dict(
+        ollama_root="http://127.0.0.1:11434",
+        model_tag="x",
+        model_digest="sha256:abc",
+        runtime_version="0.16.1",
+        effective_context_tokens=16384,
+        temperature=0.0,
+        expected_runtime_identity_fingerprint="a" * 64,
+    )
+    kwargs.update(overrides)
+    return LiveOllamaRuntimeExpectation(**kwargs)
+
+
+def test_ollama_root_rejects_non_http_schemes_userinfo_and_extra_path():
+    with pytest.raises(ValueError, match="ollama_root_scheme_not_allowed"):
+        _construct_expected(ollama_root="file:///tmp/ollama")
+    with pytest.raises(ValueError, match="ollama_root_scheme_not_allowed"):
+        _construct_expected(ollama_root="ftp://127.0.0.1:11434")
+    with pytest.raises(ValueError, match="ollama_root_must_not_include_userinfo"):
+        _construct_expected(ollama_root="http://user:pass@127.0.0.1:11434")
+    with pytest.raises(ValueError, match="ollama_root_must_be_origin_only"):
+        _construct_expected(ollama_root="http://127.0.0.1:11434/hidden")
+    with pytest.raises(ValueError, match="ollama_root_must_not_include_query_or_fragment"):
+        _construct_expected(ollama_root="http://127.0.0.1:11434?x=1")
+    accepted = _construct_expected(ollama_root="https://example.invalid:11434")
+    assert accepted.openai_base_url == "https://example.invalid:11434/v1"
+
+
+def test_digest_prefix_canonicalization_still_binds_expected_form(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    runtime_server,
+):
+    script, root = runtime_server
+    script.models = [{"name": "test-coder:1", "digest": "ABC"}]
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert result.ok
+    rows = BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker)
+    assert rows[0].model_digest == "sha256:abc"
+    assert rows[0].outcome == "PASS"
+
+
+def test_runtime_digest_swap_after_evaluation_records_no_certificate(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    runtime_server,
+):
+    script, root = runtime_server
+    script.models_after_inference = [{"name": "test-coder:1", "digest": "sha256:swapped"}]
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert not result.ok
+    assert result.reason == "runtime_changed_after_evaluation"
+    assert result.evaluation_evidence_ref
+    assert result.certificate_id is None
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+    assert script.completion_posts == len(mandatory_cases())
+
+
+def test_unknown_normalizer_fails_closed_before_inference(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    runtime_server,
+):
+    script, root = runtime_server
+    result = _certify(
+        db_conn,
+        registered_worker,
+        blobs_dir,
+        root,
+        normalizer_id="not_a_registered_normalizer",
+        normalizer_version=1,
+    )
+    assert not result.ok
+    assert result.reason == "unknown_or_incomplete_protocol_normalizer"
+    assert script.completion_posts == 0
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+
+
+def test_worker_removed_after_evaluation_records_no_certificate(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    runtime_server,
+    monkeypatch,
+):
+    from code_slayer.security.evaluation import (
+        run_baseline_security_evaluation as real_run,
+    )
+
+    def wrap(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        db_conn.execute("DELETE FROM workers WHERE worker_id = ?", (registered_worker,))
+        return result
+
+    monkeypatch.setattr(
+        "code_slayer.security.live_certification.run_baseline_security_evaluation",
+        wrap,
+    )
+    _script, root = runtime_server
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert not result.ok
+    assert result.reason == "unknown_worker"
+    assert result.evaluation_evidence_ref
+    assert result.certificate_id is None
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+
+
+def test_invalid_reread_outcome_and_hard_category_record_no_certificate(
+    db_conn,
+    registered_worker,
+    blobs_dir,
+    runtime_server,
+    monkeypatch,
+):
+    from code_slayer.security.evidence import (
+        read_baseline_security_evidence as real_read,
+    )
+
+    def bad_outcome(*args, **kwargs):
+        document = dict(real_read(*args, **kwargs))
+        document["final_outcome"] = "NOT_AN_OUTCOME"
+        return document
+
+    monkeypatch.setattr(
+        "code_slayer.security.live_certification.read_baseline_security_evidence",
+        bad_outcome,
+    )
+    _script, root = runtime_server
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert not result.ok
+    assert result.reason == "invalid_final_outcome"
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+
+    def bad_hard(*args, **kwargs):
+        document = dict(real_read(*args, **kwargs))
+        document["hard_disqualifiers"] = ["NOT_A_CATEGORY"]
+        return document
+
+    monkeypatch.setattr(
+        "code_slayer.security.live_certification.read_baseline_security_evidence",
+        bad_hard,
+    )
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert not result.ok
+    assert result.reason == "invalid_hard_category"
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []

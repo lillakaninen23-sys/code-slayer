@@ -38,6 +38,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from code_slayer.security.evaluation import run_baseline_security_evaluation
 from code_slayer.security.evidence import (
@@ -82,10 +83,11 @@ class LiveOllamaRuntimeExpectation:
     it is bound by the exact model digest plus the expected runtime
     fingerprint instead.
 
-    `ollama_root` is the Ollama HTTP root (`http://HOST:PORT`), never
-    the OpenAI-compatible `/v1` path. The OpenAI base URL is derived
-    as `{ollama_root}/v1` so the probe and inference cannot silently
-    target different hosts.
+    `ollama_root` is the Ollama HTTP origin (`http://HOST:PORT` or
+    `https://HOST:PORT`), never the OpenAI-compatible `/v1` path and
+    never a `file:` or other non-HTTP scheme. The OpenAI base URL is
+    derived as `{ollama_root}/v1` so the probe and inference cannot
+    silently target different hosts.
     """
 
     ollama_root: str
@@ -105,12 +107,12 @@ class LiveOllamaRuntimeExpectation:
     def __post_init__(self) -> None:
         if not isinstance(self.ollama_root, str) or not self.ollama_root.strip():
             raise ValueError("ollama_root must be a non-empty string")
-        root = self.ollama_root.strip().rstrip("/")
-        if root.endswith("/v1"):
-            raise ValueError("ollama_root_must_not_include_openai_path")
+        _validate_ollama_origin(self.ollama_root)
         if not isinstance(self.model_tag, str) or not self.model_tag.strip():
             raise ValueError("model_tag must be a non-empty string")
         if not isinstance(self.model_digest, str) or not self.model_digest.strip():
+            raise ValueError("model_digest must be a non-empty string")
+        if not _canonical_digest(self.model_digest):
             raise ValueError("model_digest must be a non-empty string")
         if not isinstance(self.runtime_version, str) or not self.runtime_version.strip():
             raise ValueError("runtime_version must be a non-empty string")
@@ -205,6 +207,28 @@ def _canonical_digest(value: str) -> str:
     if text.startswith("sha256:"):
         text = text[7:]
     return text
+
+
+def _validate_ollama_origin(url: str) -> None:
+    """Fail closed unless `url` is an http(s) origin with no path,
+    userinfo, query, or fragment. Probe and inference both derive from
+    this origin; a `file:` URL or `/v1` suffix would split or bypass
+    the live Ollama boundary.
+    """
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("ollama_root_scheme_not_allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("ollama_root_must_not_include_userinfo")
+    if parsed.query or parsed.fragment:
+        raise ValueError("ollama_root_must_not_include_query_or_fragment")
+    path = parsed.path.rstrip("/")
+    if path not in ("",):
+        if path == "/v1":
+            raise ValueError("ollama_root_must_not_include_openai_path")
+        raise ValueError("ollama_root_must_be_origin_only")
+    if not parsed.hostname:
+        raise ValueError("ollama_root must be a non-empty string")
 
 
 def _strict_json_object(raw: bytes) -> dict:
@@ -450,6 +474,15 @@ def certify_live_baseline_security(
     if document.get("runtime_identity_fingerprint") != fingerprint:
         return _deny(
             "runtime_identity_fingerprint_mismatch",
+            runtime_identity_fingerprint=fingerprint,
+            evaluation_evidence_ref=evidence_ref,
+        )
+
+    try:
+        verify_ollama_runtime(expected)
+    except ValueError:
+        return _deny(
+            "runtime_changed_after_evaluation",
             runtime_identity_fingerprint=fingerprint,
             evaluation_evidence_ref=evidence_ref,
         )
