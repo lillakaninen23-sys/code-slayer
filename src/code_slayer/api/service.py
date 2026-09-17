@@ -17,6 +17,14 @@ from code_slayer.planning.executor import PlanningJobExecutor
 from code_slayer.planning.service import EngineeringPlanningService
 from code_slayer.repo import identity
 from code_slayer.runner import LocalWorkerRunner
+from code_slayer.security.certification_executor import CertificationJobExecutor
+from code_slayer.security.certification_service import (
+    BaselineCertificationTarget,
+    CertificationBlocked,
+    CertificationConflict,
+    CertificationService,
+    RoleEvaluationTarget,
+)
 from code_slayer.workers.prompt_analysis import EvidenceSource, PromptAnalyst
 from code_slayer.workers.protocol import WorkerAdapter
 from code_slayer.workers.question_gate import ResolutionKind
@@ -71,6 +79,9 @@ class RuntimeBindings:
     # client-facing. A smaller poll interval is useful for tests;
     # production has no reason to lower it below the default.
     lifecycle_poll_interval_seconds: float = 2.0
+    baseline_certification_targets: tuple[BaselineCertificationTarget, ...] = ()
+    role_evaluation_targets: tuple[RoleEvaluationTarget, ...] = ()
+    certification_poll_interval_seconds: float = 1.0
 
 
 class ApplicationService:
@@ -115,6 +126,15 @@ class ApplicationService:
             poll_interval_seconds=self.bindings.lifecycle_poll_interval_seconds,
         )
         self._lifecycle_executor.start()
+        self._certification_executor = CertificationJobExecutor(
+            self.identity.repo_id,
+            self.identity.worktree_id,
+            state_root=self.state_root,
+            targets=self.bindings.baseline_certification_targets,
+            role_targets=self.bindings.role_evaluation_targets,
+            poll_interval_seconds=self.bindings.certification_poll_interval_seconds,
+        )
+        self._certification_executor.start()
 
     def close(self) -> None:
         """Stop this instance's background dispatchers, if started.
@@ -130,6 +150,7 @@ class ApplicationService:
         if self._planning_executor is not None:
             self._planning_executor.stop()
         self._lifecycle_executor.stop()
+        self._certification_executor.stop()
 
     @contextmanager
     def runner(self):
@@ -401,3 +422,87 @@ class ApplicationService:
             except KeyError:
                 raise APIError("not_found", "Permission grant not found.", 404) from None
             return self._permission_grant_json(record)
+
+    @contextmanager
+    def certification(self):
+        service = CertificationService(
+            self.identity.repo_id,
+            self.identity.worktree_id,
+            state_root=self.state_root,
+            targets=self.bindings.baseline_certification_targets,
+            role_targets=self.bindings.role_evaluation_targets,
+        )
+        try:
+            yield service
+        finally:
+            service.close()
+
+    def list_certification_workers(self):
+        with self.certification() as service:
+            return {
+                "environment": "VALIDATION",
+                "workers": service.list_workers(),
+            }
+
+    def get_certification_worker(self, worker_id):
+        with self.certification() as service:
+            try:
+                return service.worker_detail(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+
+    def certification_preflight(self, worker_id):
+        with self.certification() as service:
+            try:
+                return service.run_preflight(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            except CertificationConflict as exc:
+                raise APIError(
+                    exc.code, "A certification run is already in progress.", 409,
+                ) from None
+
+    def start_baseline_certification(self, worker_id):
+        with self.certification() as service:
+            try:
+                result = service.start_baseline_run(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            except CertificationConflict as exc:
+                raise APIError(
+                    exc.code, "A certification run is already in progress.", 409,
+                ) from None
+            except CertificationBlocked as exc:
+                raise APIError(
+                    exc.code, "Preflight must succeed before certification.", 409,
+                ) from None
+        self._certification_executor.notify()
+        return result
+
+    def get_certification_run(self, run_id):
+        with self.certification() as service:
+            try:
+                return service.get_run(run_id)
+            except KeyError:
+                raise APIError("not_found", "Certification run not found.", 404) from None
+
+    def get_certification_evidence(self, run_id):
+        from code_slayer.security.evidence import SecurityEvaluationEvidenceError
+
+        with self.certification() as service:
+            try:
+                return service.run_evidence(run_id)
+            except KeyError:
+                raise APIError("not_found", "Certification run not found.", 404) from None
+            except CertificationBlocked as exc:
+                raise APIError(exc.code, "Evidence is not available for this run.", 409) from None
+            except SecurityEvaluationEvidenceError as exc:
+                raise APIError(exc.reason, "Evidence verification failed.", 409) from None
+
+    def get_certification_history(self, worker_id):
+        with self.certification() as service:
+            try:
+                service.worker_summary(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            return service.history(worker_id)

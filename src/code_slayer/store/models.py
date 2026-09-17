@@ -443,3 +443,34 @@ class RepositoryIntelligenceSnapshotRow:
     snapshot_content_hash: str
     file_count: int
     inventory_truncated: bool
+
+
+@dataclass(frozen=True)
+class CertificationRunRow:
+    """One durable Certification Center job (schema v16). Distinct from
+    a Baseline Security certificate: a run may finish INCOMPLETE with
+    no certificate. Identity fields are immutable; lifecycle fields
+    evolve until a terminal state."""
+
+    run_id: str
+    worker_id: str
+    kind: str
+    environment: str
+    state: str
+    reason: str | None
+    preflight_json: str
+    expected_runtime_identity_fingerprint: str | None
+    model_tag: str | None
+    model_digest: str | None
+    ollama_root: str | None
+    certificate_id: str | None
+    evidence_ref: str | None
+    hard_disqualifiers_json: str
+    created_at: str
+    updated_at: str
+    started_at: str | None
+    finished_at: str | None
+    attempt: int
+    owner_pid: int | None
+    owner_pid_started_at: str | None
+    owner_generation: int

@@ -354,3 +354,53 @@ def permission_grants():
 def permission_grant_revoke(grant_id):
     body({})
     return jsonify(service().revoke_permission_grant(grant_id))
+
+
+# -- Certification Center v1 -------------------------------------------------
+#
+# Browser is a control surface only. These routes never accept an
+# outcome, evidence_ref, adapter, fingerprint, digest, or
+# hard-disqualifier list. Preflight is GET-in-spirit but POST because it
+# writes a durable preflight run; it never infers. Starting
+# certification is a separate POST. Polling is GET-only.
+
+
+@api.get("/certification/workers")
+def certification_workers():
+    return jsonify(service().list_certification_workers())
+
+
+@api.get("/certification/workers/<worker_id>")
+def certification_worker(worker_id):
+    return jsonify(service().get_certification_worker(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/baseline/preflight")
+def certification_preflight(worker_id):
+    body({})
+    return jsonify(service().certification_preflight(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/baseline/runs")
+def certification_start(worker_id):
+    body({})
+    result = service().start_baseline_certification(worker_id)
+    response = jsonify(result)
+    response.status_code = 202
+    response.headers["Location"] = "/api/certification/runs/" + result["run_id"]
+    return response
+
+
+@api.get("/certification/runs/<run_id>")
+def certification_run(run_id):
+    return jsonify(service().get_certification_run(run_id))
+
+
+@api.get("/certification/runs/<run_id>/evidence")
+def certification_evidence(run_id):
+    return jsonify(service().get_certification_evidence(run_id))
+
+
+@api.get("/certification/workers/<worker_id>/history")
+def certification_history(worker_id):
+    return jsonify(service().get_certification_history(worker_id))

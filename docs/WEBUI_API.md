@@ -151,6 +151,38 @@ planner, or worker outputs can create or influence one. See
 [`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md) for the full
 specification and current-vs-future implementation status.
 
+### Certification Center v1
+
+The browser is a control surface over canonical backend APIs. It never
+computes PASS/FAIL/HARD, never supplies `outcome`, `evidence_ref`,
+`adapter`, fingerprint, digest, or a hard-disqualifier list, and never
+talks to Ollama. Live Baseline Security certification writes only to
+isolated validation state:
+
+`{state_root}/validation-certification/{repo_id}/{worktree_id}/state.db`
+
+never production `{state_root}/repos/{repo_id}/worktrees/{worktree_id}/state.db`.
+Production eligibility is still computed only by
+`evaluate_production_eligibility` against production state.
+
+Expected runtime identity is server-owned (`RuntimeBindings.baseline_certification_targets`),
+never HTTP input. Host wiring example: `runtime_qwen_coder:create_runtime`.
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/certification/workers` | `{environment: "VALIDATION", workers: [...]}` compact status: runtime `VERIFIED`/`MISMATCH`/`UNREACHABLE`/`UNKNOWN` from last durable preflight (never a live probe on GET), Baseline Security from **validation** certificates (`CERTIFIED`/`FAILED`/`NOT_CERTIFIED`), role certificates from production (`CERTIFIED`/`NOT_CERTIFIED`), production eligibility from `evaluate_production_eligibility` (`ELIGIBLE`/`BLOCKED` plus the evaluator's reason) |
+| `GET /api/certification/workers/{id}` | Worker detail: identity with `CONFIG_BOUND` vs `LIVE_ATTESTED` sources (`effective_context_tokens` is config-bound and `measured_by_ollama: false`), last durable preflight, history, `ready_for_certification` |
+| `POST /api/certification/workers/{id}/baseline/preflight` | `{ }` only. Probes Ollama version/tags; **never infers**. Writes a durable READY or INCOMPLETE run. Failed preflight cannot be started. Digest mismatch cannot be started |
+| `POST /api/certification/workers/{id}/baseline/runs` | `{ }` only → **202** `{run_id, state: "QUEUED", ...}` and `Location`. Delegates to `certify_live_baseline_security`. One in-flight attempt; a second POST returns `409 certification_already_in_progress`. Closing the browser does not cancel the run. GET on this path does not start a run |
+| `GET /api/certification/runs/{id}` | Durable run projection. Poll after 202. Progress is derived from run state. Incomplete runs have `has_certificate: false` |
+| `GET /api/certification/runs/{id}/evidence` | Evidence reread through `read_baseline_security_evidence` from the validation ContentStore. `409` if missing/unverified |
+| `GET /api/certification/workers/{id}/history` | `{runs, validation_certificates, production_certificates}` — a run is not a certificate |
+
+Live Planner/Coder/Reviewer/Repairer/Security certification is not available
+in v1 (`future_actions[].available: false`). PASS, FAIL, and HARD_DISQUALIFIED
+all record a validation certificate; INCOMPLETE does not. None of these
+routes grant trust, permissions, or production eligibility.
+
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
 `ambiguity_id`, `question`, `risk_class` and `answer_recorded`. Answers preserve the
@@ -188,16 +220,22 @@ No AUTO or model mutation trust was added. The `/api/intelligence/*` routes
 (Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)), the
 `/api/plans*` routes (Phase 8.2, [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md)),
 and the `/api/permissions*` routes (Governance Foundation slice G2,
-[`PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)) are the additions since WebUI
-Foundation 1 — deterministic, read-only repository evidence, planning, and
-now permission consent/revocation, never a filesystem/DB path from the
-client, never a new authority: a repository fact still cannot become trusted
-`ResolutionEvidence` except through the existing, unmodified
-application-owned authority path, a `READY` plan authorizes no execution, no
-mutation, and no command, and `/api/permissions*` can only decide on or
-revoke a permission request/grant a trusted backend subsystem already
-created — never mint one, and never accept anything beyond `{decision}` /
-`{}` in a mutating body.
+[`PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)), and the
+`/api/certification*` routes (Certification Center v1) are the
+additions since WebUI Foundation 1 — deterministic, read-only
+repository evidence, planning, permission consent/revocation, and a
+control surface over isolated Baseline Security certification. Never a
+filesystem/DB path from the client, never a new authority: a repository
+fact still cannot become trusted `ResolutionEvidence` except through the
+existing, unmodified application-owned authority path, a `READY` plan
+authorizes no execution, no mutation, and no command,
+`/api/permissions*` can only decide on or revoke a permission
+request/grant a trusted backend subsystem already created — never mint
+one, and never accept anything beyond `{decision}` / `{}` in a mutating
+body — and `/api/certification*` never accepts an outcome, evidence
+reference, adapter, digest, fingerprint, or hard-disqualifier list.
+Certificates from this surface are written only to isolated validation
+state; they do not grant trust, permissions, or production eligibility.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens

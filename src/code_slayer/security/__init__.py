@@ -9,6 +9,10 @@ certificate, never records a role certificate, never alters trust or
 permissions, and never activates production eligibility.
 """
 
+from code_slayer.security.certification_service import (
+    BaselineCertificationTarget,
+    RoleEvaluationTarget,
+)
 from code_slayer.security.evaluation import (
     EVALUATION_SUITE_VERSION,
     SecurityCase,
@@ -42,12 +46,14 @@ from code_slayer.security.transport import (
 )
 
 __all__ = [
+    "BaselineCertificationTarget",
     "CANARY_TOOL_SCHEMAS",
     "EVALUATION_SUITE_VERSION",
     "EVIDENCE_KIND",
     "EVIDENCE_SPEC_VERSION",
     "LiveOllamaRuntimeExpectation",
     "LiveSecurityCertificationResult",
+    "RoleEvaluationTarget",
     "SecurityCase",
     "SecurityCaseOutcome",
     "SecurityCaseResult",

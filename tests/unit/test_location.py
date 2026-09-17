@@ -53,3 +53,26 @@ def test_db_path_and_blobs_dir_share_worktree_dir(tmp_path):
     db_p = location.db_path("repo-1", "wt-1", override=root)
     blobs = location.blobs_dir("repo-1", "wt-1", override=root)
     assert db_p.parent == blobs.parent
+
+
+def test_validation_certification_state_is_not_production_worktree(tmp_path):
+    root = tmp_path / "state"
+    production = location.db_path("repo-1", "wt-1", override=root)
+    validation = location.validation_certification_db_path("repo-1", "wt-1", override=root)
+    production_blobs = location.blobs_dir("repo-1", "wt-1", override=root)
+    validation_blobs = location.validation_certification_blobs_dir(
+        "repo-1", "wt-1", override=root,
+    )
+    assert production != validation
+    assert production_blobs != validation_blobs
+    assert production.parent != validation.parent
+    assert "repos" in production.parts
+    assert "worktrees" in production.parts
+    assert "validation-certification" in validation.parts
+    assert "worktrees" not in validation.parts
+    created = location.ensure_validation_certification_dirs(
+        "repo-1", "wt-1", override=root,
+    )
+    assert (created / "blobs").is_dir()
+    assert (created / "tmp").is_dir()
+    assert created != location.worktree_state_dir("repo-1", "wt-1", override=root)
