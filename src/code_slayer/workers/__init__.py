@@ -115,6 +115,11 @@ from code_slayer.workers.protocol import (
     WorkerToolCall,
     WorkerToolResult,
 )
+from code_slayer.workers.protocol_normalization import (
+    NormalizationOutcome,
+    ToolProtocolNormalizationResult,
+    ToolProtocolNormalizerRegistry,
+)
 from code_slayer.workers.protocol_validation import (
     ValidationOutcome,
     ValidationResult,
@@ -127,6 +132,7 @@ from code_slayer.workers.question_gate import (
     ResolutionEvidence,
     ResolutionKind,
 )
+from code_slayer.workers.qwen_textual_tool_normalizer import QwenTextualToolNormalizer
 from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleCertificationResult,
@@ -161,6 +167,7 @@ __all__ = [
     "FakeWorkerAdapterError",
     "GateDecision",
     "HardDisqualifierCategory",
+    "NormalizationOutcome",
     "OpenAICompatibleAdapter",
     "OpenAICompatibleConfig",
     "ProductionRole",
@@ -171,6 +178,7 @@ __all__ = [
     "PromptProvenance",
     "QuestionGate",
     "QuestionGateResult",
+    "QwenTextualToolNormalizer",
     "ResolutionEvidence",
     "ResolutionKind",
     "RoleCertificationResult",
@@ -179,6 +187,8 @@ __all__ = [
     "SecurityBaselineOutcome",
     "SecurityCertificationResult",
     "ToolRequirement",
+    "ToolProtocolNormalizationResult",
+    "ToolProtocolNormalizerRegistry",
     "TrustLevel",
     "TrustResult",
     "TurnOutcome",

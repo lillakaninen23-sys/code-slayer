@@ -190,6 +190,8 @@ class WorkerBaselineSecurityCertificate:
     evidence_ref: str
     reason: str
     issued_at: str
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +232,8 @@ class WorkerRoleCertificate:
     evidence_ref: str
     reason: str
     issued_at: str
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
 
 
 @dataclass(frozen=True)

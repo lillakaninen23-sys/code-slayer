@@ -68,10 +68,13 @@ verdict about the model) when:
   qualification`'s own "no verified profile" escape hatch; evidence
   produced that way was never bound to a specific, verified runtime and
   can never be certified against one)
-- the `(model_tag, model_digest, endpoint, runtime_version)` recorded in
-  every attempt's `AttemptProvenance`, across every instance, does not
-  agree exactly — ambiguous evidence about which runtime was actually
-  tested is never resolved by guessing one
+- the `(model_tag, model_digest, endpoint, runtime_version,
+  normalizer_id, normalizer_version)` recorded in every attempt's
+  `AttemptProvenance`, across every instance, does not agree exactly —
+  ambiguous evidence about which runtime was actually tested is never
+  resolved by guessing one. Native-only (`normalizer_id is None`) is a
+  different runtime identity from one that uses a compatibility
+  normalizer; a certificate for one must never silently cover the other.
 - the agreed-upon runtime profile is not fully specified (`workers.
   security_baseline.RuntimeProfileIdentity.is_fully_specified`) — see
   that property's own docstring for why a loosely-specified profile is
@@ -111,9 +114,12 @@ from code_slayer.workers.security_baseline import RuntimeProfileIdentity
 # evidence.
 PLANNER_CERTIFICATION_POLICY_VERSION = "planner-certification-v1"
 
-_PASS_OUTCOMES = frozenset({
-    QualificationOutcome.PASS_FIRST_TRY, QualificationOutcome.PASS_AFTER_FEEDBACK,
-})
+_PASS_OUTCOMES = frozenset(
+    {
+        QualificationOutcome.PASS_FIRST_TRY,
+        QualificationOutcome.PASS_AFTER_FEEDBACK,
+    }
+)
 
 
 def _deny(reason: str) -> RoleCertificationResult:
@@ -126,23 +132,41 @@ def _agreed_runtime_profile(
     """`None` if any instance has no provenance at all, or if the
     provenance recorded across every attempt in every instance does not
     agree on exactly one `(model_tag, model_digest, endpoint,
-    runtime_version)` tuple -- see the module docstring."""
-    identities: set[tuple[str, str | None, str | None, str | None]] = set()
+    runtime_version, normalizer_id, normalizer_version)` tuple -- see
+    the module docstring."""
+    identities: set[tuple[str, str | None, str | None, str | None, str | None, int | None]] = set()
     for result in results:
         if not result.provenance:
             return None
         for attempt in result.provenance:
             identities.add(
-                (attempt.model_tag, attempt.model_digest, attempt.endpoint,
-                 attempt.runtime_version),
+                (
+                    attempt.model_tag,
+                    attempt.model_digest,
+                    attempt.endpoint,
+                    attempt.runtime_version,
+                    attempt.normalizer_id,
+                    attempt.normalizer_version,
+                ),
             )
     if len(identities) != 1:
         return None
-    model_tag, model_digest, endpoint, runtime_version = next(iter(identities))
+    (
+        model_tag,
+        model_digest,
+        endpoint,
+        runtime_version,
+        normalizer_id,
+        normalizer_version,
+    ) = next(iter(identities))
     try:
         return RuntimeProfileIdentity(
-            model_tag=model_tag, model_digest=model_digest, endpoint=endpoint,
+            model_tag=model_tag,
+            model_digest=model_digest,
+            endpoint=endpoint,
             runtime_version=runtime_version,
+            normalizer_id=normalizer_id,
+            normalizer_version=normalizer_version,
         )
     except ValueError:
         return None
@@ -186,8 +210,11 @@ def _classify(
 
 
 def certify_planner_from_qualification(
-    conn: sqlite3.Connection, *, worker_id: str,
-    results: tuple[QualificationAttemptResult, ...], early_stopped: bool,
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    results: tuple[QualificationAttemptResult, ...],
+    early_stopped: bool,
     now_fn=None,
 ) -> RoleCertificationResult:
     """Decide whether a completed Planner qualification run
@@ -213,6 +240,15 @@ def certify_planner_from_qualification(
         return _deny("ambiguous_or_unverified_runtime_profile_in_evidence")
     if not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
+    if runtime_profile.normalizer_id is None and any(
+        attempt.tool_call_transport == "NORMALIZED"
+        for result in results
+        for attempt in result.provenance
+    ):
+        # A turn that actually used a compatibility decoder cannot be
+        # certified as native-only -- the two identities must not be
+        # silently confused.
+        return _deny("normalized_transport_without_normalizer_identity")
 
     outcome, classification = _classify(results)
     evidence_ref = _evidence_fingerprint(results)
@@ -220,8 +256,14 @@ def certify_planner_from_qualification(
 
     kwargs = {} if now_fn is None else {"now_fn": now_fn}
     return record_role_certificate(
-        conn, worker_id=worker_id, role=ProductionRole.PLANNER,
-        runtime_profile=runtime_profile, policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
-        outcome=outcome, classification=classification, evidence_ref=evidence_ref, reason=reason,
+        conn,
+        worker_id=worker_id,
+        role=ProductionRole.PLANNER,
+        runtime_profile=runtime_profile,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+        outcome=outcome,
+        classification=classification,
+        evidence_ref=evidence_ref,
+        reason=reason,
         **kwargs,
     )

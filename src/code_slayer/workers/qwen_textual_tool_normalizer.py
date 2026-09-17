@@ -18,8 +18,14 @@ VALUE_1
 VALUE_2
 </parameter>
 </function>
-</tool_call>
 ```
+
+An optional trailing `</tool_call>` closer with no matching opening
+`<tool_call>` is also accepted — that exact asymmetry is the 2026-09-14
+leak shape (`docs/CODE_SLAYER_VISION.md` §58) and the live
+`qwen3-coder-ctx16k:30b`/Ollama observation this decoder was written
+against. A document that *opens* with `<tool_call>` does not match this
+grammar and is rejected.
 
 - exactly one `<function=NAME>` ... `</function>` invocation in the
   whole document (a second, anywhere — even nested inside a parameter
@@ -27,11 +33,8 @@ VALUE_2
 - `NAME` must be a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) and must
   exactly equal one of `allowed_tools` — an unrecognized or spoofed
   name rejects
-- no non-whitespace content before `<function=` or after the trailing
-  `</tool_call>` — this format's own closing marker, required exactly
-  once, with no matching opening `<tool_call>` anywhere (the exact
-  asymmetry observed in real output; a document that also opens with
-  `<tool_call>` does not match this exact grammar and is rejected)
+- no non-whitespace content before `<function=` or after `</function>`
+  (or after the optional trailing `</tool_call>` when present)
 - zero or more `<parameter=NAME>VALUE</parameter>` blocks between the
   function open/close tags, each with a valid identifier name
 - a duplicate parameter name, an unrecognized parameter name (checked
@@ -40,7 +43,9 @@ VALUE_2
   invocation), or any tag that never closes all reject the whole
   document
 - every parameter value NOT in `string_parameters` must parse as valid
-  JSON once trimmed of surrounding whitespace — malformed JSON rejects
+  JSON once trimmed of surrounding whitespace — malformed JSON,
+  non-finite constants (`NaN`/`Infinity`), and duplicate object keys
+  all reject
 
 There is no recovery, no fuzzy matching, no extraction from surrounding
 prose, and no inference of a missing field: a document either exactly
@@ -70,6 +75,7 @@ docstring.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from code_slayer.workers.protocol import WorkerToolCall
@@ -103,8 +109,14 @@ _TOOL_CALL_CLOSE = "</tool_call>"
 # inside a value means a nested/recursive pseudo-tool invocation, or a
 # tag that was never meant to be inside a value at all -- rejected
 # either way, never guessed apart.
-_RESERVED_MARKERS = (_FUNCTION_OPEN, _FUNCTION_CLOSE, _PARAMETER_OPEN, _PARAMETER_CLOSE,
-                     _TOOL_CALL_OPEN, _TOOL_CALL_CLOSE)
+_RESERVED_MARKERS = (
+    _FUNCTION_OPEN,
+    _FUNCTION_CLOSE,
+    _PARAMETER_OPEN,
+    _PARAMETER_CLOSE,
+    _TOOL_CALL_OPEN,
+    _TOOL_CALL_CLOSE,
+)
 
 
 def _is_valid_identifier(value: str) -> bool:
@@ -121,6 +133,29 @@ def _is_valid_identifier(value: str) -> bool:
 
 def _reject(reason: str) -> ToolProtocolNormalizationResult:
     return ToolProtocolNormalizationResult(NormalizationOutcome.REJECTED, reason)
+
+
+def _strict_json_loads(raw: str) -> object:
+    """`json.loads` with the extra fail-closed constraints this decoder
+    actually needs: no `NaN`/`Infinity`, no duplicate object keys. Never
+    a second, heuristic JSON repair pass."""
+
+    def _reject_constant(value: str) -> None:
+        raise json.JSONDecodeError(f"non_finite_constant:{value}", raw, 0)
+
+    def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise json.JSONDecodeError("duplicate_object_key", raw, 0)
+            result[key] = value
+        return result
+
+    return json.loads(
+        raw,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_no_duplicate_keys,
+    )
 
 
 @dataclass(frozen=True)
@@ -148,30 +183,34 @@ class QwenTextualToolNormalizer:
     normalizer_version: int = NORMALIZER_VERSION
 
     def normalize(
-        self, text: str, *, allowed_tools: tuple[str, ...],
+        self,
+        text: str,
+        *,
+        allowed_tools: tuple[str, ...],
     ) -> ToolProtocolNormalizationResult:
         if not isinstance(text, str):
             return _reject("not_a_string")
         if len(text) > _MAX_INPUT_CHARS:
             return _reject("input_too_large")
 
-        # Exactly one function invocation, exactly one tool_call close
-        # marker, and no tool_call OPEN marker anywhere -- the exact,
-        # asymmetric shape this grammar accepts (see the module
-        # docstring). A second occurrence of any of these, anywhere in
-        # the document including nested inside a parameter value,
-        # rejects the whole document immediately -- this single set of
-        # counts is what makes "multiple functions" and "nested/
-        # recursive pseudo-tool invocation" both fail closed before any
-        # detailed parsing even begins.
+        # Exactly one function invocation, no tool_call OPEN marker, and
+        # at most one tool_call close marker -- the exact, asymmetric
+        # shape this grammar accepts (see the module docstring). A
+        # second occurrence of any of these, anywhere in the document
+        # including nested inside a parameter value, rejects the whole
+        # document immediately -- this single set of counts is what
+        # makes "multiple functions" and "nested/recursive pseudo-tool
+        # invocation" both fail closed before any detailed parsing even
+        # begins.
         if text.count(_FUNCTION_OPEN) != 1:
             return _reject("expected_exactly_one_function_invocation")
         if text.count(_FUNCTION_CLOSE) != 1:
             return _reject("expected_exactly_one_function_close_tag")
         if text.count(_TOOL_CALL_OPEN) != 0:
             return _reject("unexpected_tool_call_open_tag")
-        if text.count(_TOOL_CALL_CLOSE) != 1:
-            return _reject("expected_exactly_one_tool_call_close_tag")
+        close_count = text.count(_TOOL_CALL_CLOSE)
+        if close_count > 1:
+            return _reject("expected_at_most_one_tool_call_close_tag")
 
         function_open_index = text.index(_FUNCTION_OPEN)
         if text[:function_open_index].strip():
@@ -190,7 +229,7 @@ class QwenTextualToolNormalizer:
         function_close_index = text.index(_FUNCTION_CLOSE)
         if function_close_index < name_end:
             return _reject("malformed_document_structure")
-        body = text[name_end + 1:function_close_index]
+        body = text[name_end + 1 : function_close_index]
 
         params: dict[str, object] = {}
         seen: set[str] = set()
@@ -225,19 +264,23 @@ class QwenTextualToolNormalizer:
             if param_name in self.string_parameters:
                 params[param_name] = raw_value.strip()
             else:
-                import json
                 try:
-                    params[param_name] = json.loads(raw_value.strip())
+                    params[param_name] = _strict_json_loads(raw_value.strip())
                 except json.JSONDecodeError:
                     return _reject("malformed_json_parameter_value")
 
-            remaining = remaining[value_end + len(_PARAMETER_CLOSE):]
+            remaining = remaining[value_end + len(_PARAMETER_CLOSE) :]
 
-        after_function = text[function_close_index + len(_FUNCTION_CLOSE):]
-        if after_function.strip() != _TOOL_CALL_CLOSE:
+        after_function = text[function_close_index + len(_FUNCTION_CLOSE) :]
+        trailer = after_function.strip()
+        if close_count == 0:
+            if trailer:
+                return _reject("non_whitespace_suffix")
+        elif trailer != _TOOL_CALL_CLOSE:
             return _reject("non_whitespace_suffix")
 
         return ToolProtocolNormalizationResult(
-            NormalizationOutcome.NORMALIZED, "qwen_textual_tool_v1_normalized",
+            NormalizationOutcome.NORMALIZED,
+            "qwen_textual_tool_v1_normalized",
             tool_call=WorkerToolCall(tool=function_name, params=params),
         )

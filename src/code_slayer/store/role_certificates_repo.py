@@ -33,10 +33,23 @@ class RoleCertificatesRepo:
         self._conn = conn
 
     def record_in_transaction(
-        self, *, certificate_id: str, worker_id: str, role: str, policy_version: str,
-        model_tag: str, model_digest: str | None, endpoint: str | None,
-        runtime_version: str | None, outcome: str, classification: str,
-        evidence_ref: str, reason: str, issued_at: str,
+        self,
+        *,
+        certificate_id: str,
+        worker_id: str,
+        role: str,
+        policy_version: str,
+        model_tag: str,
+        model_digest: str | None,
+        endpoint: str | None,
+        runtime_version: str | None,
+        outcome: str,
+        classification: str,
+        evidence_ref: str,
+        reason: str,
+        issued_at: str,
+        normalizer_id: str | None = None,
+        normalizer_version: int | None = None,
     ) -> WorkerRoleCertificate:
         if not self._conn.in_transaction:
             raise RuntimeError(
@@ -45,11 +58,24 @@ class RoleCertificatesRepo:
         self._conn.execute(
             "INSERT INTO worker_role_certificates "
             "(certificate_id, worker_id, role, policy_version, model_tag, model_digest, "
-            "endpoint, runtime_version, outcome, classification, evidence_ref, reason, "
-            "issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "endpoint, runtime_version, normalizer_id, normalizer_version, outcome, "
+            "classification, evidence_ref, reason, issued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                certificate_id, worker_id, role, policy_version, model_tag, model_digest,
-                endpoint, runtime_version, outcome, classification, evidence_ref, reason,
+                certificate_id,
+                worker_id,
+                role,
+                policy_version,
+                model_tag,
+                model_digest,
+                endpoint,
+                runtime_version,
+                normalizer_id,
+                normalizer_version,
+                outcome,
+                classification,
+                evidence_ref,
+                reason,
                 issued_at,
             ),
         )
@@ -96,4 +122,6 @@ def _row_to_certificate(row: sqlite3.Row) -> WorkerRoleCertificate:
         evidence_ref=row["evidence_ref"],
         reason=row["reason"],
         issued_at=row["issued_at"],
+        normalizer_id=row["normalizer_id"],
+        normalizer_version=row["normalizer_version"],
     )

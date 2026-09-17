@@ -59,7 +59,9 @@ def registered_worker(db_conn) -> str:
 @pytest.fixture
 def profile() -> RuntimeProfileIdentity:
     return RuntimeProfileIdentity(
-        model_tag="devstral:24b", model_digest="sha256:abc", endpoint="http://local:11436/v1",
+        model_tag="devstral:24b",
+        model_digest="sha256:abc",
+        endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
     )
 
@@ -67,62 +69,95 @@ def profile() -> RuntimeProfileIdentity:
 def _security_pass(conn, worker_id, profile, *, now_fn=None, evidence_ref="sec-ev"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile, outcome=SecurityBaselineOutcome.PASS,
-        evidence_ref=evidence_ref, reason="ok", **kwargs,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref=evidence_ref,
+        reason="ok",
+        **kwargs,
     )
 
 
 def _security_fail(conn, worker_id, profile, *, now_fn=None, evidence_ref="sec-ev"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile, outcome=SecurityBaselineOutcome.FAIL,
-        evidence_ref=evidence_ref, reason="unsafe", **kwargs,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.FAIL,
+        evidence_ref=evidence_ref,
+        reason="unsafe",
+        **kwargs,
     )
 
 
 def _security_hard_disqualified(conn, worker_id, profile, *, now_fn=None, evidence_ref="sec-ev"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED, evidence_ref=evidence_ref,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED,
+        evidence_ref=evidence_ref,
         reason="attempted_policy_bypass",
-        hard_disqualifiers=(HardDisqualifierCategory.POLICY_OR_GATE_BYPASS_ATTEMPT,), **kwargs,
+        hard_disqualifiers=(HardDisqualifierCategory.POLICY_OR_GATE_BYPASS_ATTEMPT,),
+        **kwargs,
     )
 
 
 def _role_pass(conn, worker_id, role, profile, *, now_fn=None, evidence_ref="role-ev"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_role_certificate(
-        conn, worker_id=worker_id, role=role, runtime_profile=profile,
-        policy_version=POLICY_VERSION, outcome=RoleQualificationOutcome.PASS,
-        classification="PASS_FIRST_TRY", evidence_ref=evidence_ref, reason="ok", **kwargs,
+        conn,
+        worker_id=worker_id,
+        role=role,
+        runtime_profile=profile,
+        policy_version=POLICY_VERSION,
+        outcome=RoleQualificationOutcome.PASS,
+        classification="PASS_FIRST_TRY",
+        evidence_ref=evidence_ref,
+        reason="ok",
+        **kwargs,
     )
 
 
 def _role_fail(conn, worker_id, role, profile, *, now_fn=None, evidence_ref="role-ev"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_role_certificate(
-        conn, worker_id=worker_id, role=role, runtime_profile=profile,
-        policy_version=POLICY_VERSION, outcome=RoleQualificationOutcome.FAIL,
-        classification="FAIL_POLICY", evidence_ref=evidence_ref, reason="bad", **kwargs,
+        conn,
+        worker_id=worker_id,
+        role=role,
+        runtime_profile=profile,
+        policy_version=POLICY_VERSION,
+        outcome=RoleQualificationOutcome.FAIL,
+        classification="FAIL_POLICY",
+        evidence_ref=evidence_ref,
+        reason="bad",
+        **kwargs,
     )
 
 
 def _evaluate(conn, worker_id, role, profile, *, policy_version=POLICY_VERSION):
     return evaluate_production_eligibility(
-        conn, worker_id=worker_id, role=role, runtime_profile=profile,
+        conn,
+        worker_id=worker_id,
+        role=role,
+        runtime_profile=profile,
         expected_role_policy_version=policy_version,
     )
 
 
 # -- 1: both valid => eligible -----------------------------------------------
 
+
 def test_baseline_security_pass_and_role_pass_is_eligible(db_conn, registered_worker, profile):
     security = _security_pass(db_conn, registered_worker, profile)
     role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        True, "eligible",
+        True,
+        "eligible",
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id=role.certificate.certificate_id,
     )
@@ -130,20 +165,28 @@ def test_baseline_security_pass_and_role_pass_is_eligible(db_conn, registered_wo
 
 # -- 2: Security PASS + missing role cert => denied --------------------------
 
+
 def test_security_pass_with_missing_role_certificate_is_denied(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     security = _security_pass(db_conn, registered_worker, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "no_role_certificate", security_certificate_id=security.certificate.certificate_id,
+        False,
+        "no_role_certificate",
+        security_certificate_id=security.certificate.certificate_id,
     )
 
 
 # -- 3: role PASS + missing Security cert => denied --------------------------
 
+
 def test_role_pass_with_missing_security_certificate_is_denied(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
@@ -152,42 +195,49 @@ def test_role_pass_with_missing_security_certificate_is_denied(
 
 # -- 4: Security FAIL + role PASS => denied ----------------------------------
 
+
 def test_security_fail_with_role_pass_is_denied(db_conn, registered_worker, profile):
     security = _security_fail(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "security_baseline_fail",
+        False,
+        "security_baseline_fail",
         security_certificate_id=security.certificate.certificate_id,
     )
 
 
 # -- 5: Security hard-disqualified + role PASS => denied ---------------------
 
+
 def test_security_hard_disqualifier_with_role_pass_is_denied(db_conn, registered_worker, profile):
     security = _security_hard_disqualified(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "security_hard_disqualifier",
+        False,
+        "security_hard_disqualifier",
         security_certificate_id=security.certificate.certificate_id,
     )
 
 
 # -- 6: role FAIL + Security PASS => denied ----------------------------------
 
+
 def test_role_fail_with_security_pass_is_denied(db_conn, registered_worker, profile):
     security = _security_pass(db_conn, registered_worker, profile)
     role = _role_fail(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "role_qualification_fail",
+        False,
+        "role_qualification_fail",
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id=role.certificate.certificate_id,
     )
 
 
 # -- 7/8: a role certificate authorizes ONLY its own exact role -------------
+
 
 def test_planner_certificate_does_not_authorize_coder(db_conn, registered_worker, profile):
     _security_pass(db_conn, registered_worker, profile)
@@ -207,8 +257,11 @@ def test_coder_certificate_does_not_authorize_planner(db_conn, registered_worker
 
 # -- 9/10: dedicated Security-role vs. mandatory baseline Security ----------
 
+
 def test_security_role_certificate_does_not_replace_baseline_security_certificate(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     """A `ProductionRole.SECURITY` role certificate is not the mandatory
     Baseline Security Certificate -- without the latter, eligibility for
@@ -219,7 +272,9 @@ def test_security_role_certificate_does_not_replace_baseline_security_certificat
 
 
 def test_baseline_security_certificate_does_not_create_security_role_eligibility(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     """The reverse: a valid Baseline Security Certificate alone never
     makes a worker eligible for the dedicated SECURITY role -- a real
@@ -227,20 +282,26 @@ def test_baseline_security_certificate_does_not_create_security_role_eligibility
     security = _security_pass(db_conn, registered_worker, profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.SECURITY, profile)
     assert decision == EligibilityDecision(
-        False, "no_role_certificate",
+        False,
+        "no_role_certificate",
         security_certificate_id=security.certificate.certificate_id,
     )
 
 
 # -- 13: runtime-profile mismatch (either certificate) => denied ------------
 
+
 def test_security_certificate_for_a_different_profile_is_denied(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     other_profile = RuntimeProfileIdentity(
-        model_tag="a-different-model", model_digest="sha256:zzz", endpoint="http://other/v1",
+        model_tag="a-different-model",
+        model_digest="sha256:zzz",
+        endpoint="http://other/v1",
         runtime_version="9.9.9",
     )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, other_profile)
@@ -249,36 +310,46 @@ def test_security_certificate_for_a_different_profile_is_denied(
 
 def test_role_certificate_for_a_different_profile_is_denied(db_conn, registered_worker, profile):
     other_profile = RuntimeProfileIdentity(
-        model_tag="devstral:24b", model_digest="sha256:different", endpoint="http://local:11436/v1",
+        model_tag="devstral:24b",
+        model_digest="sha256:different",
+        endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
     )
     security = _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, other_profile)
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "role_certificate_profile_mismatch",
+        False,
+        "role_certificate_profile_mismatch",
         security_certificate_id=security.certificate.certificate_id,
     )
 
 
 # -- 14/15: qualification-policy/version mismatch or staleness => denied ----
 
+
 def test_role_certificate_with_wrong_policy_version_is_denied(db_conn, registered_worker, profile):
     security = _security_pass(db_conn, registered_worker, profile)
     role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     decision = _evaluate(
-        db_conn, registered_worker, ProductionRole.PLANNER, profile,
+        db_conn,
+        registered_worker,
+        ProductionRole.PLANNER,
+        profile,
         policy_version="a-completely-different-policy-version",
     )
     assert decision == EligibilityDecision(
-        False, "role_certificate_policy_version_stale",
+        False,
+        "role_certificate_policy_version_stale",
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id=role.certificate.certificate_id,
     )
 
 
 def test_role_certificate_recorded_under_a_stale_prior_policy_version_is_denied(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     """Item 15: a certificate that used to be current under an OLDER
     policy version is exactly as denied as one for an unrelated version
@@ -286,85 +357,126 @@ def test_role_certificate_recorded_under_a_stale_prior_policy_version_is_denied(
     security = _security_pass(db_conn, registered_worker, profile)
     with transaction(db_conn):
         RoleCertificatesRepo(db_conn).record_in_transaction(
-            certificate_id="stale-cert", worker_id=registered_worker,
-            role=ProductionRole.PLANNER.value, policy_version="planner-certification-v0-retired",
-            model_tag=profile.model_tag, model_digest=profile.model_digest,
-            endpoint=profile.endpoint, runtime_version=profile.runtime_version,
-            outcome=RoleQualificationOutcome.PASS.value, classification="PASS_FIRST_TRY",
-            evidence_ref="ev", reason="ok", issued_at="2020-01-01T00:00:00.000000Z",
+            certificate_id="stale-cert",
+            worker_id=registered_worker,
+            role=ProductionRole.PLANNER.value,
+            policy_version="planner-certification-v0-retired",
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            outcome=RoleQualificationOutcome.PASS.value,
+            classification="PASS_FIRST_TRY",
+            evidence_ref="ev",
+            reason="ok",
+            issued_at="2020-01-01T00:00:00.000000Z",
         )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "role_certificate_policy_version_stale",
+        False,
+        "role_certificate_policy_version_stale",
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id="stale-cert",
     )
 
 
 def test_security_certificate_recorded_under_a_stale_baseline_version_is_denied(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     with transaction(db_conn):
         BaselineSecurityCertificatesRepo(db_conn).record_in_transaction(
-            certificate_id="stale-sec-cert", worker_id=registered_worker,
-            baseline_version="baseline-security-v0-retired", model_tag=profile.model_tag,
-            model_digest=profile.model_digest, endpoint=profile.endpoint,
-            runtime_version=profile.runtime_version, outcome=SecurityBaselineOutcome.PASS.value,
-            hard_disqualifiers_json="[]", evidence_ref="ev", reason="ok",
+            certificate_id="stale-sec-cert",
+            worker_id=registered_worker,
+            baseline_version="baseline-security-v0-retired",
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            outcome=SecurityBaselineOutcome.PASS.value,
+            hard_disqualifiers_json="[]",
+            evidence_ref="ev",
+            reason="ok",
             issued_at="2020-01-01T00:00:00.000000Z",
         )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "baseline_security_certificate_policy_version_stale",
+        False,
+        "baseline_security_certificate_policy_version_stale",
         security_certificate_id="stale-sec-cert",
     )
 
 
 # -- 19: malformed/unknown persisted outcome fails closed --------------------
 
+
 def test_role_certificate_with_unknown_persisted_outcome_fails_closed(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     security = _security_pass(db_conn, registered_worker, profile)
     with transaction(db_conn):
         RoleCertificatesRepo(db_conn).record_in_transaction(
-            certificate_id="garbage-cert", worker_id=registered_worker,
-            role=ProductionRole.PLANNER.value, policy_version=POLICY_VERSION,
-            model_tag=profile.model_tag, model_digest=profile.model_digest,
-            endpoint=profile.endpoint, runtime_version=profile.runtime_version,
-            outcome="SOMETHING_UNEXPECTED", classification="corrupted",
-            evidence_ref="ev", reason="ok", issued_at="2026-01-01T00:00:00.000000Z",
+            certificate_id="garbage-cert",
+            worker_id=registered_worker,
+            role=ProductionRole.PLANNER.value,
+            policy_version=POLICY_VERSION,
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            outcome="SOMETHING_UNEXPECTED",
+            classification="corrupted",
+            evidence_ref="ev",
+            reason="ok",
+            issued_at="2026-01-01T00:00:00.000000Z",
         )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "role_qualification_fail",
+        False,
+        "role_qualification_fail",
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id="garbage-cert",
     )
 
 
 def test_security_certificate_with_unknown_persisted_outcome_fails_closed(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     with transaction(db_conn):
         BaselineSecurityCertificatesRepo(db_conn).record_in_transaction(
-            certificate_id="garbage-sec-cert", worker_id=registered_worker,
-            baseline_version="baseline-security-v1", model_tag=profile.model_tag,
-            model_digest=profile.model_digest, endpoint=profile.endpoint,
-            runtime_version=profile.runtime_version, outcome="SOMETHING_UNEXPECTED",
-            hard_disqualifiers_json="[]", evidence_ref="ev", reason="ok",
+            certificate_id="garbage-sec-cert",
+            worker_id=registered_worker,
+            baseline_version="baseline-security-v1",
+            model_tag=profile.model_tag,
+            model_digest=profile.model_digest,
+            endpoint=profile.endpoint,
+            runtime_version=profile.runtime_version,
+            outcome="SOMETHING_UNEXPECTED",
+            hard_disqualifiers_json="[]",
+            evidence_ref="ev",
+            reason="ok",
             issued_at="2026-01-01T00:00:00.000000Z",
         )
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert decision == EligibilityDecision(
-        False, "security_baseline_fail", security_certificate_id="garbage-sec-cert",
+        False,
+        "security_baseline_fail",
+        security_certificate_id="garbage-sec-cert",
     )
 
 
 # -- 20: persistence/read failure fails closed, never "eligible" ------------
 
+
 def test_persistence_read_failure_is_never_converted_to_eligible(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
@@ -374,6 +486,7 @@ def test_persistence_read_failure_is_never_converted_to_eligible(
 
 
 # -- 21: caller cannot fabricate eligibility ----------------------------------
+
 
 def test_evaluate_production_eligibility_accepts_no_role_verdict_parameter():
     """Structural, not conventional: the production entry point's own
@@ -386,12 +499,18 @@ def test_evaluate_production_eligibility_accepts_no_role_verdict_parameter():
     assert "role_qualification" not in params
     assert "role_status" not in params
     assert params == {
-        "conn", "worker_id", "role", "runtime_profile", "expected_role_policy_version",
+        "conn",
+        "worker_id",
+        "role",
+        "runtime_profile",
+        "expected_role_policy_version",
     }
 
 
 def test_no_role_certificate_denies_even_with_a_real_security_pass(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     """Without a REAL, durable role certificate, eligibility is denied
     regardless of anything else being true -- there is no way to talk
@@ -403,8 +522,11 @@ def test_no_role_certificate_denies_even_with_a_real_security_pass(
 
 # -- 24: no role certificate is transitively created for another role -------
 
+
 def test_evaluating_one_role_never_creates_or_affects_another_roles_certificate(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     _security_pass(db_conn, registered_worker, profile)
     _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
@@ -415,12 +537,17 @@ def test_evaluating_one_role_never_creates_or_affects_another_roles_certificate(
     coder_decision = _evaluate(db_conn, registered_worker, ProductionRole.CODER, profile)
     assert not coder_decision.eligible
     assert coder_decision.reason == "no_role_certificate"
-    assert RoleCertificatesRepo(db_conn).list_for_worker_role(
-        registered_worker, ProductionRole.CODER.value,
-    ) == []
+    assert (
+        RoleCertificatesRepo(db_conn).list_for_worker_role(
+            registered_worker,
+            ProductionRole.CODER.value,
+        )
+        == []
+    )
 
 
 # -- fail-closed: unknown worker, malformed request, insufficient identity --
+
 
 def test_unknown_worker_is_denied(db_conn, profile):
     decision = _evaluate(db_conn, "never-registered", ProductionRole.PLANNER, profile)
@@ -429,8 +556,11 @@ def test_unknown_worker_is_denied(db_conn, profile):
 
 def test_malformed_role_type_is_denied(db_conn, registered_worker, profile):
     decision = evaluate_production_eligibility(
-        db_conn, worker_id=registered_worker, role="planner",  # a plain string, not the enum
-        runtime_profile=profile, expected_role_policy_version=POLICY_VERSION,
+        db_conn,
+        worker_id=registered_worker,
+        role="planner",  # a plain string, not the enum
+        runtime_profile=profile,
+        expected_role_policy_version=POLICY_VERSION,
     )
     assert decision == EligibilityDecision(False, "malformed_eligibility_request")
 
@@ -442,7 +572,8 @@ def test_incompletely_specified_runtime_profile_is_denied(db_conn, registered_wo
 
 
 def test_incompletely_specified_profile_is_denied_even_with_a_matching_weak_certificate(
-    db_conn, registered_worker,
+    db_conn,
+    registered_worker,
 ):
     """A certificate CAN legitimately be recorded against a loosely
     specified profile (recording stays honest about what was actually
@@ -457,8 +588,11 @@ def test_incompletely_specified_profile_is_denied_even_with_a_matching_weak_cert
 
 # -- stale superseded certificates never win over the latest evidence -------
 
+
 def test_stale_superseded_security_certificate_never_preferred_over_the_latest(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     clock = _FakeClock("2026-01-01T00:00:00.000000Z")
     _security_pass(db_conn, registered_worker, profile, now_fn=clock, evidence_ref="old")
@@ -469,3 +603,64 @@ def test_stale_superseded_security_certificate_never_preferred_over_the_latest(
     decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
     assert not decision.eligible
     assert decision.reason == "security_baseline_fail"
+
+
+# -- native vs compatibility-normalizer identity must not silently substitute
+
+
+def test_native_certificate_does_not_authorize_a_normalized_runtime(
+    db_conn,
+    registered_worker,
+    profile,
+):
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    normalized = RuntimeProfileIdentity(
+        model_tag=profile.model_tag,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, normalized)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_normalized_certificate_does_not_authorize_a_native_runtime(
+    db_conn,
+    registered_worker,
+    profile,
+):
+    normalized = RuntimeProfileIdentity(
+        model_tag=profile.model_tag,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    _security_pass(db_conn, registered_worker, normalized)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, normalized)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert decision == EligibilityDecision(False, "baseline_security_certificate_profile_mismatch")
+
+
+def test_matching_normalized_profiles_can_be_eligible(db_conn, registered_worker, profile):
+    normalized = RuntimeProfileIdentity(
+        model_tag=profile.model_tag,
+        model_digest=profile.model_digest,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    security = _security_pass(db_conn, registered_worker, normalized)
+    role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, normalized)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, normalized)
+    assert decision == EligibilityDecision(
+        True,
+        "eligible",
+        security_certificate_id=security.certificate.certificate_id,
+        role_certificate_id=role.certificate.certificate_id,
+    )

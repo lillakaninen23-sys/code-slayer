@@ -157,8 +157,12 @@ def _matching_certificate(certificates, runtime_profile):
     their rows most-recent-first."""
     for certificate in certificates:
         candidate = RuntimeProfileIdentity(
-            model_tag=certificate.model_tag, model_digest=certificate.model_digest,
-            endpoint=certificate.endpoint, runtime_version=certificate.runtime_version,
+            model_tag=certificate.model_tag,
+            model_digest=certificate.model_digest,
+            endpoint=certificate.endpoint,
+            runtime_version=certificate.runtime_version,
+            normalizer_id=certificate.normalizer_id,
+            normalizer_version=certificate.normalizer_version,
         )
         if candidate.matches(runtime_profile):
             return certificate
@@ -166,8 +170,12 @@ def _matching_certificate(certificates, runtime_profile):
 
 
 def evaluate_production_eligibility(
-    conn: sqlite3.Connection, *, worker_id: str, role: ProductionRole,
-    runtime_profile: RuntimeProfileIdentity, expected_role_policy_version: str,
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    role: ProductionRole,
+    runtime_profile: RuntimeProfileIdentity,
+    expected_role_policy_version: str,
 ) -> EligibilityDecision:
     """The one production-eligibility gate a future router should query
     instead of deciding trust/qualification/security for itself. See the
@@ -222,7 +230,8 @@ def evaluate_production_eligibility(
     role_certificates = RoleCertificatesRepo(conn).list_for_worker_role(worker_id, role.value)
     if not role_certificates:
         return _deny(
-            "no_role_certificate", security_certificate_id=security_certificate.certificate_id,
+            "no_role_certificate",
+            security_certificate_id=security_certificate.certificate_id,
         )
     role_certificate = _matching_certificate(role_certificates, runtime_profile)
     if role_certificate is None:
@@ -244,6 +253,8 @@ def evaluate_production_eligibility(
         )
 
     return EligibilityDecision(
-        True, "eligible", security_certificate_id=security_certificate.certificate_id,
+        True,
+        "eligible",
+        security_certificate_id=security_certificate.certificate_id,
         role_certificate_id=role_certificate.certificate_id,
     )

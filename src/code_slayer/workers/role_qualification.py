@@ -152,9 +152,16 @@ def _deny(reason: str) -> RoleCertificationResult:
 
 
 def record_role_certificate(
-    conn: sqlite3.Connection, *, worker_id: str, role: ProductionRole,
-    runtime_profile: RuntimeProfileIdentity, policy_version: str,
-    outcome: RoleQualificationOutcome, classification: str, evidence_ref: str, reason: str,
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    role: ProductionRole,
+    runtime_profile: RuntimeProfileIdentity,
+    policy_version: str,
+    outcome: RoleQualificationOutcome,
+    classification: str,
+    evidence_ref: str,
+    reason: str,
     now_fn=utcnow_iso,
 ) -> RoleCertificationResult:
     """Durably record one role-qualification certification decision —
@@ -197,24 +204,42 @@ def record_role_certificate(
         certificate_id = uuid.uuid4().hex
         issued_at = now_fn()
         certificate = RoleCertificatesRepo(conn).record_in_transaction(
-            certificate_id=certificate_id, worker_id=worker_id, role=role.value,
-            policy_version=policy_version, model_tag=runtime_profile.model_tag,
-            model_digest=runtime_profile.model_digest, endpoint=runtime_profile.endpoint,
-            runtime_version=runtime_profile.runtime_version, outcome=outcome.value,
-            classification=classification, evidence_ref=evidence_ref, reason=reason,
+            certificate_id=certificate_id,
+            worker_id=worker_id,
+            role=role.value,
+            policy_version=policy_version,
+            model_tag=runtime_profile.model_tag,
+            model_digest=runtime_profile.model_digest,
+            endpoint=runtime_profile.endpoint,
+            runtime_version=runtime_profile.runtime_version,
+            normalizer_id=runtime_profile.normalizer_id,
+            normalizer_version=runtime_profile.normalizer_version,
+            outcome=outcome.value,
+            classification=classification,
+            evidence_ref=evidence_ref,
+            reason=reason,
             issued_at=issued_at,
         )
         AuditWriter(conn).append(
-            task_id=None, event_type=EventType.ROLE_QUALIFICATION_CERTIFICATE_RECORDED,
-            actor_type="system", actor_id=worker_id,
+            task_id=None,
+            event_type=EventType.ROLE_QUALIFICATION_CERTIFICATE_RECORDED,
+            actor_type="system",
+            actor_id=worker_id,
             payload={
-                "certificate_id": certificate_id, "worker_id": worker_id, "role": role.value,
-                "policy_version": policy_version, "model_tag": runtime_profile.model_tag,
+                "certificate_id": certificate_id,
+                "worker_id": worker_id,
+                "role": role.value,
+                "policy_version": policy_version,
+                "model_tag": runtime_profile.model_tag,
                 "model_digest": runtime_profile.model_digest,
                 "endpoint": runtime_profile.endpoint,
                 "runtime_version": runtime_profile.runtime_version,
-                "outcome": outcome.value, "classification": classification,
-                "evidence_ref": evidence_ref, "reason": reason,
+                "normalizer_id": runtime_profile.normalizer_id,
+                "normalizer_version": runtime_profile.normalizer_version,
+                "outcome": outcome.value,
+                "classification": classification,
+                "evidence_ref": evidence_ref,
+                "reason": reason,
             },
         )
         return RoleCertificationResult(True, "certificate_recorded", certificate=certificate)

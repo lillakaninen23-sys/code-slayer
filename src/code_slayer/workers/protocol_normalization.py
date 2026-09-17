@@ -90,6 +90,7 @@ configured for this runtime" all fail exactly the same way, closed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -129,13 +130,22 @@ class ToolProtocolNormalizer(Protocol):
     exact identity `workers.security_baseline.RuntimeProfileIdentity`
     binds a certificate to — see that module's own docstring for why a
     runtime profile using one normalizer/version must never be silently
-    treated as equivalent to a different one, or to none at all."""
+    treated as equivalent to a different one, or to none at all.
+    Identity attributes are read-only: a frozen normalizer dataclass is
+    a valid implementation, and a caller must never mutate the identity
+    a certificate is bound to."""
 
-    normalizer_id: str
-    normalizer_version: int
+    @property
+    def normalizer_id(self) -> str: ...
+
+    @property
+    def normalizer_version(self) -> int: ...
 
     def normalize(
-        self, text: str, *, allowed_tools: tuple[str, ...],
+        self,
+        text: str,
+        *,
+        allowed_tools: tuple[str, ...],
     ) -> ToolProtocolNormalizationResult: ...
 
 
@@ -146,7 +156,7 @@ class ToolProtocolNormalizerRegistry:
     registration at construction time — see the module docstring's
     "Registry" section for the fail-closed `resolve()` contract."""
 
-    def __init__(self, normalizers: tuple[ToolProtocolNormalizer, ...] = ()) -> None:
+    def __init__(self, normalizers: Sequence[ToolProtocolNormalizer] = ()) -> None:
         by_key: dict[tuple[str, int], ToolProtocolNormalizer] = {}
         for normalizer in normalizers:
             key = (normalizer.normalizer_id, normalizer.normalizer_version)
@@ -156,7 +166,9 @@ class ToolProtocolNormalizerRegistry:
         self._by_key = by_key
 
     def resolve(
-        self, normalizer_id: str | None, normalizer_version: int | None,
+        self,
+        normalizer_id: str | None,
+        normalizer_version: int | None,
     ) -> ToolProtocolNormalizer | None:
         """`None` whenever `normalizer_id` is `None` (no compatibility
         normalizer configured for this runtime profile at all), or when

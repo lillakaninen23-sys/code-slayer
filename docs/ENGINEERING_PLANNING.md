@@ -143,11 +143,24 @@ validates the response through the same `workers.protocol_validation.
 validate_response()` every bounded worker turn already goes through —
 including its reserved tool-call-transport-marker detection, which is
 what stops a model from embedding a tool call inside plain text to
-bypass this protocol. `planning.planner.parse_planner_output()` then
-does strict, whole-shape schema validation of the resulting structured
-payload — an unrecognized field, wrong type, or non-mapping/non-list
-shape rejects the whole thing (`PlannerOutcome.MALFORMED`), never a
-partial reconstruction or a heuristic parse of free text.
+bypass this protocol. Native structured `tool_calls` always take
+precedence. A leaked textual protocol is **fail-closed by default**
+(`PlannerOutcome.MALFORMED`, `NON_TOOL_RESPONSE`); an operator may
+explicitly enable a strict, deterministic Tool Protocol Compatibility
+Layer (`workers.protocol_normalization` / `workers.
+qwen_textual_tool_normalizer`) for a named `(normalizer_id,
+normalizer_version)` pair, which accepts only one exact grammar and
+then re-enters the same `validate_response()` +
+`parse_planner_output()` path — never a fuzzy/LLM repair, never a
+model-selected decoder, and never a silent change to runtime-profile
+identity or certificates. Native vs. normalized behavior is recorded
+distinctly in `planning.provenance.store_planner_output` via
+`PlannerResponse.tool_call_transport`. `planning.planner.
+parse_planner_output()` then does strict, whole-shape schema validation
+of the resulting structured payload — an unrecognized field, wrong
+type, or non-mapping/non-list shape rejects the whole thing
+(`PlannerOutcome.MALFORMED`), never a partial reconstruction or a
+heuristic parse of free text.
 
 `planning.fake_planner.FakePlanner` is a deterministic, fully offline
 test double mirroring `workers.fake_prompt_analyst.FakePromptAnalyst`.

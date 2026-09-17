@@ -52,7 +52,9 @@ A certificate binds to the existing canonical worker identity
 (`worker_id`, `store.workers_repo.WorkersRepo` — the same identity
 `workers.trust`/`workers.conformance` already use) plus an explicit
 `RuntimeProfileIdentity`: `model_tag` (required) and optional
-`model_digest`/`endpoint`/`runtime_version` — deliberately the same
+`model_digest`/`endpoint`/`runtime_version` plus the optional
+compatibility-normalizer identity (`normalizer_id`/`normalizer_version`,
+both `None` meaning native-only transport) — deliberately the same
 identity vocabulary `planning.qualification.RuntimeContextProfile`
 already established for "what runtime was actually verified," reused
 here rather than inventing a second, differently-named identity shape
@@ -69,20 +71,29 @@ profile fields, and requiring `workers.production_eligibility` to match
 them exactly against the CURRENT profile before ever trusting a
 certificate, is what stops a certificate issued against one runtime from
 silently covering a different one now answering to the same `worker_id`.
+The normalizer identity is part of that exact match: a certificate for a
+native-only runtime must never silently authorize a runtime using a
+compatibility normalizer, and vice versa. This module never issues or
+upgrades a certificate on its own when a normalizer is added or removed.
 
 `model_digest`/`endpoint`/`runtime_version` remain optional here
 deliberately — `record_baseline_certificate()` still accepts a
 certificate bound only to `model_tag`, since that is sometimes the only
 fact genuinely available at *evaluation* time, and this module's job is
 recording evidence honestly, not demanding more identity than was
-actually established. `RuntimeProfileIdentity.is_fully_specified`
-exists for the separate, stricter question a *production* decision must
-ask: `workers.production_eligibility` refuses to treat ANY certificate
-as authoritative for a real eligibility decision unless the CURRENT
-profile it is asked to check against has every field populated — a
-loosely-specified profile (e.g. `model_tag` alone) could otherwise let
-two meaningfully different runtimes silently share a certificate. This
-keeps recording lenient/honest and production consultation strict,
+actually established. `normalizer_id`/`normalizer_version` are optional
+in the same honest-recording sense (`None`/`None` is a complete, exact
+statement of "native-only," not a wildcard). `RuntimeProfileIdentity.
+is_fully_specified` exists for the separate, stricter question a
+*production* decision must ask: `workers.production_eligibility` refuses
+to treat ANY certificate as authoritative for a real eligibility
+decision unless the CURRENT profile it is asked to check against has
+every *model/runtime* field populated — a loosely-specified profile
+(e.g. `model_tag` alone) could otherwise let two meaningfully different
+runtimes silently share a certificate. Native-only (`normalizer_id is
+None`) is fully specified with respect to the compatibility layer;
+enabling a normalizer is a different identity, never a missing one.
+This keeps recording lenient/honest and production consultation strict,
 without changing what this module itself accepts.
 
 ## No fabrication, ever
@@ -178,22 +189,42 @@ class RuntimeProfileIdentity:
     Security evaluation was actually run against — deliberately the same
     identity vocabulary `planning.qualification.RuntimeContextProfile`
     already established (`model_tag`/`model_digest`/`endpoint`/
-    `runtime_version`), reused here rather than invented afresh. A
-    caller-*verified* value, never introspected or assumed by this
-    module itself (same posture `RuntimeContextProfile` already takes)."""
+    `runtime_version` plus the compatibility-normalizer identity),
+    reused here rather than invented afresh. A caller-*verified* value,
+    never introspected or assumed by this module itself (same posture
+    `RuntimeContextProfile` already takes).
+
+    `normalizer_id`/`normalizer_version` are security-relevant runtime
+    configuration, not per-turn behavior: both `None` means native-only
+    transport; both set names the exact `workers.protocol_normalization`
+    decoder this runtime is configured to use. An incomplete pair is
+    refused at construction — never treated as a wildcard, and never
+    inferred from a model response."""
 
     model_tag: str
     model_digest: str | None = None
     endpoint: str | None = None
     runtime_version: str | None = None
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag.strip():
             raise ValueError("model_tag must be a non-empty string")
-        for name in ("model_digest", "endpoint", "runtime_version"):
+        for name in ("model_digest", "endpoint", "runtime_version", "normalizer_id"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"{name} must be a non-empty string or None")
+        if (self.normalizer_id is None) != (self.normalizer_version is None):
+            raise ValueError(
+                "normalizer_id and normalizer_version must both be set or both be None",
+            )
+        if self.normalizer_version is not None and (
+            not isinstance(self.normalizer_version, int)
+            or isinstance(self.normalizer_version, bool)
+            or self.normalizer_version < 1
+        ):
+            raise ValueError("normalizer_version must be a positive integer or None")
 
     def matches(self, other: RuntimeProfileIdentity) -> bool:
         """Exact match on every field — `None` only ever matches `None`,
@@ -201,7 +232,9 @@ class RuntimeProfileIdentity:
         issued against a partially-described profile (e.g. no digest
         recorded) from being silently treated as covering a DIFFERENT,
         now-current profile that also happens to omit a digest for an
-        unrelated reason."""
+        unrelated reason, and what stops a native-only certificate from
+        silently covering a runtime that uses a compatibility
+        normalizer (or vice versa)."""
         if not isinstance(other, RuntimeProfileIdentity):
             return False
         return (
@@ -209,24 +242,31 @@ class RuntimeProfileIdentity:
             and self.model_digest == other.model_digest
             and self.endpoint == other.endpoint
             and self.runtime_version == other.runtime_version
+            and self.normalizer_id == other.normalizer_id
+            and self.normalizer_version == other.normalizer_version
         )
 
     @property
     def is_fully_specified(self) -> bool:
-        """`True` only when every identity field is populated —
-        `model_tag` alone (or any strict subset) is a legitimate binding
-        for a *recorded* certificate (`record_baseline_certificate()`
-        never required more, and this property does not retroactively
-        change that), but it is NOT a strong enough binding for
-        `workers.production_eligibility` to treat as authoritative for a
-        real production decision: two meaningfully different runtimes
-        (different digest, different endpoint, different runtime
-        version) could otherwise share the same loosely-specified
-        profile and be silently confused for each other. `workers.
-        production_eligibility` refuses to evaluate eligibility at all
-        against a `runtime_profile` for which this is `False` — unknown
-        identity fails closed rather than wildcard-matching (see that
-        module's own docstring)."""
+        """`True` only when every *model/runtime* identity field is
+        populated — `model_tag` alone (or any strict subset) is a
+        legitimate binding for a *recorded* certificate
+        (`record_baseline_certificate()` never required more, and this
+        property does not retroactively change that), but it is NOT a
+        strong enough binding for `workers.production_eligibility` to
+        treat as authoritative for a real production decision: two
+        meaningfully different runtimes (different digest, different
+        endpoint, different runtime version) could otherwise share the
+        same loosely-specified profile and be silently confused for
+        each other. `workers.production_eligibility` refuses to evaluate
+        eligibility at all against a `runtime_profile` for which this is
+        `False` — unknown identity fails closed rather than wildcard-
+        matching (see that module's own docstring).
+
+        `normalizer_id`/`normalizer_version` being `None` is a complete
+        statement of native-only transport, not a missing identity
+        field, so it does not make this property `False`. An incomplete
+        pair cannot be constructed at all (see `__post_init__`)."""
         return None not in (self.model_tag, self.model_digest, self.endpoint, self.runtime_version)
 
 
@@ -242,8 +282,13 @@ def _deny(reason: str) -> SecurityCertificationResult:
 
 
 def record_baseline_certificate(
-    conn: sqlite3.Connection, *, worker_id: str, runtime_profile: RuntimeProfileIdentity,
-    outcome: SecurityBaselineOutcome, evidence_ref: str, reason: str,
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    runtime_profile: RuntimeProfileIdentity,
+    outcome: SecurityBaselineOutcome,
+    evidence_ref: str,
+    reason: str,
     hard_disqualifiers: tuple[HardDisqualifierCategory, ...] = (),
     now_fn=utcnow_iso,
 ) -> SecurityCertificationResult:
@@ -287,25 +332,40 @@ def record_baseline_certificate(
         certificate_id = uuid.uuid4().hex
         issued_at = now_fn()
         certificate = BaselineSecurityCertificatesRepo(conn).record_in_transaction(
-            certificate_id=certificate_id, worker_id=worker_id,
-            baseline_version=BASELINE_VERSION, model_tag=runtime_profile.model_tag,
-            model_digest=runtime_profile.model_digest, endpoint=runtime_profile.endpoint,
-            runtime_version=runtime_profile.runtime_version, outcome=outcome.value,
+            certificate_id=certificate_id,
+            worker_id=worker_id,
+            baseline_version=BASELINE_VERSION,
+            model_tag=runtime_profile.model_tag,
+            model_digest=runtime_profile.model_digest,
+            endpoint=runtime_profile.endpoint,
+            runtime_version=runtime_profile.runtime_version,
+            normalizer_id=runtime_profile.normalizer_id,
+            normalizer_version=runtime_profile.normalizer_version,
+            outcome=outcome.value,
             hard_disqualifiers_json=json.dumps([d.value for d in hard_disqualifiers]),
-            evidence_ref=evidence_ref, reason=reason, issued_at=issued_at,
+            evidence_ref=evidence_ref,
+            reason=reason,
+            issued_at=issued_at,
         )
         AuditWriter(conn).append(
-            task_id=None, event_type=EventType.SECURITY_BASELINE_CERTIFICATE_RECORDED,
-            actor_type="system", actor_id=worker_id,
+            task_id=None,
+            event_type=EventType.SECURITY_BASELINE_CERTIFICATE_RECORDED,
+            actor_type="system",
+            actor_id=worker_id,
             payload={
-                "certificate_id": certificate_id, "worker_id": worker_id,
-                "baseline_version": BASELINE_VERSION, "model_tag": runtime_profile.model_tag,
+                "certificate_id": certificate_id,
+                "worker_id": worker_id,
+                "baseline_version": BASELINE_VERSION,
+                "model_tag": runtime_profile.model_tag,
                 "model_digest": runtime_profile.model_digest,
                 "endpoint": runtime_profile.endpoint,
                 "runtime_version": runtime_profile.runtime_version,
+                "normalizer_id": runtime_profile.normalizer_id,
+                "normalizer_version": runtime_profile.normalizer_version,
                 "outcome": outcome.value,
                 "hard_disqualifiers": [d.value for d in hard_disqualifiers],
-                "evidence_ref": evidence_ref, "reason": reason,
+                "evidence_ref": evidence_ref,
+                "reason": reason,
             },
         )
         return SecurityCertificationResult(True, "certificate_recorded", certificate=certificate)

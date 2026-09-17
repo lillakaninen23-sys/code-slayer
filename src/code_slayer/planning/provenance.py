@@ -69,8 +69,10 @@ def _read_verified(store: ContentStore, content_hash: str, expected_kind: str) -
 
 def store_request(store: ContentStore, original_request: str) -> ContentBlob:
     return store.put(
-        original_request.encode("utf-8"), media_type="text/plain",
-        source_kind=REQUEST_EVIDENCE_KIND, exportable=False,
+        original_request.encode("utf-8"),
+        media_type="text/plain",
+        source_kind=REQUEST_EVIDENCE_KIND,
+        exportable=False,
     )
 
 
@@ -81,8 +83,10 @@ def read_request(conn: sqlite3.Connection, blobs_dir: Path | str, content_hash: 
 
 def _resolution_to_dict(resolution: WorkerSupplementalResolution) -> dict:
     return {
-        "ambiguity_id": resolution.ambiguity_id, "kind": resolution.kind.value,
-        "source": resolution.source.value, "content_hash": resolution.content_hash,
+        "ambiguity_id": resolution.ambiguity_id,
+        "kind": resolution.kind.value,
+        "source": resolution.source.value,
+        "content_hash": resolution.content_hash,
         # The verified answer text itself is never duplicated here -- a
         # reader already has `content_hash` to re-verify/re-read it from
         # ContentStore directly, exactly like every other reference in
@@ -110,8 +114,10 @@ def store_planner_input(store: ContentStore, request: PlannerRequest) -> Content
         ],
     }
     return store.put(
-        _canonical(document), media_type="application/json",
-        source_kind=PLANNER_INPUT_EVIDENCE_KIND, exportable=False,
+        _canonical(document),
+        media_type="application/json",
+        source_kind=PLANNER_INPUT_EVIDENCE_KIND,
+        exportable=False,
     )
 
 
@@ -124,34 +130,50 @@ def store_planner_output(store: ContentStore, response: PlannerResponse) -> Cont
     (Phase 8.2b) — only the coarse `failure_category` is (via
     `planning.service`'s durable `reason` field)."""
     document = {
-        "outcome": response.outcome.value, "raw": response.raw, "error": response.error,
+        "outcome": response.outcome.value,
+        "raw": response.raw,
+        "error": response.error,
         "failure_category": (
             response.failure_category.value if response.failure_category else None
         ),
+        "tool_call_transport": (
+            response.tool_call_transport.value if response.tool_call_transport else None
+        ),
+        "normalizer_id": response.normalizer_id,
+        "normalizer_version": response.normalizer_version,
+        "normalization_reason": response.normalization_reason,
     }
     return store.put(
-        _canonical(document), media_type="application/json",
-        source_kind=PLANNER_OUTPUT_EVIDENCE_KIND, exportable=False,
+        _canonical(document),
+        media_type="application/json",
+        source_kind=PLANNER_OUTPUT_EVIDENCE_KIND,
+        exportable=False,
     )
 
 
 def store_validation_result(store: ContentStore, result: EvidenceValidationResult) -> ContentBlob:
     document = {"blocking": result.blocking, "issues": list(result.issues)}
     return store.put(
-        _canonical(document), media_type="application/json",
-        source_kind=VALIDATION_EVIDENCE_KIND, exportable=False,
+        _canonical(document),
+        media_type="application/json",
+        source_kind=VALIDATION_EVIDENCE_KIND,
+        exportable=False,
     )
 
 
 def store_plan_content(store: ContentStore, content: EngineeringPlanContent) -> ContentBlob:
     return store.put(
-        _canonical(plan_content_to_dict(content)), media_type="application/json",
-        source_kind=PLAN_CONTENT_EVIDENCE_KIND, exportable=False,
+        _canonical(plan_content_to_dict(content)),
+        media_type="application/json",
+        source_kind=PLAN_CONTENT_EVIDENCE_KIND,
+        exportable=False,
     )
 
 
 def read_plan_content(
-    conn: sqlite3.Connection, blobs_dir: Path | str, content_hash: str,
+    conn: sqlite3.Connection,
+    blobs_dir: Path | str,
+    content_hash: str,
 ) -> EngineeringPlanContent:
     store = ContentStore(conn, blobs_dir)
     document = json.loads(_read_verified(store, content_hash, PLAN_CONTENT_EVIDENCE_KIND))
@@ -159,8 +181,13 @@ def read_plan_content(
 
 
 def read_supplemental_resolution(
-    conn: sqlite3.Connection, blobs_dir: Path | str, *, ambiguity_id: str,
-    source: str, resolution_kind: str, answer_content_hash: str,
+    conn: sqlite3.Connection,
+    blobs_dir: Path | str,
+    *,
+    ambiguity_id: str,
+    source: str,
+    resolution_kind: str,
+    answer_content_hash: str,
 ) -> WorkerSupplementalResolution:
     """Read back one durable human-resolution answer and verify its
     content identity — mirrors `runner.local_worker_runner.
@@ -168,7 +195,9 @@ def read_supplemental_resolution(
     store = ContentStore(conn, blobs_dir)
     content = _read_verified(store, answer_content_hash, PLAN_HUMAN_ANSWER_EVIDENCE_KIND)
     return WorkerSupplementalResolution(
-        ambiguity_id=ambiguity_id, kind=WorkerSupplementalKind(resolution_kind),
-        source=WorkerSupplementalSource(source), content=content.decode("utf-8"),
+        ambiguity_id=ambiguity_id,
+        kind=WorkerSupplementalKind(resolution_kind),
+        source=WorkerSupplementalSource(source),
+        content=content.decode("utf-8"),
         content_hash=answer_content_hash,
     )

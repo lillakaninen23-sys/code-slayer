@@ -31,10 +31,22 @@ class BaselineSecurityCertificatesRepo:
         self._conn = conn
 
     def record_in_transaction(
-        self, *, certificate_id: str, worker_id: str, baseline_version: str,
-        model_tag: str, model_digest: str | None, endpoint: str | None,
-        runtime_version: str | None, outcome: str, hard_disqualifiers_json: str,
-        evidence_ref: str, reason: str, issued_at: str,
+        self,
+        *,
+        certificate_id: str,
+        worker_id: str,
+        baseline_version: str,
+        model_tag: str,
+        model_digest: str | None,
+        endpoint: str | None,
+        runtime_version: str | None,
+        outcome: str,
+        hard_disqualifiers_json: str,
+        evidence_ref: str,
+        reason: str,
+        issued_at: str,
+        normalizer_id: str | None = None,
+        normalizer_version: int | None = None,
     ) -> WorkerBaselineSecurityCertificate:
         if not self._conn.in_transaction:
             raise RuntimeError(
@@ -43,12 +55,24 @@ class BaselineSecurityCertificatesRepo:
         self._conn.execute(
             "INSERT INTO worker_baseline_security_certificates "
             "(certificate_id, worker_id, baseline_version, model_tag, model_digest, "
-            "endpoint, runtime_version, outcome, hard_disqualifiers_json, evidence_ref, "
-            "reason, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "endpoint, runtime_version, normalizer_id, normalizer_version, outcome, "
+            "hard_disqualifiers_json, evidence_ref, reason, issued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                certificate_id, worker_id, baseline_version, model_tag, model_digest,
-                endpoint, runtime_version, outcome, hard_disqualifiers_json, evidence_ref,
-                reason, issued_at,
+                certificate_id,
+                worker_id,
+                baseline_version,
+                model_tag,
+                model_digest,
+                endpoint,
+                runtime_version,
+                normalizer_id,
+                normalizer_version,
+                outcome,
+                hard_disqualifiers_json,
+                evidence_ref,
+                reason,
+                issued_at,
             ),
         )
         certificate = self.get(certificate_id)
@@ -90,4 +114,6 @@ def _row_to_certificate(row: sqlite3.Row) -> WorkerBaselineSecurityCertificate:
         evidence_ref=row["evidence_ref"],
         reason=row["reason"],
         issued_at=row["issued_at"],
+        normalizer_id=row["normalizer_id"],
+        normalizer_version=row["normalizer_version"],
     )

@@ -45,26 +45,40 @@ def profile() -> RuntimeProfileIdentity:
 def _pass(conn, worker_id, profile, *, evidence_ref="evidence-1", now_fn=None, reason="ok"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.PASS, evidence_ref=evidence_ref, reason=reason, **kwargs,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref=evidence_ref,
+        reason=reason,
+        **kwargs,
     )
 
 
 def _fail(conn, worker_id, profile, *, evidence_ref="evidence-1", now_fn=None, reason="unsafe"):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.FAIL, evidence_ref=evidence_ref, reason=reason, **kwargs,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.FAIL,
+        evidence_ref=evidence_ref,
+        reason=reason,
+        **kwargs,
     )
 
 
 def _hard_disqualified(conn, worker_id, profile, *, evidence_ref="evidence-1", now_fn=None):
     kwargs = {"now_fn": now_fn} if now_fn is not None else {}
     return record_baseline_certificate(
-        conn, worker_id=worker_id, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED, evidence_ref=evidence_ref,
+        conn,
+        worker_id=worker_id,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED,
+        evidence_ref=evidence_ref,
         reason="attempted_policy_bypass",
-        hard_disqualifiers=(HardDisqualifierCategory.POLICY_OR_GATE_BYPASS_ATTEMPT,), **kwargs,
+        hard_disqualifiers=(HardDisqualifierCategory.POLICY_OR_GATE_BYPASS_ATTEMPT,),
+        **kwargs,
     )
 
 
@@ -87,6 +101,7 @@ def _passing_conformance_responses():
 
 
 # -- RuntimeProfileIdentity: exact matching, no wildcards --------------------
+
 
 def test_runtime_profile_identity_requires_nonempty_model_tag():
     with pytest.raises(ValueError):
@@ -112,16 +127,42 @@ def test_runtime_profile_identity_is_fully_specified_requires_every_field():
     assert not RuntimeProfileIdentity(model_tag="m").is_fully_specified
     assert not RuntimeProfileIdentity(model_tag="m", model_digest="d").is_fully_specified
     assert RuntimeProfileIdentity(
-        model_tag="m", model_digest="d", endpoint="e", runtime_version="v",
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+    ).is_fully_specified
+    # Native-only (normalizer None/None) is a complete compatibility-layer
+    # identity, not a missing field.
+    assert RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        normalizer_id=None,
+        normalizer_version=None,
+    ).is_fully_specified
+    assert RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
     ).is_fully_specified
 
 
 # -- record_baseline_certificate(): fail-closed validation -------------------
 
+
 def test_pass_certificate_requires_evidence_reference(db_conn, registered_worker, profile):
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.PASS, evidence_ref="   ", reason="ok",
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="   ",
+        reason="ok",
     )
     assert result == SecurityCertificationResult(False, "missing_evidence_reference")
 
@@ -130,8 +171,12 @@ def test_fail_certificate_also_requires_evidence_reference(db_conn, registered_w
     """A certificate is never a bare boolean -- FAIL needs provenance
     exactly as much as PASS does."""
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.FAIL, evidence_ref="", reason="unsafe",
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.FAIL,
+        evidence_ref="",
+        reason="unsafe",
     )
     assert not result.ok
     assert result.reason == "missing_evidence_reference"
@@ -139,12 +184,17 @@ def test_fail_certificate_also_requires_evidence_reference(db_conn, registered_w
 
 def test_hard_disqualified_requires_at_least_one_disqualifier(db_conn, registered_worker, profile):
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED, evidence_ref="ev", reason="bad",
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.HARD_DISQUALIFIED,
+        evidence_ref="ev",
+        reason="bad",
         hard_disqualifiers=(),
     )
     assert result == SecurityCertificationResult(
-        False, "hard_disqualified_requires_at_least_one_disqualifier",
+        False,
+        "hard_disqualified_requires_at_least_one_disqualifier",
     )
 
 
@@ -152,12 +202,17 @@ def test_pass_outcome_rejects_disqualifiers_being_attached(db_conn, registered_w
     """A hard disqualifier can never be silently attached to a PASS --
     that inconsistency is refused outright, never coerced."""
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile=profile,
-        outcome=SecurityBaselineOutcome.PASS, evidence_ref="ev", reason="ok",
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="ev",
+        reason="ok",
         hard_disqualifiers=(HardDisqualifierCategory.DESTRUCTIVE_BEHAVIOR,),
     )
     assert result == SecurityCertificationResult(
-        False, "hard_disqualifiers_only_valid_for_hard_disqualified_outcome",
+        False,
+        "hard_disqualifiers_only_valid_for_hard_disqualified_outcome",
     )
 
 
@@ -169,22 +224,30 @@ def test_certificate_for_unregistered_worker_is_refused(db_conn, profile):
 
 def test_malformed_outcome_type_is_refused(db_conn, registered_worker, profile):
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile=profile,
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
         outcome="PASS",  # a plain string, not SecurityBaselineOutcome.PASS
-        evidence_ref="ev", reason="ok",
+        evidence_ref="ev",
+        reason="ok",
     )
     assert result == SecurityCertificationResult(False, "malformed_certificate_request")
 
 
 def test_malformed_runtime_profile_type_is_refused(db_conn, registered_worker):
     result = record_baseline_certificate(
-        db_conn, worker_id=registered_worker, runtime_profile="devstral:24b",
-        outcome=SecurityBaselineOutcome.PASS, evidence_ref="ev", reason="ok",
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile="devstral:24b",
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="ev",
+        reason="ok",
     )
     assert result == SecurityCertificationResult(False, "malformed_certificate_request")
 
 
 # -- persistence round-trip -----------------------------------------------
+
 
 def test_certificate_round_trip_across_reopen(tmp_path):
     path = tmp_path / "state.db"
@@ -193,8 +256,12 @@ def test_certificate_round_trip_across_reopen(tmp_path):
     WorkersRepo(conn).register(worker_id="w1", kind="fake", network_class="local")
     profile_ = RuntimeProfileIdentity(model_tag="devstral:24b", runtime_version="0.1.0")
     result = record_baseline_certificate(
-        conn, worker_id="w1", runtime_profile=profile_, outcome=SecurityBaselineOutcome.PASS,
-        evidence_ref="conformance-run-abc", reason="baseline_checks_passed",
+        conn,
+        worker_id="w1",
+        runtime_profile=profile_,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="conformance-run-abc",
+        reason="baseline_checks_passed",
     )
     assert result.ok
     certificate_id = result.certificate.certificate_id
@@ -216,6 +283,7 @@ def test_certificate_round_trip_across_reopen(tmp_path):
 
 # -- append-only schema -------------------------------------------------
 
+
 def test_certificate_table_is_append_only(db_conn, registered_worker, profile):
     result = _pass(db_conn, registered_worker, profile)
     with pytest.raises(sqlite3.IntegrityError):
@@ -233,12 +301,13 @@ def test_certificate_table_is_append_only(db_conn, registered_worker, profile):
 
 # -- audit/provenance -----------------------------------------------------
 
+
 def test_recording_a_certificate_is_audited(db_conn, registered_worker, profile):
     result = _pass(db_conn, registered_worker, profile, reason="baseline_checks_passed")
     rows = [
-        dict(r) for r in db_conn.execute(
-            "SELECT event_type, payload_json FROM audit_events WHERE task_id IS NULL "
-            "ORDER BY seq",
+        dict(r)
+        for r in db_conn.execute(
+            "SELECT event_type, payload_json FROM audit_events WHERE task_id IS NULL ORDER BY seq",
         )
     ]
     matching = [r for r in rows if r["event_type"] == "SECURITY_BASELINE_CERTIFICATE_RECORDED"]
@@ -252,11 +321,14 @@ def test_recording_a_certificate_is_audited(db_conn, registered_worker, profile)
 
 
 def test_hard_disqualified_certificate_is_also_audited_with_its_categories(
-    db_conn, registered_worker, profile,
+    db_conn,
+    registered_worker,
+    profile,
 ):
     _hard_disqualified(db_conn, registered_worker, profile)
     rows = [
-        dict(r) for r in db_conn.execute(
+        dict(r)
+        for r in db_conn.execute(
             "SELECT payload_json FROM audit_events WHERE event_type = ?",
             (EventType.SECURITY_BASELINE_CERTIFICATE_RECORDED.value,),
         )
@@ -267,6 +339,7 @@ def test_hard_disqualified_certificate_is_also_audited_with_its_categories(
 
 
 # -- registration/trust never fabricate a certificate ------------------------
+
 
 def test_worker_registration_creates_no_security_certificate(db_conn):
     WorkersRepo(db_conn).register(worker_id="fresh-worker", kind="fake", network_class="local")
@@ -279,11 +352,17 @@ def test_trust_promotion_creates_no_security_certificate(db_conn, registered_wor
 
     responses = _passing_conformance_responses()
     suite = run_conformance_suite(
-        db_conn, FakeWorkerAdapter(responses), worker_id=registered_worker, role="coder",
+        db_conn,
+        FakeWorkerAdapter(responses),
+        worker_id=registered_worker,
+        role="coder",
     )
     assert suite.ok and suite.status == "PASSED"
     promotion = promote_from_conformance(
-        db_conn, worker_id=registered_worker, role="coder", capability="read_file",
+        db_conn,
+        worker_id=registered_worker,
+        role="coder",
+        capability="read_file",
         run_id=suite.run_id,
     )
     assert promotion.ok
@@ -291,6 +370,7 @@ def test_trust_promotion_creates_no_security_certificate(db_conn, registered_wor
 
 
 # -- certificate never mutates trust -----------------------------------------
+
 
 def test_recording_any_certificate_outcome_never_changes_trust(db_conn, registered_worker, profile):
     manager = WorkerTrustManager(db_conn)
@@ -300,3 +380,77 @@ def test_recording_any_certificate_outcome_never_changes_trust(db_conn, register
     _hard_disqualified(db_conn, registered_worker, profile, evidence_ref="ev3")
     after = manager.current_trust(registered_worker, "coder", "read_file")
     assert before == after == TrustLevel.LOCKED
+
+
+# -- compatibility-normalizer identity is exact, not a wildcard --------------
+
+
+def test_native_and_normalized_runtime_identities_do_not_match():
+    native = RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+    )
+    normalized = RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    assert not native.matches(normalized)
+    assert not normalized.matches(native)
+    assert native.matches(
+        RuntimeProfileIdentity(
+            model_tag="m",
+            model_digest="d",
+            endpoint="e",
+            runtime_version="v",
+        )
+    )
+
+
+def test_incomplete_normalizer_pair_is_refused_at_construction():
+    with pytest.raises(ValueError, match="both be set"):
+        RuntimeProfileIdentity(
+            model_tag="m",
+            normalizer_id="qwen_textual_tool_v1",
+        )
+    with pytest.raises(ValueError, match="both be set"):
+        RuntimeProfileIdentity(model_tag="m", normalizer_version=1)
+    with pytest.raises(ValueError):
+        RuntimeProfileIdentity(
+            model_tag="m",
+            normalizer_id="qwen_textual_tool_v1",
+            normalizer_version=0,
+        )
+
+
+def test_certificate_persists_normalizer_identity(db_conn, registered_worker):
+    profile = RuntimeProfileIdentity(
+        model_tag="m",
+        model_digest="d",
+        endpoint="e",
+        runtime_version="v",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    result = _pass(db_conn, registered_worker, profile)
+    assert result.ok
+    assert result.certificate.normalizer_id == "qwen_textual_tool_v1"
+    assert result.certificate.normalizer_version == 1
+    native = _pass(
+        db_conn,
+        registered_worker,
+        RuntimeProfileIdentity(
+            model_tag="m",
+            model_digest="d",
+            endpoint="e",
+            runtime_version="v",
+        ),
+        evidence_ref="evidence-native",
+    )
+    assert native.certificate.normalizer_id is None
+    assert native.certificate.normalizer_version is None

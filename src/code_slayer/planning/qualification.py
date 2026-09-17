@@ -385,24 +385,33 @@ class TrialOutcome(StrEnum):
 
 # A genuine, authorized `emit_engineering_plan` tool call was made for
 # every one of these six outcomes.
-_GENUINE_TOOL_CALL_OUTCOMES = frozenset({
-    TrialOutcome.TOOL_SCHEMA_INVALID,
-    TrialOutcome.POLICY_VIOLATION,
-    TrialOutcome.SCOPE_VIOLATION,
-    TrialOutcome.PLAN_VALIDATION_REJECTED,
-    TrialOutcome.TASK_NOT_RELEVANT,
-    TrialOutcome.VALID_STRUCTURED_PLAN,
-})
-_SCHEMA_VALID_OUTCOMES = frozenset({
-    TrialOutcome.POLICY_VIOLATION, TrialOutcome.SCOPE_VIOLATION,
-    TrialOutcome.PLAN_VALIDATION_REJECTED, TrialOutcome.TASK_NOT_RELEVANT,
-    TrialOutcome.VALID_STRUCTURED_PLAN,
-})
+_GENUINE_TOOL_CALL_OUTCOMES = frozenset(
+    {
+        TrialOutcome.TOOL_SCHEMA_INVALID,
+        TrialOutcome.POLICY_VIOLATION,
+        TrialOutcome.SCOPE_VIOLATION,
+        TrialOutcome.PLAN_VALIDATION_REJECTED,
+        TrialOutcome.TASK_NOT_RELEVANT,
+        TrialOutcome.VALID_STRUCTURED_PLAN,
+    }
+)
+_SCHEMA_VALID_OUTCOMES = frozenset(
+    {
+        TrialOutcome.POLICY_VIOLATION,
+        TrialOutcome.SCOPE_VIOLATION,
+        TrialOutcome.PLAN_VALIDATION_REJECTED,
+        TrialOutcome.TASK_NOT_RELEVANT,
+        TrialOutcome.VALID_STRUCTURED_PLAN,
+    }
+)
 # Outcomes that never represent a real, assessable qualification attempt --
 # excluded from every rate's denominator in `aggregate_planner_trials`.
-_NON_ASSESSABLE_OUTCOMES = frozenset({
-    TrialOutcome.INVALID_ENVIRONMENT, TrialOutcome.OUTPUT_BUDGET_EXHAUSTED,
-})
+_NON_ASSESSABLE_OUTCOMES = frozenset(
+    {
+        TrialOutcome.INVALID_ENVIRONMENT,
+        TrialOutcome.OUTPUT_BUDGET_EXHAUSTED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -434,12 +443,37 @@ def _structural_fingerprint(output) -> str:
 
 # -- task-relevance: a deliberately weak, generic, deterministic check ------
 
-_ENGLISH_STOPWORDS = frozenset({
-    "about", "above", "after", "again", "against", "their", "there",
-    "these", "those", "which", "while", "would", "could", "should",
-    "where", "being", "other", "under", "using", "based", "every",
-    "before", "because", "without", "within", "still", "between",
-})
+_ENGLISH_STOPWORDS = frozenset(
+    {
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "their",
+        "there",
+        "these",
+        "those",
+        "which",
+        "while",
+        "would",
+        "could",
+        "should",
+        "where",
+        "being",
+        "other",
+        "under",
+        "using",
+        "based",
+        "every",
+        "before",
+        "because",
+        "without",
+        "within",
+        "still",
+        "between",
+    }
+)
 
 
 def _significant_words(text: str) -> frozenset[str]:
@@ -458,7 +492,8 @@ def _is_task_relevant(original_request: str, goal: str) -> bool:
 
 
 def _policy_or_scope_violation(
-    output, allowed_scope: tuple[str, ...] | None,
+    output,
+    allowed_scope: tuple[str, ...] | None,
 ) -> tuple[TrialOutcome, str] | None:
     """Deterministic, network-free check of a genuine, schema-valid
     plan's own claimed `affected_files` paths. Policy (always checked)
@@ -466,17 +501,19 @@ def _policy_or_scope_violation(
     is never also reported as a scope violation. Returns `None` when
     neither applies. See the module docstring's "Scope/policy violation"
     section."""
-    policy_rejected = sorted({
-        f.path for f in output.affected_files
-        if not _is_policy_safe_path(f.path)
-    })
+    policy_rejected = sorted(
+        {f.path for f in output.affected_files if not _is_policy_safe_path(f.path)}
+    )
     if policy_rejected:
         return TrialOutcome.POLICY_VIOLATION, _bounded(",".join(policy_rejected))
     if allowed_scope is not None:
-        out_of_scope = sorted({
-            f.path for f in output.affected_files
-            if not any(files.within(f.path, scope) for scope in allowed_scope)
-        })
+        out_of_scope = sorted(
+            {
+                f.path
+                for f in output.affected_files
+                if not any(files.within(f.path, scope) for scope in allowed_scope)
+            }
+        )
         if out_of_scope:
             return TrialOutcome.SCOPE_VIOLATION, _bounded(",".join(out_of_scope))
     return None
@@ -491,8 +528,11 @@ def _is_policy_safe_path(path: str) -> bool:
 
 
 def classify_planner_response(
-    response: PlannerResponse, snapshot: Snapshot | None = None,
-    *, original_request: str | None = None, allowed_scope: tuple[str, ...] | None = None,
+    response: PlannerResponse,
+    snapshot: Snapshot | None = None,
+    *,
+    original_request: str | None = None,
+    allowed_scope: tuple[str, ...] | None = None,
 ) -> tuple[TrialOutcome, str | None, str | None]:
     """Pure function: never calls a model, never mutates anything.
     `finish_reason == "length"` is checked first, before anything else --
@@ -538,18 +578,21 @@ def classify_planner_response(
         if validation.blocking:
             return (
                 TrialOutcome.PLAN_VALIDATION_REJECTED,
-                _bounded(";".join(validation.issues)), "DRAFT",
+                _bounded(";".join(validation.issues)),
+                "DRAFT",
             )
         hint = "NEEDS_INPUT" if validation.content.open_questions else "READY"
     else:
         hint = None
 
     if original_request is not None and not _is_task_relevant(
-        original_request, response.output.goal,
+        original_request,
+        response.output.goal,
     ):
         return (
             TrialOutcome.TASK_NOT_RELEVANT,
-            "goal shares no significant word with the original task", None,
+            "goal shares no significant word with the original task",
+            None,
         )
 
     return TrialOutcome.VALID_STRUCTURED_PLAN, None, hint
@@ -650,7 +693,8 @@ def estimate_request_token_measurement(request: PlannerRequest) -> TokenMeasurem
     """`estimate_request_tokens()` wrapped with its own confidence
     provenance -- always `ESTIMATED`."""
     return TokenMeasurement(
-        source=TokenMeasurementSource.ESTIMATED, token_count=estimate_request_tokens(request),
+        source=TokenMeasurementSource.ESTIMATED,
+        token_count=estimate_request_tokens(request),
         request_fingerprint=_rendered_request_fingerprint(request),
         method=f"char_heuristic:chars_per_token={_CHARS_PER_TOKEN_CONSERVATIVE}",
     )
@@ -662,7 +706,8 @@ def actual_evaluated_measurement_from_usage(request: PlannerRequest, usage) -> T
     the full untruncated request survived. See `VerifiedExpectedInput`/
     `verify_full_input_preservation()` for the stronger claim."""
     return TokenMeasurement(
-        source=TokenMeasurementSource.ACTUAL_EVALUATED, token_count=usage.prompt_tokens,
+        source=TokenMeasurementSource.ACTUAL_EVALUATED,
+        token_count=usage.prompt_tokens,
         request_fingerprint=_rendered_request_fingerprint(request),
         method="runtime_usage_prompt_tokens",
     )
@@ -693,7 +738,9 @@ class FullInputPreservationResult:
 
 
 def verify_full_input_preservation(
-    request: PlannerRequest, actual_evaluated_tokens: int, expected: VerifiedExpectedInput,
+    request: PlannerRequest,
+    actual_evaluated_tokens: int,
+    expected: VerifiedExpectedInput,
 ) -> FullInputPreservationResult:
     """`verified=True` only when the *current* request's own fingerprint
     matches `expected.request_fingerprint` exactly AND `actual_evaluated_
@@ -703,25 +750,33 @@ def verify_full_input_preservation(
     current_fp = _rendered_request_fingerprint(request)
     if current_fp != expected.request_fingerprint:
         return FullInputPreservationResult(
-            verified=False, reason="request_fingerprint_mismatch_expected_measurement_stale",
+            verified=False,
+            reason="request_fingerprint_mismatch_expected_measurement_stale",
             measurement=TokenMeasurement(
-                source=TokenMeasurementSource.ACTUAL_EVALUATED, token_count=actual_evaluated_tokens,
-                request_fingerprint=current_fp, method="runtime_usage_prompt_tokens",
+                source=TokenMeasurementSource.ACTUAL_EVALUATED,
+                token_count=actual_evaluated_tokens,
+                request_fingerprint=current_fp,
+                method="runtime_usage_prompt_tokens",
             ),
         )
     if actual_evaluated_tokens < expected.expected_tokens:
         return FullInputPreservationResult(
-            verified=False, reason="input_truncated",
+            verified=False,
+            reason="input_truncated",
             measurement=TokenMeasurement(
-                source=TokenMeasurementSource.ACTUAL_EVALUATED, token_count=actual_evaluated_tokens,
-                request_fingerprint=current_fp, method="runtime_usage_prompt_tokens",
+                source=TokenMeasurementSource.ACTUAL_EVALUATED,
+                token_count=actual_evaluated_tokens,
+                request_fingerprint=current_fp,
+                method="runtime_usage_prompt_tokens",
             ),
         )
     if actual_evaluated_tokens > expected.expected_tokens:
         return FullInputPreservationResult(
-            verified=False, reason="unexpected_growth_vs_verified_baseline",
+            verified=False,
+            reason="unexpected_growth_vs_verified_baseline",
             measurement=TokenMeasurement(
-                source=TokenMeasurementSource.UNKNOWN, token_count=None,
+                source=TokenMeasurementSource.UNKNOWN,
+                token_count=None,
                 request_fingerprint=current_fp,
                 method=(
                     f"runtime_usage_prompt_tokens={actual_evaluated_tokens}_exceeds_"
@@ -730,10 +785,13 @@ def verify_full_input_preservation(
             ),
         )
     return FullInputPreservationResult(
-        verified=True, reason="full_input_preservation_verified",
+        verified=True,
+        reason="full_input_preservation_verified",
         measurement=TokenMeasurement(
-            source=TokenMeasurementSource.VERIFIED_FULL_INPUT, token_count=actual_evaluated_tokens,
-            request_fingerprint=current_fp, method=f"verified_expected:{expected.method}",
+            source=TokenMeasurementSource.VERIFIED_FULL_INPUT,
+            token_count=actual_evaluated_tokens,
+            request_fingerprint=current_fp,
+            method=f"verified_expected:{expected.method}",
         ),
     )
 
@@ -753,6 +811,13 @@ class RuntimeContextProfile:
     tool_choice_enforcement: str = "ADVISORY_ONLY_UNVERIFIED"
     output_budget_enforcement_verified: bool = False
     notes: str | None = None
+    # Security-relevant runtime configuration of the Tool Protocol
+    # Compatibility Layer -- both None means native-only (the default,
+    # matching every existing caller). Both set names the exact
+    # `workers.protocol_normalization` decoder this runtime is
+    # configured to use. Never inferred from a model response.
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag:
@@ -761,6 +826,20 @@ class RuntimeContextProfile:
             value = getattr(self, name)
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if (self.normalizer_id is None) != (self.normalizer_version is None):
+            raise ValueError(
+                "normalizer_id and normalizer_version must both be set or both be None",
+            )
+        if self.normalizer_id is not None and (
+            not isinstance(self.normalizer_id, str) or not self.normalizer_id.strip()
+        ):
+            raise ValueError("normalizer_id must be a non-empty string or None")
+        if self.normalizer_version is not None and (
+            not isinstance(self.normalizer_version, int)
+            or isinstance(self.normalizer_version, bool)
+            or self.normalizer_version < 1
+        ):
+            raise ValueError("normalizer_version must be a positive integer or None")
 
     def required_context_tokens(self, measured_input_tokens: int) -> int:
         return measured_input_tokens + self.output_token_budget + self.safety_margin_tokens
@@ -778,7 +857,9 @@ class PreflightResult:
 
 
 def preflight_check(
-    request: PlannerRequest, profile: RuntimeContextProfile, *,
+    request: PlannerRequest,
+    profile: RuntimeContextProfile,
+    *,
     exact_counter: TokenCounter | None = None,
 ) -> PreflightResult:
     """Pure, no network call unless `exact_counter` is supplied and
@@ -794,7 +875,9 @@ def preflight_check(
     required_with_estimate = profile.required_context_tokens(estimate.token_count)
     if required_with_estimate <= profile.effective_context_tokens:
         return PreflightResult(
-            fits=True, measurement=estimate, required_context_tokens=required_with_estimate,
+            fits=True,
+            measurement=estimate,
+            required_context_tokens=required_with_estimate,
             effective_context_tokens=profile.effective_context_tokens,
         )
     if exact_counter is not None:
@@ -806,7 +889,8 @@ def preflight_check(
             required_with_exact = profile.required_context_tokens(exact.token_count)
             return PreflightResult(
                 fits=required_with_exact <= profile.effective_context_tokens,
-                measurement=exact, required_context_tokens=required_with_exact,
+                measurement=exact,
+                required_context_tokens=required_with_exact,
                 effective_context_tokens=profile.effective_context_tokens,
             )
         # A counter that could not report VERIFIED_FULL_INPUT never
@@ -814,17 +898,24 @@ def preflight_check(
         # hopeless-check-or-proceed logic as if none had been supplied.
     if required_with_estimate > profile.effective_context_tokens * _HOPELESS_OVERFLOW_MULTIPLIER:
         return PreflightResult(
-            fits=False, measurement=estimate, required_context_tokens=required_with_estimate,
+            fits=False,
+            measurement=estimate,
+            required_context_tokens=required_with_estimate,
             effective_context_tokens=profile.effective_context_tokens,
         )
     return PreflightResult(
-        fits=True, measurement=estimate, required_context_tokens=required_with_estimate,
+        fits=True,
+        measurement=estimate,
+        required_context_tokens=required_with_estimate,
         effective_context_tokens=profile.effective_context_tokens,
     )
 
 
 def _run_planner_trial_with_response(
-    planner: Planner, request: PlannerRequest, *, snapshot: Snapshot | None = None,
+    planner: Planner,
+    request: PlannerRequest,
+    *,
+    snapshot: Snapshot | None = None,
     context_profile: RuntimeContextProfile | None = None,
     exact_counter: TokenCounter | None = None,
     verified_expected_input: VerifiedExpectedInput | None = None,
@@ -862,7 +953,8 @@ def _run_planner_trial_with_response(
         preflight = preflight_check(request, context_profile, exact_counter=exact_counter)
         if not preflight.fits:
             return PlannerTrial(
-                outcome=TrialOutcome.INVALID_ENVIRONMENT, latency_seconds=0.0,
+                outcome=TrialOutcome.INVALID_ENVIRONMENT,
+                latency_seconds=0.0,
                 detail=(
                     f"required_context_tokens={preflight.required_context_tokens} "
                     f"exceeds effective_context_tokens={preflight.effective_context_tokens} "
@@ -875,7 +967,8 @@ def _run_planner_trial_with_response(
     latency = time.monotonic() - started
     if not isinstance(response, PlannerResponse):
         response = PlannerResponse(
-            PlannerOutcome.MALFORMED, error="planner_returned_non_planner_response",
+            PlannerOutcome.MALFORMED,
+            error="planner_returned_non_planner_response",
             failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
         )
 
@@ -886,7 +979,8 @@ def _run_planner_trial_with_response(
             if preservation.reason != "request_fingerprint_mismatch_expected_measurement_stale":
                 if not preservation.verified:
                     return PlannerTrial(
-                        outcome=TrialOutcome.INVALID_ENVIRONMENT, latency_seconds=latency,
+                        outcome=TrialOutcome.INVALID_ENVIRONMENT,
+                        latency_seconds=latency,
                         detail=(
                             f"{preservation.reason}: actual_evaluated_input_tokens={actual} "
                             f"expected_untruncated_input_tokens={verified_expected_input.expected_tokens}"
@@ -897,7 +991,8 @@ def _run_planner_trial_with_response(
                 # No verified baseline applies to this (different)
                 # fingerprint -- fall back to the weaker ceiling check.
                 return PlannerTrial(
-                    outcome=TrialOutcome.INVALID_ENVIRONMENT, latency_seconds=latency,
+                    outcome=TrialOutcome.INVALID_ENVIRONMENT,
+                    latency_seconds=latency,
                     detail=(
                         f"observed usage.prompt_tokens={actual} >= "
                         f"effective_context_tokens={context_profile.effective_context_tokens}: "
@@ -907,7 +1002,8 @@ def _run_planner_trial_with_response(
                 ), response
         elif actual >= context_profile.effective_context_tokens:
             return PlannerTrial(
-                outcome=TrialOutcome.INVALID_ENVIRONMENT, latency_seconds=latency,
+                outcome=TrialOutcome.INVALID_ENVIRONMENT,
+                latency_seconds=latency,
                 detail=(
                     f"observed usage.prompt_tokens={actual} >= "
                     f"effective_context_tokens={context_profile.effective_context_tokens}: "
@@ -916,19 +1012,26 @@ def _run_planner_trial_with_response(
             ), response
 
     outcome, detail, hint = classify_planner_response(
-        response, snapshot,
+        response,
+        snapshot,
         original_request=request.original_request if check_task_relevance else None,
         allowed_scope=allowed_scope,
     )
     fingerprint = _structural_fingerprint(response.output) if response.output is not None else None
     return PlannerTrial(
-        outcome=outcome, latency_seconds=latency, detail=detail,
-        plan_state_hint=hint, goal_fingerprint=fingerprint,
+        outcome=outcome,
+        latency_seconds=latency,
+        detail=detail,
+        plan_state_hint=hint,
+        goal_fingerprint=fingerprint,
     ), response
 
 
 def run_planner_trial(
-    planner: Planner, request: PlannerRequest, *, snapshot: Snapshot | None = None,
+    planner: Planner,
+    request: PlannerRequest,
+    *,
+    snapshot: Snapshot | None = None,
     context_profile: RuntimeContextProfile | None = None,
     exact_counter: TokenCounter | None = None,
     verified_expected_input: VerifiedExpectedInput | None = None,
@@ -939,16 +1042,25 @@ def run_planner_trial(
     classified. See `_run_planner_trial_with_response()` for the full
     behavior; this public wrapper discards the raw response."""
     trial, _response = _run_planner_trial_with_response(
-        planner, request, snapshot=snapshot, context_profile=context_profile,
-        exact_counter=exact_counter, verified_expected_input=verified_expected_input,
-        check_task_relevance=check_task_relevance, allowed_scope=allowed_scope,
+        planner,
+        request,
+        snapshot=snapshot,
+        context_profile=context_profile,
+        exact_counter=exact_counter,
+        verified_expected_input=verified_expected_input,
+        check_task_relevance=check_task_relevance,
+        allowed_scope=allowed_scope,
     )
     return trial
 
 
 def run_planner_case(
-    planner: Planner, request: PlannerRequest, *, repetitions: int,
-    snapshot: Snapshot | None = None, warm_up: bool = False,
+    planner: Planner,
+    request: PlannerRequest,
+    *,
+    repetitions: int,
+    snapshot: Snapshot | None = None,
+    warm_up: bool = False,
     context_profile: RuntimeContextProfile | None = None,
 ) -> tuple[tuple[PlannerTrial, ...], float | None]:
     """Run `repetitions` identical trials (same `request` every time)."""
@@ -957,7 +1069,10 @@ def run_planner_case(
     cold_start_seconds = None
     if warm_up:
         cold_start_seconds = run_planner_trial(
-            planner, request, snapshot=snapshot, context_profile=context_profile,
+            planner,
+            request,
+            snapshot=snapshot,
+            context_profile=context_profile,
         ).latency_seconds
     trials = tuple(
         run_planner_trial(planner, request, snapshot=snapshot, context_profile=context_profile)
@@ -991,7 +1106,8 @@ def run_tool_transport_trial(adapter: WorkerAdapter, request: WorkerRequest) -> 
         latency = time.monotonic() - started
         reason = str(exc)
         outcome = (
-            ToolTransportOutcome.TRANSPORT_TIMEOUT if "timeout" in reason
+            ToolTransportOutcome.TRANSPORT_TIMEOUT
+            if "timeout" in reason
             else ToolTransportOutcome.TRANSPORT_ERROR
         )
         return ToolTransportTrial(outcome=outcome, latency_seconds=latency, detail=_bounded(reason))
@@ -999,21 +1115,28 @@ def run_tool_transport_trial(adapter: WorkerAdapter, request: WorkerRequest) -> 
     validation = validate_response(request, response)
     if validation.executable:
         return ToolTransportTrial(
-            outcome=ToolTransportOutcome.GENUINE_TOOL_CALL, latency_seconds=latency,
+            outcome=ToolTransportOutcome.GENUINE_TOOL_CALL,
+            latency_seconds=latency,
         )
     if response.kind == WorkerResponseKind.TEXT:
         return ToolTransportTrial(
-            outcome=ToolTransportOutcome.NON_TOOL_RESPONSE, latency_seconds=latency,
+            outcome=ToolTransportOutcome.NON_TOOL_RESPONSE,
+            latency_seconds=latency,
             detail=_bounded(validation.reason),
         )
     return ToolTransportTrial(
-        outcome=ToolTransportOutcome.MALFORMED_TOOL_CALL, latency_seconds=latency,
+        outcome=ToolTransportOutcome.MALFORMED_TOOL_CALL,
+        latency_seconds=latency,
         detail=_bounded(validation.reason),
     )
 
 
 def run_tool_transport_case(
-    adapter: WorkerAdapter, request: WorkerRequest, *, repetitions: int, warm_up: bool = False,
+    adapter: WorkerAdapter,
+    request: WorkerRequest,
+    *,
+    repetitions: int,
+    warm_up: bool = False,
 ) -> tuple[tuple[ToolTransportTrial, ...], float | None]:
     if not isinstance(repetitions, int) or repetitions < 1:
         raise ValueError("repetitions must be a positive integer")
@@ -1065,7 +1188,10 @@ class CaseMetrics:
 
 
 def aggregate_planner_trials(
-    case: str, candidate: str, trials: Sequence[PlannerTrial], *,
+    case: str,
+    candidate: str,
+    trials: Sequence[PlannerTrial],
+    *,
     cold_start_seconds: float | None = None,
 ) -> CaseMetrics:
     if not trials:
@@ -1090,7 +1216,9 @@ def aggregate_planner_trials(
         return (numerator / assessable) if assessable else None
 
     return CaseMetrics(
-        case=case, candidate=candidate, repetitions=total,
+        case=case,
+        candidate=candidate,
+        repetitions=total,
         assessable_repetitions=assessable,
         non_assessable_count=non_assessable,
         non_assessable_rate=non_assessable / total,
@@ -1123,9 +1251,7 @@ def observe_determinism(trials: Sequence[PlannerTrial]) -> dict:
 
 def payload_fingerprint(payload: dict) -> str:
     tools = payload.get("tools") or []
-    tool_names = sorted(
-        t.get("function", {}).get("name", "") for t in tools if isinstance(t, dict)
-    )
+    tool_names = sorted(t.get("function", {}).get("name", "") for t in tools if isinstance(t, dict))
     return hashlib.sha256(
         (
             f"model={payload.get('model')};tool_choice={payload.get('tool_choice')};"
@@ -1140,14 +1266,16 @@ def payload_fingerprint(payload: dict) -> str:
 DEFAULT_MAX_CORRECTION_ATTEMPTS = 2
 DEFAULT_EARLY_STOP_AFTER_CONSECUTIVE_TRANSPORT_FAILURES = 3
 
-_CORRECTABLE_OUTCOMES = frozenset({
-    TrialOutcome.NON_TOOL_RESPONSE,
-    TrialOutcome.TOOL_SCHEMA_INVALID,
-    TrialOutcome.POLICY_VIOLATION,
-    TrialOutcome.SCOPE_VIOLATION,
-    TrialOutcome.PLAN_VALIDATION_REJECTED,
-    TrialOutcome.TASK_NOT_RELEVANT,
-})
+_CORRECTABLE_OUTCOMES = frozenset(
+    {
+        TrialOutcome.NON_TOOL_RESPONSE,
+        TrialOutcome.TOOL_SCHEMA_INVALID,
+        TrialOutcome.POLICY_VIOLATION,
+        TrialOutcome.SCOPE_VIOLATION,
+        TrialOutcome.PLAN_VALIDATION_REJECTED,
+        TrialOutcome.TASK_NOT_RELEVANT,
+    }
+)
 
 
 class QualificationOutcome(StrEnum):
@@ -1209,14 +1337,17 @@ class CorrectionFeedback:
 
 
 def _build_feedback(
-    qualification_class: str, attempt_number: int, trial: PlannerTrial,
+    qualification_class: str,
+    attempt_number: int,
+    trial: PlannerTrial,
 ) -> CorrectionFeedback | None:
     if trial.outcome not in _CORRECTABLE_OUTCOMES:
         return None
     if trial.outcome == TrialOutcome.POLICY_VIOLATION:
         paths = trial.detail or "one or more claimed paths"
         return CorrectionFeedback(
-            qualification_class=qualification_class, attempt_number=attempt_number,
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
             failure_category=trial.outcome.value,
             expected_behaviour=(
                 "Every affected-file path must be a safe, plain relative path inside the "
@@ -1232,7 +1363,8 @@ def _build_feedback(
     if trial.outcome == TrialOutcome.SCOPE_VIOLATION:
         paths = trial.detail or "one or more claimed paths"
         return CorrectionFeedback(
-            qualification_class=qualification_class, attempt_number=attempt_number,
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
             failure_category=trial.outcome.value,
             expected_behaviour="Only the paths explicitly allowed for this task may be affected.",
             observed_behaviour=(
@@ -1245,7 +1377,8 @@ def _build_feedback(
         )
     if trial.outcome == TrialOutcome.NON_TOOL_RESPONSE:
         return CorrectionFeedback(
-            qualification_class=qualification_class, attempt_number=attempt_number,
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
             failure_category=trial.outcome.value,
             expected_behaviour=(
                 f"Call the '{TOOL_NAME}' tool exactly once with your complete structured plan."
@@ -1258,7 +1391,8 @@ def _build_feedback(
         )
     if trial.outcome == TrialOutcome.TOOL_SCHEMA_INVALID:
         return CorrectionFeedback(
-            qualification_class=qualification_class, attempt_number=attempt_number,
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
             failure_category=trial.outcome.value,
             expected_behaviour=(
                 f"A '{TOOL_NAME}' tool call whose arguments exactly match its declared schema."
@@ -1273,7 +1407,8 @@ def _build_feedback(
         )
     if trial.outcome == TrialOutcome.TASK_NOT_RELEVANT:
         return CorrectionFeedback(
-            qualification_class=qualification_class, attempt_number=attempt_number,
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
             failure_category=trial.outcome.value,
             expected_behaviour="A goal that directly addresses the ORIGINAL_REQUEST given.",
             observed_behaviour="Your goal appears unrelated to the original task you were given.",
@@ -1284,7 +1419,8 @@ def _build_feedback(
         )
     issues = trial.detail or "one or more claims were rejected"
     return CorrectionFeedback(
-        qualification_class=qualification_class, attempt_number=attempt_number,
+        qualification_class=qualification_class,
+        attempt_number=attempt_number,
         failure_category=trial.outcome.value,
         expected_behaviour="Every concrete repository claim matches real repository evidence.",
         observed_behaviour=f"The following claims were rejected against real evidence: {issues}",
@@ -1329,11 +1465,18 @@ class AttemptProvenance:
     tool_choice_enforcement: str
     outcome: str
     environment_valid: bool
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
+    tool_call_transport: str | None = None
 
 
 def build_attempt_provenance(
-    *, qualification_class: str, request: PlannerRequest, profile: RuntimeContextProfile,
-    attempt_number: int, trial: PlannerTrial,
+    *,
+    qualification_class: str,
+    request: PlannerRequest,
+    profile: RuntimeContextProfile,
+    attempt_number: int,
+    trial: PlannerTrial,
     response: PlannerResponse | None = None,
     verified_expected_input: VerifiedExpectedInput | None = None,
 ) -> AttemptProvenance:
@@ -1349,7 +1492,9 @@ def build_attempt_provenance(
         actual_tokens = response.usage.prompt_tokens
         if verified_expected_input is not None:
             preservation = verify_full_input_preservation(
-                request, actual_tokens, verified_expected_input,
+                request,
+                actual_tokens,
+                verified_expected_input,
             )
             measurement = preservation.measurement
             full_input_verified = preservation.verified
@@ -1361,7 +1506,8 @@ def build_attempt_provenance(
         measurement = estimate_request_token_measurement(request)
     required = profile.required_context_tokens(measurement.token_count or 0)
     return AttemptProvenance(
-        qualification_class=qualification_class, model_tag=profile.model_tag,
+        qualification_class=qualification_class,
+        model_tag=profile.model_tag,
         model_digest=profile.model_digest,
         request_fingerprint=_fingerprint(prompt),
         task_fingerprint=_fingerprint(request.original_request),
@@ -1390,12 +1536,21 @@ def build_attempt_provenance(
         attempt_number=attempt_number,
         feedback_fingerprint=(
             _fingerprint(request.prior_attempt_feedback)
-            if request.prior_attempt_feedback is not None else None
+            if request.prior_attempt_feedback is not None
+            else None
         ),
-        endpoint=profile.endpoint, runtime_version=profile.runtime_version,
+        endpoint=profile.endpoint,
+        runtime_version=profile.runtime_version,
         tool_choice_enforcement=profile.tool_choice_enforcement,
         outcome=trial.outcome.value,
         environment_valid=trial.outcome != TrialOutcome.INVALID_ENVIRONMENT,
+        normalizer_id=profile.normalizer_id,
+        normalizer_version=profile.normalizer_version,
+        tool_call_transport=(
+            response.tool_call_transport.value
+            if response is not None and response.tool_call_transport is not None
+            else None
+        ),
     )
 
 
@@ -1420,7 +1575,10 @@ class QualificationAttemptResult:
 
 
 def run_planner_case_with_correction(
-    planner: Planner, request: PlannerRequest, *, qualification_class: str,
+    planner: Planner,
+    request: PlannerRequest,
+    *,
+    qualification_class: str,
     snapshot: Snapshot | None = None,
     max_correction_attempts: int = DEFAULT_MAX_CORRECTION_ATTEMPTS,
     context_profile: RuntimeContextProfile | None = None,
@@ -1454,33 +1612,47 @@ def run_planner_case_with_correction(
         return QualificationAttemptResult(
             qualification_class=qualification_class,
             outcome=QualificationOutcome.ENVIRONMENT_UNVERIFIED,
-            attempts=(), feedback=(), provenance=(),
+            attempts=(),
+            feedback=(),
+            provenance=(),
         )
     attempts: list[PlannerTrial] = []
     feedback_chain: list[CorrectionFeedback] = []
     provenance_chain: list[AttemptProvenance] = []
     current_request = request
     if (
-        context_profile is not None and context_profile.output_budget_enforcement_verified
+        context_profile is not None
+        and context_profile.output_budget_enforcement_verified
         and current_request.output_token_budget is None
     ):
         current_request = replace(
-            current_request, output_token_budget=context_profile.output_token_budget,
+            current_request,
+            output_token_budget=context_profile.output_token_budget,
         )
     attempt_number = 1
     while True:
         trial, response = _run_planner_trial_with_response(
-            planner, current_request, snapshot=snapshot, context_profile=context_profile,
-            exact_counter=exact_counter, verified_expected_input=verified_expected_input,
+            planner,
+            current_request,
+            snapshot=snapshot,
+            context_profile=context_profile,
+            exact_counter=exact_counter,
+            verified_expected_input=verified_expected_input,
             allowed_scope=allowed_scope,
         )
         attempts.append(trial)
         if context_profile is not None:
-            provenance_chain.append(build_attempt_provenance(
-                qualification_class=qualification_class, request=current_request,
-                profile=context_profile, attempt_number=attempt_number, trial=trial,
-                response=response, verified_expected_input=verified_expected_input,
-            ))
+            provenance_chain.append(
+                build_attempt_provenance(
+                    qualification_class=qualification_class,
+                    request=current_request,
+                    profile=context_profile,
+                    attempt_number=attempt_number,
+                    trial=trial,
+                    response=response,
+                    verified_expected_input=verified_expected_input,
+                )
+            )
         if trial.outcome == TrialOutcome.INVALID_ENVIRONMENT:
             outcome = QualificationOutcome.INVALID_ENVIRONMENT
             break
@@ -1489,7 +1661,8 @@ def run_planner_case_with_correction(
             break
         if trial.outcome == TrialOutcome.VALID_STRUCTURED_PLAN:
             outcome = (
-                QualificationOutcome.PASS_FIRST_TRY if attempt_number == 1
+                QualificationOutcome.PASS_FIRST_TRY
+                if attempt_number == 1
                 else QualificationOutcome.PASS_AFTER_FEEDBACK
             )
             break
@@ -1501,7 +1674,8 @@ def run_planner_case_with_correction(
             break
         if attempt_number > max_correction_attempts:
             outcome = _EXHAUSTED_FINAL_OUTCOME.get(
-                trial.outcome, QualificationOutcome.FAIL_CAPABILITY,
+                trial.outcome,
+                QualificationOutcome.FAIL_CAPABILITY,
             )
             break
         feedback = _build_feedback(qualification_class, attempt_number, trial)
@@ -1510,14 +1684,20 @@ def run_planner_case_with_correction(
         current_request = replace(current_request, prior_attempt_feedback=feedback.render())
         attempt_number += 1
     return QualificationAttemptResult(
-        qualification_class=qualification_class, outcome=outcome,
-        attempts=tuple(attempts), feedback=tuple(feedback_chain),
+        qualification_class=qualification_class,
+        outcome=outcome,
+        attempts=tuple(attempts),
+        feedback=tuple(feedback_chain),
         provenance=tuple(provenance_chain),
     )
 
 
 def run_corrected_planner_case(
-    planner: Planner, request: PlannerRequest, *, qualification_class: str, repetitions: int,
+    planner: Planner,
+    request: PlannerRequest,
+    *,
+    qualification_class: str,
+    repetitions: int,
     snapshot: Snapshot | None = None,
     max_correction_attempts: int = DEFAULT_MAX_CORRECTION_ATTEMPTS,
     early_stop_after_consecutive_transport_failures: int = (
@@ -1542,17 +1722,25 @@ def run_corrected_planner_case(
         raise ValueError(
             "early_stop_after_consecutive_transport_failures must be a positive integer",
         )
-    transport_outcomes = frozenset({
-        QualificationOutcome.FAIL_TRANSPORT_TIMEOUT, QualificationOutcome.FAIL_RUNTIME,
-    })
+    transport_outcomes = frozenset(
+        {
+            QualificationOutcome.FAIL_TRANSPORT_TIMEOUT,
+            QualificationOutcome.FAIL_RUNTIME,
+        }
+    )
     results: list[QualificationAttemptResult] = []
     consecutive_transport_failures = 0
     early_stopped = False
     for _ in range(repetitions):
         result = run_planner_case_with_correction(
-            planner, request, qualification_class=qualification_class, snapshot=snapshot,
-            max_correction_attempts=max_correction_attempts, context_profile=context_profile,
-            exact_counter=exact_counter, verified_expected_input=verified_expected_input,
+            planner,
+            request,
+            qualification_class=qualification_class,
+            snapshot=snapshot,
+            max_correction_attempts=max_correction_attempts,
+            context_profile=context_profile,
+            exact_counter=exact_counter,
+            verified_expected_input=verified_expected_input,
             unsafe_allow_unverified_environment=unsafe_allow_unverified_environment,
             allowed_scope=allowed_scope,
         )

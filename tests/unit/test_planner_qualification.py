@@ -25,6 +25,7 @@ from code_slayer.planning.planner import (
     PlannerRequest,
     PlannerResponse,
     PlannerStructuredOutput,
+    ToolCallTransport,
 )
 from code_slayer.planning.qualification import (
     DEFAULT_MAX_CORRECTION_ATTEMPTS,
@@ -96,15 +97,20 @@ def test_genuine_tool_call_classified_as_valid_structured_plan():
 
 
 def test_run_tool_transport_trial_counts_a_genuine_tool_call():
-    adapter = FakeWorkerAdapter([
-        WorkerResponse(
-            kind=WorkerResponseKind.TOOL_CALL,
-            tool_call=WorkerToolCall("read_file", {"path": "a"}),
-        ),
-    ])
+    adapter = FakeWorkerAdapter(
+        [
+            WorkerResponse(
+                kind=WorkerResponseKind.TOOL_CALL,
+                tool_call=WorkerToolCall("read_file", {"path": "a"}),
+            ),
+        ]
+    )
     request = WorkerRequest(
-        task_id="t", role="planner", original_prompt="read a",
-        allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED,
+        task_id="t",
+        role="planner",
+        original_prompt="read a",
+        allowed_tools=("read_file",),
+        tool_requirement=ToolRequirement.REQUIRED,
     )
     trial = run_tool_transport_trial(adapter, request)
     assert trial.outcome == ToolTransportOutcome.GENUINE_TOOL_CALL
@@ -115,7 +121,8 @@ def test_run_tool_transport_trial_counts_a_genuine_tool_call():
 
 def test_text_response_is_non_tool_response():
     response = PlannerResponse(
-        PlannerOutcome.MALFORMED, error="invalid_transport_response:text_response",
+        PlannerOutcome.MALFORMED,
+        error="invalid_transport_response:text_response",
         failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
     )
     outcome, _detail, _hint = classify_planner_response(response)
@@ -123,12 +130,17 @@ def test_text_response_is_non_tool_response():
 
 
 def test_tool_transport_text_response_is_non_tool_response():
-    adapter = FakeWorkerAdapter([
-        WorkerResponse(kind=WorkerResponseKind.TEXT, text="sure, I'll help"),
-    ])
+    adapter = FakeWorkerAdapter(
+        [
+            WorkerResponse(kind=WorkerResponseKind.TEXT, text="sure, I'll help"),
+        ]
+    )
     request = WorkerRequest(
-        task_id="t", role="planner", original_prompt="read a",
-        allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED,
+        task_id="t",
+        role="planner",
+        original_prompt="read a",
+        allowed_tools=("read_file",),
+        tool_requirement=ToolRequirement.REQUIRED,
     )
     trial = run_tool_transport_trial(adapter, request)
     assert trial.outcome == ToolTransportOutcome.NON_TOOL_RESPONSE
@@ -139,11 +151,13 @@ def test_tool_transport_text_response_is_non_tool_response():
 
 def test_transport_timeout_is_distinct_from_other_transport_errors():
     timeout = PlannerResponse(
-        PlannerOutcome.MALFORMED, error="adapter_error:transport_timeout",
+        PlannerOutcome.MALFORMED,
+        error="adapter_error:transport_timeout",
         failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
     )
     other = PlannerResponse(
-        PlannerOutcome.MALFORMED, error="adapter_error:transport_connection_failed",
+        PlannerOutcome.MALFORMED,
+        error="adapter_error:transport_connection_failed",
         failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
     )
     assert classify_planner_response(timeout)[0] == TrialOutcome.TRANSPORT_TIMEOUT
@@ -165,7 +179,8 @@ def test_tool_transport_timeout_is_distinct_from_other_transport_errors():
 
 def test_schema_invalid_tool_call_is_distinct_from_non_tool_response():
     response = PlannerResponse(
-        PlannerOutcome.MALFORMED, error="malformed_structured_output",
+        PlannerOutcome.MALFORMED,
+        error="malformed_structured_output",
         failure_category=PlannerFailureCategory.SCHEMA_INVALID,
     )
     outcome, _detail, _hint = classify_planner_response(response)
@@ -193,9 +208,11 @@ def test_classification_never_reads_raw_text_or_error_prose():
 def test_evidence_grounded_rejection_uses_only_the_existing_strict_validator(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
     # Claims to modify a file that does not exist in the real snapshot.
-    response = _structured(affected_files=(
-        PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
-    ))
+    response = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
+        )
+    )
     outcome, detail, hint = classify_planner_response(response, snapshot)
     assert outcome == TrialOutcome.PLAN_VALIDATION_REJECTED
     assert hint == "DRAFT"
@@ -215,18 +232,42 @@ def test_evidence_grounded_success_reports_ready_or_needs_input(git_repo_with_co
 def test_metrics_aggregate_exact_counts_and_rates():
     trials = (
         run_planner_trial(FakePlanner([_structured()]), _REQUEST),
-        run_planner_trial(FakePlanner([PlannerResponse(
-            PlannerOutcome.MALFORMED, error="adapter_error:transport_timeout",
-            failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
-        )]), _REQUEST),
-        run_planner_trial(FakePlanner([PlannerResponse(
-            PlannerOutcome.MALFORMED, error="invalid_transport_response:text_response",
-            failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
-        )]), _REQUEST),
-        run_planner_trial(FakePlanner([PlannerResponse(
-            PlannerOutcome.MALFORMED, error="malformed_structured_output",
-            failure_category=PlannerFailureCategory.SCHEMA_INVALID,
-        )]), _REQUEST),
+        run_planner_trial(
+            FakePlanner(
+                [
+                    PlannerResponse(
+                        PlannerOutcome.MALFORMED,
+                        error="adapter_error:transport_timeout",
+                        failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
+                    )
+                ]
+            ),
+            _REQUEST,
+        ),
+        run_planner_trial(
+            FakePlanner(
+                [
+                    PlannerResponse(
+                        PlannerOutcome.MALFORMED,
+                        error="invalid_transport_response:text_response",
+                        failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
+                    )
+                ]
+            ),
+            _REQUEST,
+        ),
+        run_planner_trial(
+            FakePlanner(
+                [
+                    PlannerResponse(
+                        PlannerOutcome.MALFORMED,
+                        error="malformed_structured_output",
+                        failure_category=PlannerFailureCategory.SCHEMA_INVALID,
+                    )
+                ]
+            ),
+            _REQUEST,
+        ),
     )
     metrics = aggregate_planner_trials("case", "candidate", trials)
     assert metrics.repetitions == 4
@@ -244,10 +285,18 @@ def test_metrics_aggregate_exact_counts_and_rates():
 
 def test_metrics_never_collapse_transport_and_correctness_into_one_number():
     trials = (
-        run_planner_trial(FakePlanner([PlannerResponse(
-            PlannerOutcome.MALFORMED, error="adapter_error:transport_timeout",
-            failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
-        )]), _REQUEST),
+        run_planner_trial(
+            FakePlanner(
+                [
+                    PlannerResponse(
+                        PlannerOutcome.MALFORMED,
+                        error="adapter_error:transport_timeout",
+                        failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
+                    )
+                ]
+            ),
+            _REQUEST,
+        ),
     )
     metrics = aggregate_planner_trials("case", "candidate", trials)
     assert metrics.transport_failure_rate == 1.0
@@ -275,16 +324,21 @@ def test_run_planner_case_warm_up_is_excluded_from_trials_and_metrics():
 
 
 def test_run_tool_transport_case_runs_exactly_the_requested_repetitions():
-    adapter = FakeWorkerAdapter([
-        WorkerResponse(
-            kind=WorkerResponseKind.TOOL_CALL,
-            tool_call=WorkerToolCall("read_file", {"path": "a"}),
-        )
-        for _ in range(3)
-    ])
+    adapter = FakeWorkerAdapter(
+        [
+            WorkerResponse(
+                kind=WorkerResponseKind.TOOL_CALL,
+                tool_call=WorkerToolCall("read_file", {"path": "a"}),
+            )
+            for _ in range(3)
+        ]
+    )
     request = WorkerRequest(
-        task_id="t", role="planner", original_prompt="x",
-        allowed_tools=("read_file",), tool_requirement=ToolRequirement.REQUIRED,
+        task_id="t",
+        role="planner",
+        original_prompt="x",
+        allowed_tools=("read_file",),
+        tool_requirement=ToolRequirement.REQUIRED,
     )
     trials, cold_start = run_tool_transport_case(adapter, request, repetitions=3)
     assert len(trials) == 3
@@ -298,10 +352,14 @@ def test_qualification_module_imports_no_trust_policy_lease_or_permission_author
     import code_slayer.planning.qualification as qualification_module
 
     forbidden = {
-        "code_slayer.tools.executor", "code_slayer.policy.engine",
-        "code_slayer.lease.manager", "code_slayer.repo.checkpoint",
-        "code_slayer.workers.trust", "code_slayer.workers.promotion",
-        "code_slayer.permissions.service", "code_slayer.permissions",
+        "code_slayer.tools.executor",
+        "code_slayer.policy.engine",
+        "code_slayer.lease.manager",
+        "code_slayer.repo.checkpoint",
+        "code_slayer.workers.trust",
+        "code_slayer.workers.promotion",
+        "code_slayer.permissions.service",
+        "code_slayer.permissions",
     }
     tree = ast.parse(open(qualification_module.__file__, encoding="utf-8").read())
     imported = _imported_modules(tree)
@@ -326,12 +384,15 @@ def test_qualification_module_exposes_no_production_selection_function():
     import code_slayer.planning.qualification as qualification_module
 
     forbidden_substrings = (
-        "select", "promote", "configure_production", "set_production", "activate",
+        "select",
+        "promote",
+        "configure_production",
+        "set_production",
+        "activate",
     )
     public_names = [name for name in vars(qualification_module) if not name.startswith("_")]
     offending = [
-        name for name in public_names
-        if any(sub in name.lower() for sub in forbidden_substrings)
+        name for name in public_names if any(sub in name.lower() for sub in forbidden_substrings)
     ]
     assert not offending, f"qualification module exposes a selection-shaped name: {offending}"
 
@@ -374,7 +435,10 @@ def test_observe_determinism_reports_when_outcomes_or_structure_differ():
 
 def test_payload_fingerprint_is_stable_and_reflects_tool_choice():
     payload_a = {
-        "model": "m", "tool_choice": "required", "temperature": 0.0, "stream": False,
+        "model": "m",
+        "tool_choice": "required",
+        "temperature": 0.0,
+        "stream": False,
         "tools": [{"function": {"name": "emit_engineering_plan"}}],
     }
     payload_b = dict(payload_a, tool_choice=None)
@@ -392,21 +456,24 @@ def test_payload_fingerprint_is_stable_and_reflects_tool_choice():
 
 def _non_tool_response() -> PlannerResponse:
     return PlannerResponse(
-        PlannerOutcome.MALFORMED, error="invalid_transport_response:text_response",
+        PlannerOutcome.MALFORMED,
+        error="invalid_transport_response:text_response",
         failure_category=PlannerFailureCategory.NON_TOOL_RESPONSE,
     )
 
 
 def _transport_timeout() -> PlannerResponse:
     return PlannerResponse(
-        PlannerOutcome.MALFORMED, error="adapter_error:transport_timeout",
+        PlannerOutcome.MALFORMED,
+        error="adapter_error:transport_timeout",
         failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
     )
 
 
 def _transport_error() -> PlannerResponse:
     return PlannerResponse(
-        PlannerOutcome.MALFORMED, error="adapter_error:transport_connection_failed",
+        PlannerOutcome.MALFORMED,
+        error="adapter_error:transport_connection_failed",
         failure_category=PlannerFailureCategory.TRANSPORT_ERROR,
     )
 
@@ -417,7 +484,10 @@ def _transport_error() -> PlannerResponse:
 def test_correction_a_first_attempt_pass_has_no_retries():
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_FIRST_TRY
     assert result.attempt_count == 1
@@ -431,7 +501,10 @@ def test_correction_a_first_attempt_pass_has_no_retries():
 def test_correction_b_correctable_failure_gets_feedback_and_retries_to_pass():
     planner = FakePlanner([_non_tool_response(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
     assert result.attempt_count == 2
@@ -443,12 +516,17 @@ def test_correction_b_correctable_failure_gets_feedback_and_retries_to_pass():
 
 def test_correction_b_evidence_rejection_feedback_names_the_rejected_claim(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
-    rejected = _structured(affected_files=(
-        PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
-    ))
+    rejected = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
+        )
+    )
     planner = FakePlanner([rejected, _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", snapshot=snapshot,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        snapshot=snapshot,
         unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
@@ -462,7 +540,10 @@ def test_correction_c_failure_persists_past_retry_budget_is_fail_capability():
     responses = [_non_tool_response() for _ in range(DEFAULT_MAX_CORRECTION_ATTEMPTS + 1)]
     planner = FakePlanner(responses)
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_CAPABILITY
     assert result.attempt_count == DEFAULT_MAX_CORRECTION_ATTEMPTS + 1
@@ -472,7 +553,10 @@ def test_correction_c_failure_persists_past_retry_budget_is_fail_capability():
 def test_correction_c_max_correction_attempts_zero_means_no_retry_at_all():
     planner = FakePlanner([_non_tool_response()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", max_correction_attempts=0,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        max_correction_attempts=0,
         unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_CAPABILITY
@@ -486,7 +570,10 @@ def test_correction_c_max_correction_attempts_zero_means_no_retry_at_all():
 def test_correction_d_transport_timeout_is_not_capability_failure():
     planner = FakePlanner([_transport_timeout()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_TRANSPORT_TIMEOUT
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -500,7 +587,10 @@ def test_correction_d_transport_timeout_is_not_capability_failure():
 def test_correction_e_repeated_transport_timeouts_trigger_early_stop():
     planner = FakePlanner([_transport_timeout()] * 10)
     results, early_stopped = run_corrected_planner_case(
-        planner, _REQUEST, qualification_class="A", repetitions=10,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        repetitions=10,
         early_stop_after_consecutive_transport_failures=3,
         unsafe_allow_unverified_environment=True,
     )
@@ -512,7 +602,10 @@ def test_correction_e_repeated_transport_timeouts_trigger_early_stop():
 def test_correction_e_single_timeout_does_not_trigger_early_stop():
     planner = FakePlanner([_transport_timeout(), _structured(), _structured()])
     results, early_stopped = run_corrected_planner_case(
-        planner, _REQUEST, qualification_class="A", repetitions=3,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        repetitions=3,
         early_stop_after_consecutive_transport_failures=3,
         unsafe_allow_unverified_environment=True,
     )
@@ -526,7 +619,10 @@ def test_correction_e_single_timeout_does_not_trigger_early_stop():
 def test_correction_f_runtime_error_is_fail_runtime_not_capability():
     planner = FakePlanner([_transport_error()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_RUNTIME
     assert result.attempt_count == 1
@@ -544,15 +640,21 @@ def test_correction_f_runtime_error_is_fail_runtime_not_capability():
 
 
 def _out_of_scope(**overrides):
-    return _structured(affected_files=(
-        PlannerAffectedFileProposal(path="src/bar.py", action="modify", reason="x"),
-    ), **overrides)
+    return _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="src/bar.py", action="modify", reason="x"),
+        ),
+        **overrides,
+    )
 
 
 def _policy_forbidden(**overrides):
-    return _structured(affected_files=(
-        PlannerAffectedFileProposal(path="../outside.py", action="modify", reason="x"),
-    ), **overrides)
+    return _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="../outside.py", action="modify", reason="x"),
+        ),
+        **overrides,
+    )
 
 
 def test_correction_g_scope_violation_corrects_to_a_pass():
@@ -561,7 +663,10 @@ def test_correction_g_scope_violation_corrects_to_a_pass():
     PASS_AFTER_FEEDBACK, with the violation still visible in the chain."""
     planner = FakePlanner([_out_of_scope(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", allowed_scope=("src/foo.py",),
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        allowed_scope=("src/foo.py",),
         unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
@@ -574,7 +679,10 @@ def test_correction_g_scope_violation_exhausted_is_fail_scope_not_capability():
     responses = [_out_of_scope() for _ in range(DEFAULT_MAX_CORRECTION_ATTEMPTS + 1)]
     planner = FakePlanner(responses)
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", allowed_scope=("src/foo.py",),
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        allowed_scope=("src/foo.py",),
         unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_SCOPE
@@ -585,7 +693,10 @@ def test_correction_g_scope_violation_exhausted_is_fail_scope_not_capability():
 def test_correction_g_policy_violation_corrects_to_a_pass():
     planner = FakePlanner([_policy_forbidden(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
     assert result.attempts[0].outcome == TrialOutcome.POLICY_VIOLATION
@@ -599,11 +710,15 @@ def test_correction_g_policy_violation_exhausted_is_fail_policy_never_a_pass():
     responses = [_policy_forbidden() for _ in range(DEFAULT_MAX_CORRECTION_ATTEMPTS + 1)]
     planner = FakePlanner(responses)
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_POLICY
     assert result.outcome not in (
-        QualificationOutcome.PASS_FIRST_TRY, QualificationOutcome.PASS_AFTER_FEEDBACK,
+        QualificationOutcome.PASS_FIRST_TRY,
+        QualificationOutcome.PASS_AFTER_FEEDBACK,
         QualificationOutcome.FAIL_CAPABILITY,
     )
     assert all(a.outcome == TrialOutcome.POLICY_VIOLATION for a in result.attempts)
@@ -614,7 +729,10 @@ def test_correction_g_policy_check_always_runs_even_without_a_declared_scope():
     declares `allowed_scope` -- never opt-in, unlike scope."""
     planner = FakePlanner([_policy_forbidden()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", max_correction_attempts=0,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        max_correction_attempts=0,
         unsafe_allow_unverified_environment=True,
     )
     assert result.attempts[0].outcome == TrialOutcome.POLICY_VIOLATION
@@ -627,7 +745,10 @@ def test_correction_g_no_declared_scope_never_produces_scope_violation():
     simply never flagged when no scope was ever declared."""
     planner = FakePlanner([_out_of_scope()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", max_correction_attempts=0,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        max_correction_attempts=0,
         unsafe_allow_unverified_environment=True,
     )
     assert result.attempts[0].outcome == TrialOutcome.VALID_STRUCTURED_PLAN
@@ -640,7 +761,10 @@ def test_correction_g_feedback_never_leaks_the_answer_or_expands_scope():
     the original task had."""
     planner = FakePlanner([_out_of_scope(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", allowed_scope=("src/foo.py",),
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        allowed_scope=("src/foo.py",),
         unsafe_allow_unverified_environment=True,
     )
     rendered = result.feedback[0].render()
@@ -658,17 +782,23 @@ def test_correction_g_a_second_rejected_attempt_never_becomes_a_pass(git_repo_wi
     if every attempt is still rejected, the final outcome is still a
     failure, never silently promoted to a pass."""
     snapshot = _snapshot(git_repo_with_commit)
-    rejected = _structured(affected_files=(
-        PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
-    ))
+    rejected = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
+        )
+    )
     planner = FakePlanner([rejected, rejected, rejected])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", snapshot=snapshot,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        snapshot=snapshot,
         unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_CAPABILITY
     assert result.outcome not in (
-        QualificationOutcome.PASS_FIRST_TRY, QualificationOutcome.PASS_AFTER_FEEDBACK,
+        QualificationOutcome.PASS_FIRST_TRY,
+        QualificationOutcome.PASS_AFTER_FEEDBACK,
     )
 
 
@@ -678,12 +808,16 @@ def test_correction_g_a_second_rejected_attempt_never_becomes_a_pass(git_repo_wi
 def test_correction_h_result_reconstructs_the_full_attempt_chain():
     planner = FakePlanner([_non_tool_response(), _non_tool_response(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
     assert result.attempt_count == 3
     assert [t.outcome for t in result.attempts] == [
-        TrialOutcome.NON_TOOL_RESPONSE, TrialOutcome.NON_TOOL_RESPONSE,
+        TrialOutcome.NON_TOOL_RESPONSE,
+        TrialOutcome.NON_TOOL_RESPONSE,
         TrialOutcome.VALID_STRUCTURED_PLAN,
     ]
     assert len(result.feedback) == 2
@@ -695,11 +829,16 @@ def test_correction_h_provenance_reconstructs_a_scope_violation_chain():
     """The attempt/provenance chain for a scope-violation correction is
     just as fully reconstructable as any other correctable failure."""
     profile = RuntimeContextProfile(
-        model_tag="m", effective_context_tokens=8192, output_token_budget=1024,
+        model_tag="m",
+        effective_context_tokens=8192,
+        output_token_budget=1024,
     )
     planner = FakePlanner([_out_of_scope(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", allowed_scope=("src/foo.py",),
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        allowed_scope=("src/foo.py",),
         context_profile=profile,
     )
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
@@ -715,10 +854,14 @@ def test_correction_h_provenance_reconstructs_a_scope_violation_chain():
 def test_correction_h_repeated_run_is_deterministically_reproducible():
     """Same canned response sequence in, byte-for-byte identical attempt/
     feedback/outcome chain out -- no hidden state, no randomness."""
+
     def _run():
         planner = FakePlanner([_out_of_scope(), _structured()])
         return run_planner_case_with_correction(
-            planner, _REQUEST, qualification_class="C", allowed_scope=("src/foo.py",),
+            planner,
+            _REQUEST,
+            qualification_class="C",
+            allowed_scope=("src/foo.py",),
             unsafe_allow_unverified_environment=True,
         )
 
@@ -741,7 +884,10 @@ def test_correction_h_repeated_run_is_deterministically_reproducible():
 def test_runtime_tool_failure_semantic_is_never_capability_failure():
     planner = FakePlanner([_transport_error()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_RUNTIME
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -750,7 +896,10 @@ def test_runtime_tool_failure_semantic_is_never_capability_failure():
 def test_infrastructure_failure_semantic_is_never_capability_failure():
     planner = FakePlanner([_transport_error()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.FAIL_RUNTIME
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -780,15 +929,24 @@ def test_feedback_generation_is_pure_and_requires_no_second_model():
 def test_run_corrected_planner_case_validates_its_own_arguments():
     with pytest.raises(ValueError):
         run_corrected_planner_case(
-            FakePlanner([]), _REQUEST, qualification_class="A", repetitions=0,
+            FakePlanner([]),
+            _REQUEST,
+            qualification_class="A",
+            repetitions=0,
         )
     with pytest.raises(ValueError):
         run_planner_case_with_correction(
-            FakePlanner([]), _REQUEST, qualification_class="A", max_correction_attempts=-1,
+            FakePlanner([]),
+            _REQUEST,
+            qualification_class="A",
+            max_correction_attempts=-1,
         )
     with pytest.raises(ValueError):
         run_corrected_planner_case(
-            FakePlanner([_structured()]), _REQUEST, qualification_class="A", repetitions=1,
+            FakePlanner([_structured()]),
+            _REQUEST,
+            qualification_class="A",
+            repetitions=1,
             early_stop_after_consecutive_transport_failures=0,
         )
 
@@ -813,7 +971,8 @@ def test_uncorrectable_outcomes_never_generate_feedback_or_retry():
 # =============================================================================
 
 _GENEROUS_PROFILE = RuntimeContextProfile(
-    model_tag="test-model", effective_context_tokens=1_000_000,
+    model_tag="test-model",
+    effective_context_tokens=1_000_000,
 )
 # Sized so _REQUEST's attempt-1 (no feedback, ~962 estimated tokens) fits,
 # but attempt-2 (with real NON_TOOL_RESPONSE feedback attached, ~1112
@@ -849,7 +1008,10 @@ def test_preflight_b_oversized_request_never_calls_the_model():
 def test_preflight_b_run_planner_case_with_correction_reports_invalid_environment():
     planner = FakePlanner([])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", context_profile=_TINY_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=_TINY_PROFILE,
     )
     assert result.outcome == QualificationOutcome.INVALID_ENVIRONMENT
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -876,7 +1038,10 @@ def test_preflight_c_retry_growth_over_context_is_invalid_environment_not_capabi
     )
     planner = FakePlanner([_non_tool_response(), truncated_response])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", context_profile=_MARGINAL_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=_MARGINAL_PROFILE,
     )
     assert result.outcome == QualificationOutcome.INVALID_ENVIRONMENT
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -897,7 +1062,10 @@ def test_preflight_c_bare_first_attempt_truncation_is_also_caught_post_call():
     )
     planner = FakePlanner([truncated_response])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="C", context_profile=_MARGINAL_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=_MARGINAL_PROFILE,
     )
     assert result.outcome == QualificationOutcome.INVALID_ENVIRONMENT
     assert result.attempt_count == 1
@@ -910,7 +1078,10 @@ def test_preflight_c_bare_first_attempt_truncation_is_also_caught_post_call():
 def test_preflight_d_a2_retains_original_task():
     planner = FakePlanner([_non_tool_response(), _structured()])
     run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert planner.calls[0].original_request == _REQUEST.original_request
     assert planner.calls[1].original_request == _REQUEST.original_request
@@ -920,11 +1091,15 @@ def test_preflight_e_a2_retains_repository_context(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
     request = PlannerRequest(
         original_request="Add the requested read-only endpoint.",
-        repo_context=snapshot.projects, discovered_commands=snapshot.commands,
+        repo_context=snapshot.projects,
+        discovered_commands=snapshot.commands,
     )
     planner = FakePlanner([_non_tool_response(), _structured()])
     run_planner_case_with_correction(
-        planner, request, qualification_class="C", snapshot=snapshot,
+        planner,
+        request,
+        qualification_class="C",
+        snapshot=snapshot,
         unsafe_allow_unverified_environment=True,
     )
     assert planner.calls[0].repo_context == request.repo_context
@@ -936,7 +1111,10 @@ def test_preflight_e_a2_retains_repository_context(git_repo_with_commit):
 def test_preflight_f_a2_carries_deterministic_feedback():
     planner = FakePlanner([_non_tool_response(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert planner.calls[0].prior_attempt_feedback is None
     assert planner.calls[1].prior_attempt_feedback == result.feedback[0].render()
@@ -950,10 +1128,14 @@ def test_preflight_f_a2_carries_deterministic_feedback():
 def test_preflight_g_invalid_environment_is_never_conflated_with_either_pass_kind():
     planner = FakePlanner([])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="A", context_profile=_TINY_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="A",
+        context_profile=_TINY_PROFILE,
     )
     assert result.outcome not in (
-        QualificationOutcome.PASS_FIRST_TRY, QualificationOutcome.PASS_AFTER_FEEDBACK,
+        QualificationOutcome.PASS_FIRST_TRY,
+        QualificationOutcome.PASS_AFTER_FEEDBACK,
     )
 
 
@@ -968,7 +1150,8 @@ def test_preflight_h_historical_trial_coexists_with_a_later_environment_interpre
     check()` call against the same request/profile expresses that
     interpretation instead, without touching the original record."""
     historical_trial = PlannerTrial(
-        outcome=TrialOutcome.NON_TOOL_RESPONSE, latency_seconds=12.3,
+        outcome=TrialOutcome.NON_TOOL_RESPONSE,
+        latency_seconds=12.3,
         detail="invalid_transport_response:text_response",
     )
     # The original historical record is untouched...
@@ -991,7 +1174,8 @@ def test_preflight_h_historical_trial_coexists_with_a_later_environment_interpre
 def test_preflight_i_irrelevant_goal_is_not_promoted_to_a_pass():
     irrelevant = _structured(goal="Refactor the unrelated billing subsystem entirely")
     outcome, detail, _hint = classify_planner_response(
-        irrelevant, original_request="Add a read-only endpoint for planning job counts.",
+        irrelevant,
+        original_request="Add a read-only endpoint for planning job counts.",
     )
     assert outcome == TrialOutcome.TASK_NOT_RELEVANT
     assert outcome != TrialOutcome.VALID_STRUCTURED_PLAN
@@ -1001,18 +1185,24 @@ def test_preflight_i_irrelevant_goal_is_not_promoted_to_a_pass():
 def test_preflight_i_relevant_goal_still_passes():
     relevant = _structured(goal="Add a read-only endpoint that returns job counts")
     outcome, _detail, _hint = classify_planner_response(
-        relevant, original_request="Add a read-only endpoint for planning job counts.",
+        relevant,
+        original_request="Add a read-only endpoint for planning job counts.",
     )
     assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
 
 
 def test_preflight_i_task_not_relevant_is_retryable_and_generates_feedback():
-    planner = FakePlanner([
-        _structured(goal="Refactor the unrelated billing subsystem entirely"),
-        _structured(goal="Add the requested read-only endpoint"),
-    ])
+    planner = FakePlanner(
+        [
+            _structured(goal="Refactor the unrelated billing subsystem entirely"),
+            _structured(goal="Add the requested read-only endpoint"),
+        ]
+    )
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.attempts[0].outcome == TrialOutcome.TASK_NOT_RELEVANT
     assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
@@ -1024,9 +1214,13 @@ def test_preflight_i_task_not_relevant_is_retryable_and_generates_feedback():
 
 def test_preflight_j_fabricated_blocking_evidence_never_becomes_a_pass(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
-    fabricated = _structured(affected_files=(
-        PlannerAffectedFileProposal(path="totally_fabricated_path.py", action="modify", reason="x"),
-    ))
+    fabricated = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(
+                path="totally_fabricated_path.py", action="modify", reason="x"
+            ),
+        )
+    )
     outcome, _detail, _hint = classify_planner_response(fabricated, snapshot)
     assert outcome == TrialOutcome.PLAN_VALIDATION_REJECTED
     assert outcome != TrialOutcome.VALID_STRUCTURED_PLAN
@@ -1038,13 +1232,19 @@ def test_preflight_j_fabricated_blocking_evidence_never_becomes_a_pass(git_repo_
 def test_preflight_k_provenance_fingerprint_changes_with_task():
     trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
     prov_a = build_attempt_provenance(
-        qualification_class="B", request=_REQUEST, profile=_GENEROUS_PROFILE,
-        attempt_number=1, trial=trial,
+        qualification_class="B",
+        request=_REQUEST,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
     )
     other_request = PlannerRequest(original_request="Add a completely different endpoint.")
     prov_b = build_attempt_provenance(
-        qualification_class="B", request=other_request, profile=_GENEROUS_PROFILE,
-        attempt_number=1, trial=trial,
+        qualification_class="B",
+        request=other_request,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
     )
     assert prov_a.task_fingerprint != prov_b.task_fingerprint
     assert prov_a.request_fingerprint != prov_b.request_fingerprint
@@ -1053,13 +1253,19 @@ def test_preflight_k_provenance_fingerprint_changes_with_task():
 def test_preflight_k_provenance_fingerprint_changes_with_runtime_context():
     trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
     prov_a = build_attempt_provenance(
-        qualification_class="B", request=_REQUEST, profile=_GENEROUS_PROFILE,
-        attempt_number=1, trial=trial,
+        qualification_class="B",
+        request=_REQUEST,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
     )
     other_profile = RuntimeContextProfile(model_tag="other-tag", effective_context_tokens=8192)
     prov_b = build_attempt_provenance(
-        qualification_class="B", request=_REQUEST, profile=other_profile,
-        attempt_number=1, trial=trial,
+        qualification_class="B",
+        request=_REQUEST,
+        profile=other_profile,
+        attempt_number=1,
+        trial=trial,
     )
     assert prov_a.model_tag != prov_b.model_tag
     assert prov_a.effective_context_tokens != prov_b.effective_context_tokens
@@ -1068,12 +1274,16 @@ def test_preflight_k_provenance_fingerprint_changes_with_runtime_context():
 def test_preflight_k_provenance_never_stores_raw_repository_text(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
     request = PlannerRequest(
-        original_request="Add a read-only endpoint.", repo_context=snapshot.projects,
+        original_request="Add a read-only endpoint.",
+        repo_context=snapshot.projects,
     )
     trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
     prov = build_attempt_provenance(
-        qualification_class="C", request=request, profile=_GENEROUS_PROFILE,
-        attempt_number=1, trial=trial,
+        qualification_class="C",
+        request=request,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
     )
     assert isinstance(prov, AttemptProvenance)
     for value in vars(prov).values():
@@ -1085,7 +1295,10 @@ def test_preflight_k_provenance_never_stores_raw_repository_text(git_repo_with_c
 def test_preflight_k_correction_result_carries_provenance_when_profile_supplied():
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=_GENEROUS_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=_GENEROUS_PROFILE,
     )
     assert len(result.provenance) == 1
     assert result.provenance[0].attempt_number == 1
@@ -1095,7 +1308,10 @@ def test_preflight_k_correction_result_carries_provenance_when_profile_supplied(
 def test_preflight_k_correction_result_has_no_provenance_without_a_profile():
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.provenance == ()
 
@@ -1118,7 +1334,7 @@ def test_preflight_l_no_model_specific_special_cases_in_the_module_source():
     tree = ast.parse(source)
     docstring_node = tree.body[0]
     assert isinstance(docstring_node, ast.Expr) and isinstance(docstring_node.value, ast.Constant)
-    code_only = "\n".join(source.splitlines()[docstring_node.end_lineno:]).lower()
+    code_only = "\n".join(source.splitlines()[docstring_node.end_lineno :]).lower()
     for forbidden in ("qwen", "devstral", "gemma", "ollama"):
         assert forbidden not in code_only, (
             f"qualification module's executable code references a specific model: {forbidden}"
@@ -1141,13 +1357,74 @@ def test_runtime_context_profile_validates_its_own_fields():
         RuntimeContextProfile(model_tag="", effective_context_tokens=100)
     with pytest.raises(ValueError):
         RuntimeContextProfile(model_tag="m", effective_context_tokens=-1)
+    with pytest.raises(ValueError, match="both be set"):
+        RuntimeContextProfile(
+            model_tag="m",
+            effective_context_tokens=100,
+            normalizer_id="x",
+        )
+
+
+def test_attempt_provenance_records_native_vs_normalized_identity():
+    """Native-only and compatibility-normalizer runtimes remain
+    distinguishable in qualification evidence — certificates bind to
+    this identity, so it must never be omitted or inferred."""
+    trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
+    native = build_attempt_provenance(
+        qualification_class="C",
+        request=_REQUEST,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
+        response=_structured(),
+    )
+    assert native.normalizer_id is None
+    assert native.normalizer_version is None
+    assert native.tool_call_transport is None
+
+    normalized_profile = RuntimeContextProfile(
+        model_tag=_GENEROUS_PROFILE.model_tag,
+        effective_context_tokens=_GENEROUS_PROFILE.effective_context_tokens,
+        output_token_budget=_GENEROUS_PROFILE.output_token_budget,
+        safety_margin_tokens=_GENEROUS_PROFILE.safety_margin_tokens,
+        model_digest=_GENEROUS_PROFILE.model_digest,
+        endpoint=_GENEROUS_PROFILE.endpoint,
+        runtime_version=_GENEROUS_PROFILE.runtime_version,
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    normalized_response = PlannerResponse(
+        PlannerOutcome.STRUCTURED,
+        output=PlannerStructuredOutput(goal="Add the requested read-only endpoint"),
+        raw="{}",
+        tool_call_transport=ToolCallTransport.NORMALIZED,
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+    )
+    normalized = build_attempt_provenance(
+        qualification_class="C",
+        request=_REQUEST,
+        profile=normalized_profile,
+        attempt_number=1,
+        trial=trial,
+        response=normalized_response,
+    )
+    assert normalized.normalizer_id == "qwen_textual_tool_v1"
+    assert normalized.normalizer_version == 1
+    assert normalized.tool_call_transport == ToolCallTransport.NORMALIZED.value
+    assert (native.normalizer_id, native.normalizer_version) != (
+        normalized.normalizer_id,
+        normalized.normalizer_version,
+    )
 
 
 def test_aggregate_planner_trials_excludes_invalid_environment_from_rates():
     planner_ok = FakePlanner([_structured()])
     ok_trial = run_planner_trial(planner_ok, _REQUEST, context_profile=_GENEROUS_PROFILE)
     invalid_trial = run_planner_trial(
-        FakePlanner([]), _REQUEST, context_profile=_TINY_PROFILE,
+        FakePlanner([]),
+        _REQUEST,
+        context_profile=_TINY_PROFILE,
     )
     metrics = aggregate_planner_trials("C", "candidate", (ok_trial, invalid_trial))
     assert metrics.repetitions == 2
@@ -1176,8 +1453,10 @@ class _FakeExactCounter:
 
     def measure(self, request: PlannerRequest) -> TokenMeasurement:
         return TokenMeasurement(
-            source=TokenMeasurementSource.VERIFIED_FULL_INPUT, token_count=self._token_count,
-            request_fingerprint="fake", method="test_double:fixed_exact_count",
+            source=TokenMeasurementSource.VERIFIED_FULL_INPUT,
+            token_count=self._token_count,
+            request_fingerprint="fake",
+            method="test_double:fixed_exact_count",
         )
 
 
@@ -1190,7 +1469,9 @@ def test_measurement_a_exact_count_under_context_lets_the_attempt_run():
     # explicitly via injection, not merely a profile generous enough to
     # fit the estimate on its own.
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=200, output_token_budget=0,
+        model_tag="t",
+        effective_context_tokens=200,
+        output_token_budget=0,
         safety_margin_tokens=100,
     )
     counter = _FakeExactCounter(token_count=10)
@@ -1208,7 +1489,9 @@ def test_measurement_a_exact_count_under_context_lets_the_attempt_run():
 
 def test_measurement_b_exact_count_over_context_is_invalid_environment():
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=100, output_token_budget=0,
+        model_tag="t",
+        effective_context_tokens=100,
+        output_token_budget=0,
         safety_margin_tokens=0,
     )
     counter = _FakeExactCounter(token_count=500)  # far above the effective context
@@ -1228,7 +1511,9 @@ def test_measurement_c_hopeless_estimate_overridden_by_a_fitting_exact_count():
     against a small profile must never alone prove the environment
     invalid when an exact measurement shows the real request fits."""
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=100, output_token_budget=0,
+        model_tag="t",
+        effective_context_tokens=100,
+        output_token_budget=0,
         safety_margin_tokens=0,
     )
     # Without any exact counter, _REQUEST's estimate (~962) against this
@@ -1271,7 +1556,8 @@ def test_verified_profile_d_no_profile_is_environment_unverified_never_a_pass():
     assert result.attempt_count == 0
     assert len(planner.calls) == 0  # the model was never called at all
     assert result.outcome not in (
-        QualificationOutcome.PASS_FIRST_TRY, QualificationOutcome.PASS_AFTER_FEEDBACK,
+        QualificationOutcome.PASS_FIRST_TRY,
+        QualificationOutcome.PASS_AFTER_FEEDBACK,
         QualificationOutcome.FAIL_CAPABILITY,
     )
 
@@ -1279,7 +1565,10 @@ def test_verified_profile_d_no_profile_is_environment_unverified_never_a_pass():
 def test_verified_profile_d_run_corrected_planner_case_is_cheap_when_unverified():
     planner = FakePlanner([])  # any call at all would raise
     results, early_stopped = run_corrected_planner_case(
-        planner, _REQUEST, qualification_class="B", repetitions=10,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        repetitions=10,
     )
     assert len(results) == 10
     assert all(r.outcome == QualificationOutcome.ENVIRONMENT_UNVERIFIED for r in results)
@@ -1290,7 +1579,10 @@ def test_verified_profile_d_run_corrected_planner_case_is_cheap_when_unverified(
 def test_verified_profile_d_unsafe_escape_hatch_must_be_explicit():
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", unsafe_allow_unverified_environment=True,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        unsafe_allow_unverified_environment=True,
     )
     assert result.outcome == QualificationOutcome.PASS_FIRST_TRY  # opt-in restores old behavior
 
@@ -1300,12 +1592,17 @@ def test_verified_profile_d_unsafe_escape_hatch_must_be_explicit():
 
 def test_output_budget_e_enforced_profile_threads_max_output_tokens_to_the_request():
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=1_000_000, output_token_budget=777,
+        model_tag="t",
+        effective_context_tokens=1_000_000,
+        output_token_budget=777,
         output_budget_enforcement_verified=True,
     )
     planner = FakePlanner([_structured()])
     run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=profile,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=profile,
     )
     assert planner.calls[0].output_token_budget == 777
 
@@ -1313,7 +1610,10 @@ def test_output_budget_e_enforced_profile_threads_max_output_tokens_to_the_reque
 def test_output_budget_f_unenforced_profile_never_sends_a_budget_and_says_so():
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=_GENEROUS_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=_GENEROUS_PROFILE,
     )
     assert planner.calls[0].output_token_budget is None
     assert result.provenance[0].output_budget_enforced is False
@@ -1321,12 +1621,16 @@ def test_output_budget_f_unenforced_profile_never_sends_a_budget_and_says_so():
 
 def test_output_budget_f_enforced_profile_records_that_in_provenance():
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=1_000_000,
+        model_tag="t",
+        effective_context_tokens=1_000_000,
         output_budget_enforcement_verified=True,
     )
     planner = FakePlanner([_structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=profile,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=profile,
     )
     assert result.provenance[0].output_budget_enforced is True
 
@@ -1337,7 +1641,10 @@ def test_output_budget_f_enforced_profile_records_that_in_provenance():
 def test_retry_g_gets_a_fresh_token_measurement_reflecting_feedback_growth():
     planner = FakePlanner([_non_tool_response(), _structured()])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=_GENEROUS_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=_GENEROUS_PROFILE,
     )
     assert len(result.provenance) == 2
     assert result.provenance[1].measured_input_tokens > result.provenance[0].measured_input_tokens
@@ -1359,8 +1666,11 @@ def test_measurement_h_request_fingerprint_changes_so_a_stale_measurement_is_nev
 def test_measurement_i_provenance_records_source_and_method():
     trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
     prov = build_attempt_provenance(
-        qualification_class="B", request=_REQUEST, profile=_GENEROUS_PROFILE,
-        attempt_number=1, trial=trial,
+        qualification_class="B",
+        request=_REQUEST,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
     )
     assert prov.token_measurement_source == TokenMeasurementSource.ESTIMATED.value
     assert "char_heuristic" in prov.token_measurement_method
@@ -1377,7 +1687,7 @@ def test_measurement_j_no_class_c_specific_identifiers_in_executable_code():
     source = open(qualification_module.__file__, encoding="utf-8").read()
     tree = ast.parse(source)
     docstring_node = tree.body[0]
-    code_only = "\n".join(source.splitlines()[docstring_node.end_lineno:]).lower()
+    code_only = "\n".join(source.splitlines()[docstring_node.end_lineno :]).lower()
     for forbidden in ("class_c", "planning-jobs", "planning_jobs_count"):
         assert forbidden not in code_only, (
             f"qualification module's executable code hardcodes a specific task/class: {forbidden}"
@@ -1395,7 +1705,8 @@ def _with_usage(response: PlannerResponse, *, prompt_tokens: int, completion_tok
     return replace(
         response,
         usage=WorkerUsage(
-            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         ),
     )
@@ -1407,7 +1718,9 @@ def _with_usage(response: PlannerResponse, *, prompt_tokens: int, completion_tok
 def test_expected_actual_a_matching_actual_verifies_full_input_preservation():
     fp = preflight_check(_REQUEST, _GENEROUS_PROFILE).measurement.request_fingerprint
     expected = VerifiedExpectedInput(
-        request_fingerprint=fp, expected_tokens=9724, method="cross_context_size_comparison",
+        request_fingerprint=fp,
+        expected_tokens=9724,
+        method="cross_context_size_comparison",
     )
     result = verify_full_input_preservation(_REQUEST, 9724, expected)
     assert result.verified is True
@@ -1416,7 +1729,10 @@ def test_expected_actual_a_matching_actual_verifies_full_input_preservation():
     response = _with_usage(_structured(), prompt_tokens=9724)
     planner = FakePlanner([response])
     trial = run_planner_trial(
-        planner, _REQUEST, context_profile=_GENEROUS_PROFILE, verified_expected_input=expected,
+        planner,
+        _REQUEST,
+        context_profile=_GENEROUS_PROFILE,
+        verified_expected_input=expected,
     )
     assert trial.outcome == TrialOutcome.VALID_STRUCTURED_PLAN
 
@@ -1427,7 +1743,9 @@ def test_expected_actual_a_matching_actual_verifies_full_input_preservation():
 def test_expected_actual_b_actual_below_expected_is_input_truncated():
     fp = preflight_check(_REQUEST, _GENEROUS_PROFILE).measurement.request_fingerprint
     expected = VerifiedExpectedInput(
-        request_fingerprint=fp, expected_tokens=9724, method="cross_context_size_comparison",
+        request_fingerprint=fp,
+        expected_tokens=9724,
+        method="cross_context_size_comparison",
     )
     result = verify_full_input_preservation(_REQUEST, 4096, expected)
     assert result.verified is False
@@ -1436,7 +1754,10 @@ def test_expected_actual_b_actual_below_expected_is_input_truncated():
     response = _with_usage(_structured(), prompt_tokens=4096)
     planner = FakePlanner([response])
     trial = run_planner_trial(
-        planner, _REQUEST, context_profile=_GENEROUS_PROFILE, verified_expected_input=expected,
+        planner,
+        _REQUEST,
+        context_profile=_GENEROUS_PROFILE,
+        verified_expected_input=expected,
     )
     assert trial.outcome == TrialOutcome.INVALID_ENVIRONMENT
     assert "input_truncated" in trial.detail
@@ -1462,8 +1783,12 @@ def test_expected_actual_c_actual_under_context_alone_is_never_verified():
     # ever claim the full (possibly 9000-token) original was preserved.
     assert trial.outcome == TrialOutcome.VALID_STRUCTURED_PLAN
     trial_prov = build_attempt_provenance(
-        qualification_class="C", request=_REQUEST, profile=profile, attempt_number=1,
-        trial=trial, response=response,
+        qualification_class="C",
+        request=_REQUEST,
+        profile=profile,
+        attempt_number=1,
+        trial=trial,
+        response=response,
     )
     assert trial_prov.token_measurement_source == TokenMeasurementSource.ACTUAL_EVALUATED.value
     assert trial_prov.token_measurement_source != TokenMeasurementSource.VERIFIED_FULL_INPUT.value
@@ -1478,7 +1803,9 @@ def test_expected_actual_d_stale_expected_measurement_is_never_reused():
     other_request = PlannerRequest(original_request="A totally different task.")
     stale_fp = preflight_check(_REQUEST, _GENEROUS_PROFILE).measurement.request_fingerprint
     expected = VerifiedExpectedInput(
-        request_fingerprint=stale_fp, expected_tokens=9724, method="cross_context_size_comparison",
+        request_fingerprint=stale_fp,
+        expected_tokens=9724,
+        method="cross_context_size_comparison",
     )
     result = verify_full_input_preservation(other_request, 9724, expected)
     assert result.verified is False
@@ -1495,10 +1822,14 @@ def test_expected_actual_e_a_retry_never_reuses_attempt_1s_verified_baseline():
     ceiling check instead of wrongly inheriting attempt 1's guarantee."""
     fp_attempt_1 = preflight_check(_REQUEST, _GENEROUS_PROFILE).measurement.request_fingerprint
     expected_for_attempt_1 = VerifiedExpectedInput(
-        request_fingerprint=fp_attempt_1, expected_tokens=962, method="test_baseline",
+        request_fingerprint=fp_attempt_1,
+        expected_tokens=962,
+        method="test_baseline",
     )
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=1100, output_token_budget=0,
+        model_tag="t",
+        effective_context_tokens=1100,
+        output_token_budget=0,
         safety_margin_tokens=0,
     )
     attempt_1_response = _with_usage(_non_tool_response(), prompt_tokens=962)
@@ -1509,7 +1840,10 @@ def test_expected_actual_e_a_retry_never_reuses_attempt_1s_verified_baseline():
     attempt_2_response = _with_usage(_structured(), prompt_tokens=1100)
     planner = FakePlanner([attempt_1_response, attempt_2_response])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=profile,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=profile,
         verified_expected_input=expected_for_attempt_1,
     )
     assert result.attempts[0].outcome == TrialOutcome.NON_TOOL_RESPONSE
@@ -1526,7 +1860,8 @@ def test_output_truncation_f_finish_reason_length_is_output_budget_exhausted():
     outcome, detail, _hint = classify_planner_response(truncated)
     assert outcome == TrialOutcome.OUTPUT_BUDGET_EXHAUSTED
     assert outcome not in (
-        TrialOutcome.TOOL_SCHEMA_INVALID, TrialOutcome.NON_TOOL_RESPONSE,
+        TrialOutcome.TOOL_SCHEMA_INVALID,
+        TrialOutcome.NON_TOOL_RESPONSE,
         TrialOutcome.PLAN_VALIDATION_REJECTED,
     )
     assert "length" in detail
@@ -1535,13 +1870,16 @@ def test_output_truncation_f_finish_reason_length_is_output_budget_exhausted():
 def test_output_truncation_f_takes_priority_over_evidence_rejection(git_repo_with_commit):
     snapshot = _snapshot(git_repo_with_commit)
     truncated_and_would_have_been_rejected = replace(
-        _structured(affected_files=(
-            PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
-        )),
+        _structured(
+            affected_files=(
+                PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
+            )
+        ),
         finish_reason="length",
     )
     outcome, _detail, _hint = classify_planner_response(
-        truncated_and_would_have_been_rejected, snapshot,
+        truncated_and_would_have_been_rejected,
+        snapshot,
     )
     assert outcome == TrialOutcome.OUTPUT_BUDGET_EXHAUSTED
 
@@ -1549,7 +1887,10 @@ def test_output_truncation_f_takes_priority_over_evidence_rejection(git_repo_wit
 def test_output_truncation_f_case_level_outcome_is_output_budget_exhausted_never_capability():
     planner = FakePlanner([replace(_non_tool_response(), finish_reason="length")])
     result = run_planner_case_with_correction(
-        planner, _REQUEST, qualification_class="B", context_profile=_GENEROUS_PROFILE,
+        planner,
+        _REQUEST,
+        qualification_class="B",
+        context_profile=_GENEROUS_PROFILE,
     )
     assert result.outcome == QualificationOutcome.OUTPUT_BUDGET_EXHAUSTED
     assert result.outcome != QualificationOutcome.FAIL_CAPABILITY
@@ -1579,12 +1920,18 @@ def test_output_truncation_g_no_finish_reason_at_all_is_unaffected():
 
 def test_output_truncation_h_completion_tokens_and_finish_reason_bind_in_provenance():
     response = _with_usage(
-        replace(_structured(), finish_reason="length"), prompt_tokens=500, completion_tokens=4096,
+        replace(_structured(), finish_reason="length"),
+        prompt_tokens=500,
+        completion_tokens=4096,
     )
     trial = PlannerTrial(outcome=TrialOutcome.OUTPUT_BUDGET_EXHAUSTED, latency_seconds=1.0)
     prov = build_attempt_provenance(
-        qualification_class="B", request=_REQUEST, profile=_GENEROUS_PROFILE, attempt_number=1,
-        trial=trial, response=response,
+        qualification_class="B",
+        request=_REQUEST,
+        profile=_GENEROUS_PROFILE,
+        attempt_number=1,
+        trial=trial,
+        response=response,
     )
     assert prov.completion_tokens == 4096
     assert prov.finish_reason == "length"
@@ -1592,14 +1939,20 @@ def test_output_truncation_h_completion_tokens_and_finish_reason_bind_in_provena
 
 def test_output_truncation_h_requested_max_tokens_binds_in_provenance():
     profile = RuntimeContextProfile(
-        model_tag="t", effective_context_tokens=1_000_000, output_token_budget=777,
+        model_tag="t",
+        effective_context_tokens=1_000_000,
+        output_token_budget=777,
         output_budget_enforcement_verified=True,
     )
     request_with_budget = replace(_REQUEST, output_token_budget=777)
     trial = PlannerTrial(outcome=TrialOutcome.VALID_STRUCTURED_PLAN, latency_seconds=1.0)
     prov = build_attempt_provenance(
-        qualification_class="B", request=request_with_budget, profile=profile, attempt_number=1,
-        trial=trial, response=_structured(),
+        qualification_class="B",
+        request=request_with_budget,
+        profile=profile,
+        attempt_number=1,
+        trial=trial,
+        response=_structured(),
     )
     assert prov.requested_max_tokens == 777
 

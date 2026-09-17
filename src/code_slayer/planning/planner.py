@@ -135,8 +135,12 @@ def render_bounded_context(request: PlannerRequest) -> dict:
         pack = request.context_pack
         context_pack = {
             "files": [
-                {"path": f.path, "content": f.content, "truncated": f.truncated,
-                 "reasons": list(f.reasons)}
+                {
+                    "path": f.path,
+                    "content": f.content,
+                    "truncated": f.truncated,
+                    "reasons": list(f.reasons),
+                }
                 for f in pack.files
             ],
             "omitted_count": len(pack.omitted),
@@ -251,6 +255,29 @@ class PlannerOutcome(StrEnum):
     MALFORMED = "MALFORMED"
 
 
+class ToolCallTransport(StrEnum):
+    """How one planning turn's `WorkerToolCall` actually arrived —
+    provenance of *this turn's behavior*, never a capability grant.
+
+    `NATIVE` — the adapter itself classified the provider response as a
+    genuine structured `tool_calls` payload (`WorkerResponseKind.
+    TOOL_CALL`). Native transport always takes precedence over any
+    compatibility decoder (`planning.worker_planner.WorkerAdapterPlanner`).
+    `NORMALIZED` — native transport did not fire, the operator had
+    explicitly enabled a `workers.protocol_normalization.
+    ToolProtocolNormalizer` for this runtime, and that decoder accepted
+    the leaked textual protocol as an exact grammar match. A normalized
+    call is then run through the exact same `validate_response()` /
+    `parse_planner_output()` path a native call already uses; this flag
+    exists so native vs. normalized behavior remains distinguishable in
+    durable provenance (`planning.provenance.store_planner_output`) and
+    qualification evidence (`planning.qualification.AttemptProvenance`).
+    """
+
+    NATIVE = "NATIVE"
+    NORMALIZED = "NORMALIZED"
+
+
 @dataclass(frozen=True)
 class PlannerResponse:
     """`output` is populated only when `outcome == STRUCTURED`. `raw`
@@ -273,7 +300,15 @@ class PlannerResponse:
     a token cap (`"length"`) — `planning.qualification` uses this to
     classify output-budget exhaustion separately from a genuine schema/
     protocol failure, rather than trying to interpret truncated JSON as
-    if it were a deliberate malformed response."""
+    if it were a deliberate malformed response.
+
+    `tool_call_transport` records whether this turn's tool call (when
+    one was produced at all) arrived through genuine native transport or
+    through an explicitly-enabled compatibility normalizer — see
+    `ToolCallTransport`. `normalizer_id`/`normalizer_version`/
+    `normalization_reason` are populated only for `NORMALIZED` turns,
+    and only with the code-owned identity/reason of the decoder that
+    actually ran — never raw model text."""
 
     outcome: PlannerOutcome
     output: PlannerStructuredOutput | None = None
@@ -282,6 +317,10 @@ class PlannerResponse:
     failure_category: PlannerFailureCategory | None = None
     usage: WorkerUsage | None = None
     finish_reason: str | None = None
+    tool_call_transport: ToolCallTransport | None = None
+    normalizer_id: str | None = None
+    normalizer_version: int | None = None
+    normalization_reason: str | None = None
 
 
 class Planner(Protocol):
@@ -295,6 +334,7 @@ class Planner(Protocol):
 
 
 # -- structured output parsing: strict schema, never heuristic prose --------
+
 
 def _is_str_tuple(value: object) -> bool:
     return isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value)
@@ -317,7 +357,9 @@ def _parse_command(item: object) -> PlannerCommandProposal | None:
     if not isinstance(item, Mapping):
         return None
     command, purpose, source = (
-        item.get("command"), item.get("purpose"), item.get("evidence_source"),
+        item.get("command"),
+        item.get("purpose"),
+        item.get("evidence_source"),
     )
     if not all(isinstance(v, str) and v for v in (command, purpose, source)):
         return None
@@ -361,8 +403,11 @@ def _parse_ambiguity(item: object) -> Ambiguity | None:
     if substring is not None and not isinstance(substring, str):
         return None
     return Ambiguity(
-        id=id_, question=question, rationale=rationale,
-        risk_class=AmbiguityRiskClass(risk), evidence_keys=tuple(evidence_keys),
+        id=id_,
+        question=question,
+        rationale=rationale,
+        risk_class=AmbiguityRiskClass(risk),
+        evidence_keys=tuple(evidence_keys),
         resolved_by_prompt_substring=substring,
     )
 
@@ -380,11 +425,29 @@ def _parse_list(items: object, parser) -> tuple | None:
 
 
 _REQUIRED_FIELDS = frozenset({"goal"})
-_ALLOWED_FIELDS = frozenset({
-    "goal", "requirements", "assumptions", "affected_files", "planned_changes",
-    "dependencies", "risks", "verification_steps", "discovered_commands",
-    "authority_requirements", "evidence_claims", "ambiguities",
-})
+_ALLOWED_FIELDS = frozenset(
+    {
+        "goal",
+        "requirements",
+        "assumptions",
+        "affected_files",
+        "planned_changes",
+        "dependencies",
+        "risks",
+        "verification_steps",
+        "discovered_commands",
+        "authority_requirements",
+        "evidence_claims",
+        "ambiguities",
+    }
+)
+# Public aliases of the same field-name authority `parse_planner_output()`
+# itself enforces -- `planning.worker_planner.build_default_normalizer_
+# registry()` reuses these rather than duplicating the Planner schema
+# inside the compatibility decoder (see `workers.qwen_textual_tool_
+# normalizer.QwenTextualToolNormalizer`).
+STRUCTURED_OUTPUT_FIELDS = _ALLOWED_FIELDS
+STRUCTURED_OUTPUT_STRING_FIELDS = frozenset({"goal"})
 
 
 def parse_planner_output(data: object) -> PlannerStructuredOutput | None:
@@ -404,8 +467,14 @@ def parse_planner_output(data: object) -> PlannerStructuredOutput | None:
     goal = data["goal"]
     if not isinstance(goal, str) or not goal:
         return None
-    for key in ("requirements", "assumptions", "dependencies", "risks", "verification_steps",
-                "authority_requirements"):
+    for key in (
+        "requirements",
+        "assumptions",
+        "dependencies",
+        "risks",
+        "verification_steps",
+        "authority_requirements",
+    ):
         if key in data and not _is_str_tuple(data[key]):
             return None
     affected_files = _parse_list(data.get("affected_files", []), _parse_affected_file)
