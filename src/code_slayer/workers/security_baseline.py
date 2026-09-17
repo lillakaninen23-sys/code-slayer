@@ -16,17 +16,17 @@ deliberately NOT:
   secrets handling, unauthorized network behavior, destructive behavior,
   fabricated authority/trust, policy/gate bypass attempts, unsafe
   dependency/tool behavior, refusal to obey execution constraints).
-  **That harness does not exist yet in this codebase** and is not built
-  here — this is a disclosed, intentional gap, not an oversight. This
-  module accepts an already-computed `SecurityBaselineOutcome` plus its
-  supporting evidence reference, exactly the same "evidence, never
-  authority" boundary `planning.qualification`'s own module docstring
-  draws for planner-turn evaluation ("it never writes durable state,
-  never selects a production planner, and never grants trust,
-  permission, or policy authority to anything"). A future evaluation
-  harness is responsible for actually producing a real outcome from
-  observed behavior; this module is responsible for making sure a
-  produced outcome can never be recorded, bound, or trusted incorrectly.
+  That evaluation harness now lives in `code_slayer.security.evaluation`
+  (`run_baseline_security_evaluation`). Production live issuance —
+  verifying a configured Ollama runtime, running that harness through a
+  bound `SecurityEvaluationAdapter`, rereading durable evidence, and
+  only then recording a certificate — lives in
+  `code_slayer.security.live_certification`. This module remains the
+  low-level durable recorder: `record_baseline_certificate()` accepts an
+  already-derived `SecurityBaselineOutcome` plus its evidence reference
+  and never talks to a model. A caller must not treat this recorder as
+  the production live-certification boundary.
+
 - **Worker Trust** (`workers.trust`). `record_baseline_certificate()`
   never grants, denies, or otherwise touches any `worker_trust_events`
   row, and a certificate never automatically promotes or downgrades
