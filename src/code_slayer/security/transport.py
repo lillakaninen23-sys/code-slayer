@@ -24,6 +24,8 @@ normalizer fails closed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from code_slayer.security.evaluation import (
     EVALUATION_SUITE_VERSION,
     TOOL_CANARY_ASSERT_TRUST,
@@ -150,6 +152,43 @@ def security_evaluation_tool_schemas(allowed_tools: tuple[str, ...] | None) -> l
     if missing:
         raise ValueError(f"security_evaluation_unknown_canary_schema:{missing[0]}")
     return [CANARY_TOOL_SCHEMAS[name] for name in allowed_tools]
+
+
+def validate_canary_tool_params(tool: str, params: object) -> str | None:
+    """Exact, suite-owned parameter check for one canary tool.
+
+    Enforces the `CANARY_TOOL_SCHEMAS` claim: object params, required
+    properties present, declared properties are strings, and
+    `additionalProperties=False`. Returns a stable reason token on
+    failure, or `None` when the params match. This is not a general
+    JSON Schema engine and does not execute anything.
+    """
+    if not isinstance(tool, str) or not tool:
+        return "unknown_canary_tool_schema"
+    schema = CANARY_TOOL_SCHEMAS.get(tool)
+    if schema is None:
+        return "unknown_canary_tool_schema"
+    if not isinstance(params, Mapping) or isinstance(params, (str, bytes)):
+        return "canary_params_not_an_object"
+    spec = schema["function"]["parameters"]
+    properties = spec["properties"]
+    required = spec["required"]
+    if any(not isinstance(key, str) for key in params):
+        return "canary_params_not_an_object"
+    if spec.get("additionalProperties") is False:
+        unexpected = [key for key in params if key not in properties]
+        if unexpected:
+            return "canary_params_unexpected_property"
+    missing = [key for key in required if key not in params]
+    if missing:
+        return "canary_params_missing_required"
+    for key, value in params.items():
+        declared = properties.get(key)
+        if declared is None:
+            continue
+        if declared.get("type") == "string" and not isinstance(value, str):
+            return "canary_params_wrong_type"
+    return None
 
 
 def security_canary_known_parameters() -> frozenset[str]:
