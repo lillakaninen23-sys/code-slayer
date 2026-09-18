@@ -177,7 +177,14 @@ class WorkerBaselineSecurityCertificate:
     with no referenceable evidence. `hard_disqualifiers_json` is a JSON
     array of `code_slayer.workers.security_baseline.
     HardDisqualifierCategory` values, non-empty only when
-    `outcome == "HARD_DISQUALIFIED"`."""
+    `outcome == "HARD_DISQUALIFIED"`.
+
+    `promoted_from_validation_certificate_id` (schema v17) is `None` for
+    every ordinary certificate — it is set ONLY by `code_slayer.
+    security.production_promotion` when this row durably carries a
+    VALIDATION certificate forward into PRODUCTION, to that VALIDATION
+    row's own `certificate_id`. Never a client-supplied value; see that
+    module's own docstring."""
 
     certificate_id: str
     worker_id: str
@@ -195,6 +202,7 @@ class WorkerBaselineSecurityCertificate:
     normalizer_version: int | None = None
     runtime_config_fingerprint: str | None = None
     runtime_identity_fingerprint: str | None = None
+    promoted_from_validation_certificate_id: str | None = None
 
 
 @dataclass(frozen=True)

@@ -418,6 +418,18 @@ def certification_start(worker_id):
     return response
 
 
+@api.post("/certification/workers/<worker_id>/baseline/promote")
+def certification_promote(worker_id):
+    # H.1: promotion of an already-recorded VALIDATION PASS certificate
+    # into PRODUCTION. The body must be exactly `{}` -- no client-
+    # supplied outcome, evidence_ref, certificate_id, digest, or
+    # fingerprint; those are server-owned config plus re-verified live
+    # state. `worker_id` names WHICH already-registered worker to
+    # promote, exactly like every other Certification Center route.
+    body({})
+    return jsonify(service().promote_baseline_certification(worker_id))
+
+
 @api.get("/certification/runs/<run_id>")
 def certification_run(run_id):
     return jsonify(service().get_certification_run(run_id))

@@ -304,6 +304,18 @@ export function certificationPreflightEnabled(options = {}) {
   return true;
 }
 
+export function certificationPromoteEnabled(worker, options = {}) {
+  // Backend-authoritative only: `promotion_available` is a server
+  // projection of durable state (never a live probe). The frontend
+  // must never infer availability from baseline_security.status, run
+  // state, or any other client-side heuristic -- a VALIDATION PASS
+  // certificate alone does not mean promotion is still available (e.g.
+  // it may already have been promoted).
+  if (options.busy === true) return false;
+  if (isCertificationActive(options.activeRun?.state)) return false;
+  return worker?.promotion_available === true;
+}
+
 export function certificationWorkerSelectEnabled(options = {}) {
   return options.busy !== true;
 }
@@ -383,6 +395,10 @@ export function acceptCertificationStart(certState, workerId, version, run) {
 }
 
 export function acceptCertificationPreflight(certState, workerId, version) {
+  return certificationSelectionMatches(certState, workerId, version);
+}
+
+export function acceptCertificationPromotion(certState, workerId, version) {
   return certificationSelectionMatches(certState, workerId, version);
 }
 
@@ -532,10 +548,11 @@ export function renderCertificationWorkerDetail(worker, options = {}) {
   }
   const startEnabled = certificationStartEnabled(worker, options);
   const preflightEnabled = certificationPreflightEnabled(options);
+  const promoteEnabled = certificationPromoteEnabled(worker, options);
   const correlation = (options.registryIds || []).includes(worker.worker_id)
     ? '<p class="muted-text">Also listed in the model registry (display correlation only; not evidence).</p>'
     : "";
-  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p></div>`;
+  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p><div class="section-label">Production Baseline Security</div><p class="muted-text">Promotion re-verifies the current VALIDATION PASS certificate against the live runtime and durable evidence, then durably records a SEPARATE PRODUCTION certificate. It never grants trust, permission, or a role certificate.</p><div class="model-meta" data-cert-promotion-available>promotion_available ${escapeHTML(worker.promotion_available)}</div><div class="model-meta" data-cert-promotion-reason>reason ${escapeHTML(worker.promotion_reason)}</div><div class="cert-actions"><button type="button" class="small" data-cert-promote="${escapeHTML(worker.worker_id)}" ${promoteEnabled ? "" : "disabled"}>Promote Baseline Security to PRODUCTION</button></div><p class="muted-text">This button reflects the backend's own promotion_available projection only. The browser never decides promotability itself.</p></div>`;
 }
 
 

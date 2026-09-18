@@ -56,10 +56,12 @@ import {
   certificationSelectionMatches,
   acceptCertificationStart,
   acceptCertificationPreflight,
+  acceptCertificationPromotion,
   beginCertificationPreflight,
   isCertificationActive,
   certificationStartEnabled,
   certificationPreflightEnabled,
+  certificationPromoteEnabled,
   renderCertificationWorkers,
   renderCertificationWorkerDetail,
   renderCertificationRun,
@@ -675,6 +677,12 @@ function certificationControls() {
       || active
       || state.selectedCertificationWorker?.ready_for_certification !== true;
   });
+  document.querySelectorAll("[data-cert-promote]").forEach((el) => {
+    el.disabled = !certificationPromoteEnabled(state.selectedCertificationWorker, {
+      busy: state.certificationBusy,
+      activeRun: state.certificationActiveRun,
+    });
+  });
   document.querySelectorAll("[data-cert-evidence]").forEach((el) => {
     el.disabled = busy;
   });
@@ -1281,6 +1289,7 @@ $("cert-stack").addEventListener("click", (event) => {
   const workerButton = event.target.closest("[data-cert-worker]");
   const preflightButton = event.target.closest("[data-cert-preflight]");
   const startButton = event.target.closest("[data-cert-start]");
+  const promoteButton = event.target.closest("[data-cert-promote]");
   const evidenceButton = event.target.closest("[data-cert-evidence]");
   if (workerButton) {
     if (state.certificationBusy) return;
@@ -1338,6 +1347,20 @@ $("cert-stack").addEventListener("click", (event) => {
         throw error;
       }
     }, "Baseline Security certification accepted. Closing this browser does not cancel the run.");
+    return;
+  }
+  if (promoteButton) {
+    const workerId = promoteButton.dataset.certPromote;
+    const version = state.certificationSelectionVersion;
+    if (!certificationPromoteEnabled(state.selectedCertificationWorker, {
+      busy: state.certificationBusy,
+      activeRun: state.certificationActiveRun,
+    })) return;
+    certificationAction(async () => {
+      await api.promoteBaselineCertification(workerId);
+      if (!acceptCertificationPromotion(state, workerId, version)) return;
+      await refreshCertificationProjection(workerId, version);
+    }, "Baseline Security certificate promoted to PRODUCTION.");
     return;
   }
   if (evidenceButton) {

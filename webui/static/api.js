@@ -102,6 +102,7 @@ export function createAPI(fetcher = globalThis.fetch.bind(globalThis)) {
     certificationWorker: (workerId) => request(`/certification/workers/${id(workerId)}`),
     certificationPreflight: (workerId) => request(`/certification/workers/${id(workerId)}/baseline/preflight`, {}),
     startBaselineCertification: (workerId) => request(`/certification/workers/${id(workerId)}/baseline/runs`, {}),
+    promoteBaselineCertification: (workerId) => request(`/certification/workers/${id(workerId)}/baseline/promote`, {}),
     certificationRun: (runId) => request(`/certification/runs/${id(runId)}`),
     certificationEvidence: (runId) => request(`/certification/runs/${id(runId)}/evidence`),
     certificationHistory: (workerId) => request(`/certification/workers/${id(workerId)}/history`),

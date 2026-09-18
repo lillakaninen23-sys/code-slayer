@@ -179,3 +179,17 @@ class EventType(StrEnum):
     # (capability conformance). Covers PASS/FAIL alike via its own
     # payload fields; never a worker/model's own self-report.
     ROLE_QUALIFICATION_CERTIFICATE_RECORDED = "ROLE_QUALIFICATION_CERTIFICATE_RECORDED"
+    # H.1: one durable record of a VALIDATION -> PRODUCTION Baseline
+    # Security promotion decision (`code_slayer.security.
+    # production_promotion.promote_baseline_security_to_production`).
+    # Supplementary to, and always alongside,
+    # SECURITY_BASELINE_CERTIFICATE_RECORDED (that event already records
+    # the new PRODUCTION certificate row itself) -- this event exists so
+    # the link back to the exact VALIDATION certificate/evidence a
+    # promotion re-verified is durably traceable without overloading
+    # SECURITY_BASELINE_CERTIFICATE_RECORDED's fixed payload shape.
+    # Promotion never grants trust, permission, or a role certificate;
+    # see that module's own docstring.
+    SECURITY_BASELINE_CERTIFICATE_PROMOTED_TO_PRODUCTION = (
+        "SECURITY_BASELINE_CERTIFICATE_PROMOTED_TO_PRODUCTION"
+    )

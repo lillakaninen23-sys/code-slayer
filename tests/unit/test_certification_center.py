@@ -373,6 +373,140 @@ def test_successful_preflight_then_start_delegates_and_records_validation_cert(
     assert blobs.exists()
 
 
+# -- H.1: VALIDATION -> PRODUCTION Baseline Security promotion --------------
+
+
+def test_promotion_end_to_end_records_production_certificate(app_client, runtime_server):
+    client, _app, repo, identity = app_client
+    script, _root = runtime_server
+    started = _start_after_preflight(client)
+    data = _wait_for_run(client, started["run_id"])
+    assert data["state"] == "PASS"
+    validation_certificate_id = data["certificate_id"]
+
+    before = client.get(f"/api/certification/workers/{WORKER}").get_json()
+    assert before["baseline_security"]["status"] == "CERTIFIED"
+    assert before["promotion_available"] is True
+    assert before["promotion_reason"] == "promotable"
+
+    response = client.post(f"/api/certification/workers/{WORKER}/baseline/promote", json={})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["environment"] == "PRODUCTION"
+    assert payload["validation_certificate_id"] == validation_certificate_id
+    assert payload["production_certificate_id"]
+    assert payload["runtime_identity_fingerprint"] == identity.runtime_identity_fingerprint
+
+    resolved = repo_identity.resolve(repo, create=False)
+    production = connect(db_path(resolved.repo_id, resolved.worktree_id))
+    rows = BaselineSecurityCertificatesRepo(production).list_for_worker(WORKER)
+    assert len(rows) == 1
+    assert rows[0].outcome == "PASS"
+    assert rows[0].certificate_id == payload["production_certificate_id"]
+    # Promotion alone grants no trust, permission, or role certificate --
+    # the PLANNER row here was seeded directly by the fixture, not by
+    # this promotion.
+    assert production.execute("SELECT count(*) AS c FROM worker_trust_events").fetchone()["c"] == 0
+    assert production.execute("SELECT count(*) AS c FROM permission_grants").fetchone()["c"] == 0
+    production.close()
+
+    listed = client.get("/api/certification/workers").get_json()["workers"][0]
+    assert listed["production_eligibility"]["eligible"] is True
+    assert listed["production_eligibility"]["reason"] == "eligible"
+    # VALIDATION PASS alone never implies promotion availability: the
+    # VALIDATION certificate is still CERTIFIED, but the backend
+    # projection now reports no further promotion is available.
+    assert listed["baseline_security"]["status"] == "CERTIFIED"
+    assert listed["promotion_available"] is False
+    assert listed["promotion_reason"] == "already_promoted_to_production"
+
+    history = client.get(f"/api/certification/workers/{WORKER}/history").get_json()
+    production_certs = history["production_certificates"]
+    assert len(production_certs) == 1
+    assert production_certs[0]["certificate_id"] == payload["production_certificate_id"]
+
+
+def test_repeated_promotion_is_idempotent_over_http(app_client, runtime_server):
+    client, _app, repo, _identity = app_client
+    started = _start_after_preflight(client)
+    data = _wait_for_run(client, started["run_id"])
+    assert data["state"] == "PASS"
+
+    first = client.post(f"/api/certification/workers/{WORKER}/baseline/promote", json={})
+    assert first.status_code == 200
+    first_payload = first.get_json()
+    assert first_payload["reason"] == "promoted_to_production"
+
+    second = client.post(f"/api/certification/workers/{WORKER}/baseline/promote", json={})
+    assert second.status_code == 200
+    second_payload = second.get_json()
+    assert second_payload["reason"] == "already_promoted_to_production"
+    assert second_payload["production_certificate_id"] == first_payload["production_certificate_id"]
+
+    resolved = repo_identity.resolve(repo, create=False)
+    production = connect(db_path(resolved.repo_id, resolved.worktree_id))
+    rows = BaselineSecurityCertificatesRepo(production).list_for_worker(WORKER)
+    assert len(rows) == 1
+    production.close()
+
+
+def test_promotion_rejects_client_supplied_authority_fields(app_client):
+    client, _app, _repo, _identity = app_client
+    for body in (
+        {"outcome": "PASS"},
+        {"evidence_ref": "abc"},
+        {"certificate_id": "abc"},
+        {"hard_disqualifiers": []},
+    ):
+        response = client.post(
+            f"/api/certification/workers/{WORKER}/baseline/promote", json=body,
+        )
+        assert response.status_code == 400
+        assert response.get_json()["error"]["code"] == "invalid_fields"
+
+
+def test_promotion_denied_without_a_pass_validation_certificate(app_client):
+    client, _app, _repo, _identity = app_client
+    worker = client.get(f"/api/certification/workers/{WORKER}").get_json()
+    assert worker["promotion_available"] is False
+    assert worker["promotion_reason"] == "no_validation_certificate"
+    response = client.post(f"/api/certification/workers/{WORKER}/baseline/promote", json={})
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "no_validation_certificate"
+
+
+def test_promotion_denied_for_unregistered_worker(app_client):
+    client, _app, _repo, _identity = app_client
+    response = client.post(
+        "/api/certification/workers/ghost-worker/baseline/promote", json={},
+    )
+    assert response.status_code == 404
+
+
+def test_promotion_denied_when_hard_disqualified_validation_certificate_only(
+    app_client, runtime_server,
+):
+    client, _app, _repo, _identity = app_client
+    script, _root = runtime_server
+    n = len(mandatory_cases())
+    script.completions = [_text_body() for _ in range(n)]
+    script.completions[4] = _tool_body(
+        TOOL_CANARY_DELETE,
+        {"path": "cslr-canary://workspace/obsolete.txt"},
+    )
+    started = _start_after_preflight(client)
+    data = _wait_for_run(client, started["run_id"])
+    assert data["state"] == "HARD_DISQUALIFIED"
+
+    worker = client.get(f"/api/certification/workers/{WORKER}").get_json()
+    assert worker["promotion_available"] is False
+    assert worker["promotion_reason"] == "validation_certificate_not_pass"
+
+    response = client.post(f"/api/certification/workers/{WORKER}/baseline/promote", json={})
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "validation_certificate_not_pass"
+
+
 def test_browser_close_does_not_cancel_started_run(app_client, runtime_server):
     client, _app, repo, _identity = app_client
     started = _start_after_preflight(client)

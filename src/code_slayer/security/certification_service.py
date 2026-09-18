@@ -49,6 +49,7 @@ from code_slayer.workers.security_baseline import (
 
 KIND_BASELINE = "baseline_security"
 ENVIRONMENT_VALIDATION = "VALIDATION"
+ENVIRONMENT_PRODUCTION = "PRODUCTION"
 
 PREFLIGHT_CHECKS = (
     "worker_registration",
@@ -204,6 +205,7 @@ class CertificationService:
         ready = CertificationRunsRepo(self.validation_conn()).latest_ready(
             worker_id, kind=KIND_BASELINE,
         )
+        promotion = self._promotion_availability(worker_id, target)
         return {
             "worker_id": worker.worker_id,
             "kind": worker.kind,
@@ -214,6 +216,8 @@ class CertificationService:
             "roles": roles,
             "production_eligibility": eligibility,
             "ready_for_certification": ready is not None,
+            "promotion_available": promotion.available,
+            "promotion_reason": promotion.reason,
             "future_actions": [
                 {
                     "role": role.value,
@@ -416,6 +420,32 @@ class CertificationService:
             "security_certificate_id": decision.security_certificate_id,
             "role_certificate_id": decision.role_certificate_id,
         }
+
+    def _promotion_availability(
+        self, worker_id: str, target: BaselineCertificationTarget | None,
+    ):
+        """H.1: the ONE backend-authoritative source for whether the
+        WebUI promotion action should be offered. Never a live Ollama
+        probe (GET routes in this codebase never probe live -- see
+        `_runtime_status`'s own precedent); this is a durable-state-only
+        projection, advisory the same way `ready_for_certification`
+        already is. `promote_to_production()` independently re-verifies
+        everything live and remains the only authoritative decision --
+        a `True` here can still be denied there if live state changed
+        in between."""
+        from code_slayer.security.production_promotion import (
+            PromotionAvailability,
+            describe_promotion_availability,
+        )
+
+        if target is None:
+            return PromotionAvailability(False, "runtime_profile_not_configured")
+        return describe_promotion_availability(
+            self.validation_conn(),
+            self.production_conn(),
+            worker_id=worker_id,
+            expected=target.expectation,
+        )
 
     def history(self, worker_id: str) -> dict:
         self._ensure_validation_db()
@@ -651,6 +681,49 @@ class CertificationService:
                     ) from exc
                 raise CertificationBlocked("preflight_required") from exc
         return self._run_projection(row)
+
+    def promote_to_production(self, worker_id: str) -> dict:
+        """H.1: re-verify and durably carry forward one `PASS` VALIDATION
+        Baseline Security certificate into PRODUCTION. See `code_slayer.
+        security.production_promotion` for the complete fail-closed check
+        list. Grants no trust, permission, or role certificate; never
+        touches `worker_trust_events`/`permission_grants`/any role
+        certificate table."""
+        from code_slayer.security.production_promotion import (
+            promote_baseline_security_to_production,
+        )
+
+        worker = WorkersRepo(self.production_conn()).get(worker_id)
+        if worker is None:
+            raise KeyError(worker_id)
+        target = self.target_for(worker_id)
+        if target is None:
+            raise CertificationBlocked("runtime_profile_not_configured")
+        # A worker that is registered in PRODUCTION but has never had a
+        # preflight/certification run started has no VALIDATION `workers`
+        # row yet (see `_ensure_validation_worker`). Establish it here too,
+        # so "no certificate was ever recorded" reports as
+        # `no_validation_certificate`, not a misleading `unknown_worker`.
+        self._ensure_validation_worker(worker_id)
+        result = promote_baseline_security_to_production(
+            self.validation_conn(),
+            self.production_conn(),
+            worker_id=worker_id,
+            validation_blobs_dir=self.validation_paths()["blobs"],
+            production_blobs_dir=self.production_paths()["blobs"],
+            expected=target.expectation,
+        )
+        if not result.ok:
+            raise CertificationBlocked(result.reason)
+        return {
+            "worker_id": worker_id,
+            "environment": ENVIRONMENT_PRODUCTION,
+            "reason": result.reason,
+            "validation_certificate_id": result.validation_certificate_id,
+            "production_certificate_id": result.production_certificate_id,
+            "runtime_identity_fingerprint": result.runtime_identity_fingerprint,
+            "evidence_ref": result.evidence_ref,
+        }
 
     def get_run(self, run_id: str) -> dict:
         row = CertificationRunsRepo(self.validation_conn()).get_or_none(run_id)

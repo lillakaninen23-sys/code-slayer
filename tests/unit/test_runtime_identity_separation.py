@@ -511,7 +511,7 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
         ).fetchone(),
     )
     assert "runtime_identity_fingerprint" not in before_role
-    assert db_module.migrate(conn) == 16
+    assert db_module.migrate(conn) == 17
     after_role = dict(
         conn.execute(
             "SELECT * FROM worker_role_certificates WHERE certificate_id = ?",
@@ -540,8 +540,8 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
     conn.close()
 
 
-def test_schema_v16_is_known_and_prior_identity_migrations_are_untouched():
-    assert db_module.known_schema_version() == 16
+def test_schema_v17_is_known_and_prior_identity_migrations_are_untouched():
+    assert db_module.known_schema_version() == 17
     names = [name for _version, name, _sql in db_module._discover_migrations()]
     assert "runtime_profile_normalizer_identity" in names
     assert "runtime_config_fingerprint" in names

@@ -557,6 +557,17 @@ class ApplicationService:
         self._certification_executor.notify()
         return result
 
+    def promote_baseline_certification(self, worker_id):
+        with self.certification() as service:
+            try:
+                return service.promote_to_production(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            except CertificationBlocked as exc:
+                raise APIError(
+                    exc.code, "Promotion requirements were not met.", 409,
+                ) from None
+
     def get_certification_run(self, run_id):
         with self.certification() as service:
             try:

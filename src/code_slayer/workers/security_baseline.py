@@ -722,6 +722,7 @@ def record_baseline_certificate(
     reason: str,
     hard_disqualifiers: tuple[HardDisqualifierCategory, ...] = (),
     now_fn=utcnow_iso,
+    promoted_from_validation_certificate_id: str | None = None,
 ) -> SecurityCertificationResult:
     """Durably record one Baseline Security evaluation result — the ONLY
     way a `worker_baseline_security_certificates` row is ever created.
@@ -737,7 +738,26 @@ def record_baseline_certificate(
     `HardDisqualifierCategory`'s own docstring for what "disagrees"
     means). Nothing here decides that the worker IS safe or unsafe — it
     decides only whether the caller's already-computed result is
-    well-formed enough to durably trust as evidence."""
+    well-formed enough to durably trust as evidence.
+
+    `promoted_from_validation_certificate_id` (schema v17) is `None` for
+    every ordinary certificate this function has always recorded — an
+    unrestricted, unchanged, append-only row exactly as before. It is a
+    server-only, optional provenance/idempotency marker: the ONLY
+    caller that ever supplies a non-`None` value is `code_slayer.
+    security.production_promotion`, which sets it to the exact
+    `certificate_id` of the VALIDATION certificate it independently
+    re-verified before calling this function — never a caller-invented
+    or client-supplied string. This function does not itself verify
+    that the referenced row exists (it has no notion of "VALIDATION" vs
+    "PRODUCTION" — that distinction is entirely which physical database
+    `conn` points at, decided by the caller); instead, a schema-level
+    partial UNIQUE index on this column (non-`NULL` values only) means
+    at most one certificate can ever claim provenance from any single
+    VALIDATION certificate — see migration 0017's own docstring. A
+    collision surfaces here as `sqlite3.IntegrityError`, propagated
+    uncaught: this function never resolves that conflict itself, exactly
+    as it never resolves any other `sqlite3.IntegrityError`."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_certificate_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
@@ -761,6 +781,11 @@ def record_baseline_certificate(
         return _deny("hard_disqualified_requires_at_least_one_disqualifier")
     if outcome != SecurityBaselineOutcome.HARD_DISQUALIFIED and hard_disqualifiers:
         return _deny("hard_disqualifiers_only_valid_for_hard_disqualified_outcome")
+    if promoted_from_validation_certificate_id is not None and (
+        not isinstance(promoted_from_validation_certificate_id, str)
+        or not promoted_from_validation_certificate_id.strip()
+    ):
+        return _deny("malformed_certificate_request")
 
     with transaction(conn):
         if WorkersRepo(conn).get(worker_id) is None:
@@ -784,6 +809,7 @@ def record_baseline_certificate(
             evidence_ref=evidence_ref,
             reason=reason,
             issued_at=issued_at,
+            promoted_from_validation_certificate_id=promoted_from_validation_certificate_id,
         )
         AuditWriter(conn).append(
             task_id=None,
@@ -806,6 +832,9 @@ def record_baseline_certificate(
                 "hard_disqualifiers": [d.value for d in hard_disqualifiers],
                 "evidence_ref": evidence_ref,
                 "reason": reason,
+                "promoted_from_validation_certificate_id": (
+                    promoted_from_validation_certificate_id
+                ),
             },
         )
         return SecurityCertificationResult(True, "certificate_recorded", certificate=certificate)

@@ -201,11 +201,17 @@ remain emergency wiring only.
 | `GET /api/certification/runs/{id}` | Durable run projection. Poll after 202. Progress is derived from run state. Incomplete runs have `has_certificate: false` |
 | `GET /api/certification/runs/{id}/evidence` | Evidence reread through `read_baseline_security_evidence` from the validation ContentStore. `409` if missing/unverified |
 | `GET /api/certification/workers/{id}/history` | `{runs, validation_certificates, production_certificates}` — a run is not a certificate |
+| `POST /api/certification/workers/{id}/baseline/promote` (H.1) | `{ }` only → `{environment: "PRODUCTION", validation_certificate_id, production_certificate_id, runtime_identity_fingerprint, evidence_ref}`. Re-verifies the current live runtime, the most recent matching `PASS` VALIDATION certificate, and its durable evidence, then calls `record_baseline_certificate()` against PRODUCTION state with that same evidence. `409` (with a specific reason code, e.g. `no_validation_certificate`, `validation_certificate_not_pass`, `runtime_identity_fingerprint_mismatch`, `runtime_model_digest_mismatch`, `runtime_version_mismatch`, or an evidence-verification reason) on any fail-closed check. Grants no trust, permission, or role certificate — see `security.production_promotion` |
 
 Live Planner/Coder/Reviewer/Repairer/Security certification is not available
 in v1 (`future_actions[].available: false`). PASS, FAIL, and HARD_DISQUALIFIED
-all record a validation certificate; INCOMPLETE does not. None of these
-routes grant trust, permissions, or production eligibility.
+all record a validation certificate; INCOMPLETE does not. Baseline Security
+PRODUCTION certificates exist ONLY via explicit promotion of an already-`PASS`
+VALIDATION certificate (H.1); nothing writes one implicitly. None of these
+routes grant trust, permissions, or production eligibility directly — a
+promoted PRODUCTION Baseline Security certificate is still only one of the
+independent inputs `evaluate_production_eligibility` combines with a
+separately-issued role certificate.
 
 Normal Certification Center startup reads workers/runtime identity from
 persistent config. `CODESLAYER_CERT_*` and `--runtime-factory` are emergency
@@ -349,9 +355,15 @@ authorizes no execution, no mutation, and no command,
 request/grant a trusted backend subsystem already created — never mint
 one, and never accept anything beyond `{decision}` / `{}` in a mutating
 body — and `/api/certification*` never accepts an outcome, evidence
-reference, adapter, digest, fingerprint, or hard-disqualifier list.
-Certificates from this surface are written only to isolated validation
-state; they do not grant trust, permissions, or production eligibility.
+reference, adapter, digest, fingerprint, certificate id, or
+hard-disqualifier list. Live Baseline Security certification writes only
+to isolated validation state. The one exception is the explicit H.1
+promotion action (`POST /api/certification/workers/{id}/baseline/promote`),
+which durably re-verifies and carries an already-`PASS` VALIDATION
+certificate forward into PRODUCTION state — still with an empty `{}`
+body, still never a client-supplied outcome/evidence/certificate id, and
+still never itself a grant of trust, permissions, or a role certificate
+(see `security.production_promotion`).
 `/api/runtime*` never accepts a client-supplied digest or fingerprint;
 `/api/system*` and `/api/tailscale*` map only to fixed argv tuples,
 never a shell string.
@@ -377,7 +389,7 @@ Focused reconciliation gates:
 ```bash
 BASE="/mnt/AI/cslr-pytest-webui-$(date +%Y%m%d-%H%M%S)-$$"
 
-env -u PYTHONPATH .venv/bin/python -m pytest   tests/unit/test_service_admin.py   tests/unit/test_certification_center.py   tests/unit/test_runtime_identity_separation.py   -q --basetemp="$BASE"
+env -u PYTHONPATH .venv/bin/python -m pytest   tests/unit/test_service_admin.py   tests/unit/test_certification_center.py   tests/unit/test_runtime_identity_separation.py   tests/unit/test_production_promotion.py   tests/unit/test_config_bindings.py   -q --basetemp="$BASE"
 
 env -u PYTHONPATH .venv/bin/ruff check .
 git diff --check
