@@ -2147,22 +2147,46 @@ def test_public_admin_path_does_not_import_fake_adapter():
         ).certify_live_baseline_security,
     )
     assert "adapter" not in sig.parameters
-    js = Path("webui/static/app.js").read_text()
-    assert "192.168.32.8" not in js
-    assert "digest" not in js.split("approve-new-identity")[0][-80:] or True
-    assert "/api/runtime/workers/" in js
-    assert "funnel" not in js.lower() or "Funnel is never used" in js
+    frontend = _webui_shipped_text()
+    # Commit A restored the Control Room; admin identity POSTs are not
+    # in the UI yet. Inspect every shipped frontend file, not the
+    # previous single-file admin SPA.
+    assert "192.168.32.8" not in frontend
+    assert "funnel" not in frontend.lower()
+
+
+def _webui_shipped_text() -> str:
+    """Shipped Control Room assets only. Tests live under webui/tests/."""
+    parts = [Path("webui/index.html").read_text()]
+    for path in sorted(Path("webui/static").iterdir()):
+        if path.is_file():
+            parts.append(path.read_text())
+    return "\n".join(parts)
 
 
 def test_webui_does_not_post_digest():
-    js = Path("webui/static/app.js").read_text()
-    assert "JSON.stringify({ id, origin })" in js
-    assert "approved_model_digest" not in js.split("async function registerWorker")[1].split(
-        "async function approveWorker",
-    )[0]
-    assert "outcome" not in js.split("async function approveWorker")[1].split(
-        "async function renderTailscale",
-    )[0]
+    """Frontend must never send digest/fingerprint/outcome/evidence.
+
+    Commit A removed the admin SPA before those POSTs are re-added.
+    Scan api.js (the only HTTP module) for authority fields rather than
+    deleted registerWorker/approveWorker function names.
+    """
+    api = Path("webui/static/api.js").read_text()
+    frontend = _webui_shipped_text()
+    assert "192.168.32.8" not in frontend
+    for field in (
+        "approved_model_digest",
+        "model_digest",
+        "runtime_identity_fingerprint",
+        "fingerprint",
+        "evidence_ref",
+        "hard_disqualifiers",
+        "adapter",
+        "outcome",
+    ):
+        assert field not in api
+    assert "JSON.stringify(data)" in api
+    assert "/api${path}" in api
 
 
 def test_cslr_wrapper_exists_and_is_executable():

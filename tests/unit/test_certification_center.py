@@ -465,9 +465,21 @@ def test_rejects_client_supplied_authority_fields(app_client):
 def test_webui_never_contacts_ollama_and_api_does_not_accept_adapter():
     source = Path("src/code_slayer/api/routes.py").read_text()
     assert "192.168.32.8" not in source
-    js = Path("webui/static/app.js").read_text()
-    assert "192.168.32.8" not in js
-    assert "/api/certification/" in js
+    shipped = [Path("webui/index.html").read_text()]
+    for path in sorted(Path("webui/static").iterdir()):
+        if path.is_file():
+            shipped.append(path.read_text())
+    frontend = "\n".join(shipped)
+    # Commit A restored the Control Room; certification routes are not
+    # in the UI yet. Keep the invariants: no machine-specific Ollama
+    # address, browser fetch only through same-origin /api.
+    assert "192.168.32.8" not in frontend
+    assert "fetch(" not in Path("webui/static/app.js").read_text()
+    assert "fetch(" not in Path("webui/static/views.js").read_text()
+    api = Path("webui/static/api.js").read_text()
+    assert "globalThis.fetch.bind" in api
+    assert "/api${path}" in api
+    assert "11434" not in frontend
     service = Path("src/code_slayer/security/certification_service.py").read_text()
     assert "192.168.32.8" not in service
     assert "FakeWorkerAdapter" not in service

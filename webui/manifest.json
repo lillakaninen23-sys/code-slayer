@@ -1,8 +1,11 @@
 {
-  "name": "Code Slayer Certification Center",
+  "name": "Code Slayer — Engineering Control Room",
   "short_name": "CSLR",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#111111",
-  "theme_color": "#111111"
+  "version": "0.1.0",
+  "integrated": true,
+  "static_only": true,
+  "provider_specific": false,
+  "backend_required": true,
+  "api_version": 1,
+  "start_url": "/"
 }
