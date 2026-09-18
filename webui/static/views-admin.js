@@ -564,3 +564,59 @@ export function renderTailscaleSettings(t,o={}){
  const confirm=o.confirm==="disable"?'<div class="runtime-confirm"><p>Disable CSLR Tailscale Serve intent? The backend will only reset the exact CSLR topology it recognizes.</p><button type="button" class="small" id="tailscale-disable-confirm">Confirm disable</button> <button type="button" class="ghost small" id="tailscale-confirm-cancel">Cancel</button></div>':"";
  return `${body}<div class="cert-actions"><button type="button" class="ghost small" id="tailscale-refresh" ${busy?"disabled":""}>Refresh current state</button><button type="button" class="ghost small" id="tailscale-enable" ${busy||!cur?"disabled":""}>Enable Serve</button><button type="button" class="ghost small" id="tailscale-disable-ask" ${busy||!cur?"disabled":""}>Disable Serve…</button></div>${confirm}`;
 }
+
+
+/* Dashboard read-only summaries. These snapshots never replace admin-view state. */
+export function beginDashboardSummaryRequest(x) {
+  x.dashboardSummaryVersion = (x.dashboardSummaryVersion || 0) + 1;
+  return x.dashboardSummaryVersion;
+}
+
+export function acceptDashboardSummary(x, version, snapshot, errors = {}) {
+  if (version !== x.dashboardSummaryVersion) return false;
+  x.dashboardSummary = snapshot;
+  x.dashboardSummaryErrors = errors;
+  x.dashboardSummaryUnavailable = false;
+  return true;
+}
+
+export function rejectDashboardSummary(x, version = null, message = "Dashboard summaries unavailable.") {
+  if (version != null && version !== x.dashboardSummaryVersion) return false;
+  x.dashboardSummary = null;
+  x.dashboardSummaryErrors = {
+    system: message,
+    runtime: message,
+    certification: message,
+    tailscale: message,
+  };
+  x.dashboardSummaryUnavailable = true;
+  x.dashboardSummaryVersion = (x.dashboardSummaryVersion || 0) + 1;
+  return true;
+}
+
+function dashboardUnavailable(error) {
+  return `<div class="metric-value">UNAVAILABLE</div><div class="metric-foot">${escapeHTML(error || "No current snapshot.")}</div>`;
+}
+
+export function renderDashboardSystemSummary(system, error) {
+  if (!system) return dashboardUnavailable(error);
+  return `<div class="metric-value">${escapeHTML(system.service?.deployment_status)}</div><div class="metric-foot">deployment_complete ${escapeHTML(system.service?.deployment_complete)}</div><div class="metric-foot">process ${escapeHTML(system.service?.process_commit)}</div><div class="metric-foot">checkout ${escapeHTML(system.service?.checkout_head)}</div>`;
+}
+
+export function renderDashboardRuntimeSummary(runtime, error) {
+  if (!runtime) return dashboardUnavailable(error);
+  const workers = Array.isArray(runtime.workers) ? runtime.workers.length : 0;
+  const servers = Array.isArray(runtime.ollama_servers) ? runtime.ollama_servers.length : 0;
+  return `<div class="metric-value">${escapeHTML(workers)} workers</div><div class="metric-foot">${escapeHTML(servers)} Ollama servers</div><div class="metric-foot">GET /api/runtime · configuration only; not live attestation.</div>`;
+}
+
+export function renderDashboardCertificationSummary(certification, error) {
+  if (!certification) return dashboardUnavailable(error);
+  const workers = Array.isArray(certification.workers) ? certification.workers.length : 0;
+  return `<div class="metric-value">${escapeHTML(certification.environment)}</div><div class="metric-foot">${escapeHTML(workers)} certification workers</div><div class="metric-foot">Backend projection only. Dashboard does not derive Planner eligibility.</div>`;
+}
+
+export function renderDashboardTailscaleSummary(tailscale, error) {
+  if (!tailscale) return dashboardUnavailable(error);
+  return `<div class="metric-value">${escapeHTML(tailscale.remote_access)}</div><div class="metric-foot">Serve ${escapeHTML(tailscale.serve?.status)}</div><div class="metric-foot">intent enabled ${escapeHTML(tailscale.intent?.enabled)} · alignment ${escapeHTML(tailscale.intent?.alignment)}</div><div class="metric-foot">Backend network/Serve/Host-path verdict only.</div>`;
+}

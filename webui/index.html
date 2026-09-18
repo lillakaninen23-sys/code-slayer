@@ -485,6 +485,52 @@
 
 
         <!-- =================================================
+             CONTROL PLANE SUMMARY
+             ================================================= -->
+
+        <article class="card" id="dashboard-control-summary">
+
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">CONTROL PLANE</div>
+              <h2>Read-only summaries</h2>
+            </div>
+          </div>
+
+          <p class="muted-text">
+            Separate GET snapshots for deployment, runtime configuration,
+            certification projection, and remote access. Dashboard never
+            performs live attestation, certification, or administrative mutation.
+          </p>
+
+          <div class="grid cards-4">
+
+            <article class="card metric">
+              <div class="metric-label">Deployment</div>
+              <div id="dashboard-system-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Runtime configuration</div>
+              <div id="dashboard-runtime-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Certification projection</div>
+              <div id="dashboard-certification-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Remote access</div>
+              <div id="dashboard-tailscale-summary">Loading…</div>
+            </article>
+
+          </div>
+
+        </article>
+
+
+        <!-- =================================================
              TECHNICAL ACTIVITY
              ================================================= -->
 

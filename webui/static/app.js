@@ -73,6 +73,13 @@ import {
   rejectTailscaleSnapshot,
   renderSystemSettings,
   renderTailscaleSettings,
+  beginDashboardSummaryRequest,
+  acceptDashboardSummary,
+  rejectDashboardSummary,
+  renderDashboardSystemSummary,
+  renderDashboardRuntimeSummary,
+  renderDashboardCertificationSummary,
+  renderDashboardTailscaleSummary,
 } from "./views-admin.js";
 
 const api = createAPI();
@@ -131,6 +138,10 @@ const state = {
   tailscaleError: null,
   tailscaleConfirm: null,
   tailscaleRequestVersion: 0,
+  dashboardSummary: null,
+  dashboardSummaryErrors: {},
+  dashboardSummaryUnavailable: false,
+  dashboardSummaryVersion: 0,
 };
 let timer;
 let activeJobTimer;
@@ -151,6 +162,7 @@ function view(name) {
   if (name === "privacy") loadPrivacy();
   if (name === "models") loadRuntime();
   if (name === "settings") loadSettings();
+  if (name === "dashboard") loadDashboardSummaries();
 }
 document
   .querySelectorAll(".nav-item")
@@ -199,6 +211,8 @@ function connected(value) {
     rejectSystemSnapshot(state); rejectTailscaleSnapshot(state);
     state.systemError = "Backend disconnected."; state.tailscaleError = "Backend disconnected.";
     renderSettingsView();
+    rejectDashboardSummary(state, null, "Backend disconnected.");
+    renderDashboardSummaries();
   } else if (!wasConnected) {
     if (document.getElementById("models")?.classList.contains("active")) loadRuntime();
     if (document.getElementById("privacy")?.classList.contains("active")) loadPrivacy();
@@ -415,6 +429,50 @@ async function observeServerTest(serverId) {
     throw error;
   }
 }
+function renderDashboardSummaries() {
+  const snapshot = state.dashboardSummary || {};
+  const errors = state.dashboardSummaryErrors || {};
+  const system = $("dashboard-system-summary");
+  const runtime = $("dashboard-runtime-summary");
+  const certification = $("dashboard-certification-summary");
+  const tailscale = $("dashboard-tailscale-summary");
+  if (system) system.innerHTML = renderDashboardSystemSummary(snapshot.system, errors.system);
+  if (runtime) runtime.innerHTML = renderDashboardRuntimeSummary(snapshot.runtime, errors.runtime);
+  if (certification) certification.innerHTML = renderDashboardCertificationSummary(snapshot.certification, errors.certification);
+  if (tailscale) tailscale.innerHTML = renderDashboardTailscaleSummary(snapshot.tailscale, errors.tailscale);
+}
+
+async function loadDashboardSummaries() {
+  if (!state.connected) {
+    rejectDashboardSummary(state, null, "Backend disconnected.");
+    renderDashboardSummaries();
+    return;
+  }
+  const version = beginDashboardSummaryRequest(state);
+  const keys = ["system", "runtime", "certification", "tailscale"];
+  const results = await Promise.allSettled([
+    api.system(),
+    api.runtime(),
+    api.certificationWorkers(),
+    api.tailscale(),
+  ]);
+  const snapshot = {};
+  const errors = {};
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i];
+    const result = results[i];
+    if (result.status === "fulfilled") {
+      snapshot[key] = result.value;
+      errors[key] = null;
+    } else {
+      snapshot[key] = null;
+      errors[key] = result.reason?.message || "Snapshot unavailable.";
+    }
+  }
+  if (!acceptDashboardSummary(state, version, snapshot, errors)) return;
+  renderDashboardSummaries();
+}
+
 function settingsControls(){
  const sr=$("system-refresh");if(sr)sr.disabled=!state.connected||state.systemBusy;
  for(const id of ["system-update-check","system-update-apply-ask","system-restart-ask"]){const e=$(id);if(e)e.disabled=!state.connected||state.systemBusy||!state.system;}
@@ -885,6 +943,8 @@ async function refresh() {
       $("run-detail").innerHTML = renderRun(null);
     }
     connected(true);
+    if (document.getElementById("dashboard")?.classList.contains("active"))
+      loadDashboardSummaries();
     notice(connectionText("connected"));
   } catch (error) {
     connected(false);
@@ -1353,6 +1413,8 @@ function refreshOnReturn() {
     loadRuntime();
   if (document.getElementById("settings")?.classList.contains("active"))
     loadSettings();
+  if (document.getElementById("dashboard")?.classList.contains("active"))
+    loadDashboardSummaries();
   if (shouldContinueCertificationPoll(state.certificationActiveRun))
     scheduleCertificationPoll();
 }

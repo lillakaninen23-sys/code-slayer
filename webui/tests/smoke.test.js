@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -1750,3 +1750,82 @@ test("Tailscale generations reject stale GETs and mutation failures invalidate p
 test("system renderer displays backend deployment states without deriving them",()=>{const x={service:{state:"active",running:true,unit:"codeslayer.service",source:"systemd",version:"1",process_commit:"process-aaa",process_commit_source:"VERIFIED",process_source_dirty:false,process_source_state:"VERIFIED",running_commit:"process-aaa",running_commit_source:"VERIFIED",checkout_head:"checkout-bbb",checkout_head_source:"VERIFIED",checkout_source_dirty:false,checkout_source_state:"VERIFIED",checkout_source_state_source:"LIVE_ATTESTED",deployment_status:"MISMATCH",deployment_complete:false,uptime_seconds:10},network:{local_url:"http://127.0.0.1:8765",bind_host:"127.0.0.1",bind_port:8765},health:{status:"ok",schema_version:1,source:"backend"}};for(const st of ["VERIFIED","DIRTY","MISMATCH","UNVERIFIED"])assert.match(renderSystemSettings({...x,service:{...x.service,deployment_status:st}}),new RegExp(st));const h=renderSystemSettings(x,{operation:{kind:"update_apply",status:"RESPONSE_RECEIVED",result:{deployment_complete:false,restart_requested:true}}});assert.match(h,/process-aaa/);assert.match(h,/checkout-bbb/);assert.match(h,/Operation response — not current system state/);assert.match(h,/does not compare commits to derive a verdict/);assert.match(h,/Refresh current state/);});
 test("Tailscale renderer keeps intent Serve and remote access distinct with no Funnel control",()=>{const x={node:{state:"RUNNING",source:"LIVE_ATTESTED"},serve:{status:"MISMATCH",source:"LIVE_ATTESTED",expected_backend:"http://127.0.0.1:8765",observed_backend:"http://127.0.0.1:9999",funnel_detected:true,hosts:["node.ts.net"]},host:{name:"node.ts.net",source:"LIVE_ATTESTED",accepted:false,accepted_source:"LIVE_ATTESTED"},intent:{enabled:true,enabled_source:"CONFIG_BOUND",alignment:"MISMATCH"},remote_access:"UNVERIFIED",url:null,backend:"http://127.0.0.1:8765",enabled:true,enabled_source:"CONFIG_BOUND",alignment:"MISMATCH",detail:"backend mismatch",source:"LIVE_ATTESTED"};const h=renderTailscaleSettings(x);assert.match(h,/funnel_detected is true/);assert.match(h,/Intent enabled, Serve status, and remote_access are distinct fields/);assert.match(h,/network\/Serve\/Host-path verdict/);assert.match(h,/node\.ts\.net/);assert.doesNotMatch(h,/Enable Funnel|Disable Funnel|data-[^=]*funnel/i);});
 test("Settings app wiring is GET-only on page load and uses explicit fixed mutations",async()=>{const a=await readFile(new URL("../static/app.js",import.meta.url),"utf8"),v=await readFile(new URL("../static/views-admin.js",import.meta.url),"utf8");assert.doesNotMatch(a,/fetch\(/);assert.doesNotMatch(v,/fetch\(/);assert.doesNotMatch(a,/localStorage|sessionStorage|indexedDB/i);assert.doesNotMatch(v,/localStorage|sessionStorage|indexedDB/i);assert.doesNotMatch(a,/window\.confirm|confirm\(/);const p=a.slice(a.indexOf("async function loadSettings()"),a.indexOf("async function runSystemMutation"));assert.match(p,/loadSystemSettings/);assert.match(p,/loadTailscaleSettings/);assert.doesNotMatch(p,/systemUpdateCheck|systemUpdateApply|systemRestart|tailscaleEnable|tailscaleDisable/);assert.match(a,/api\.systemUpdateCheck\(\)/);assert.match(a,/api\.systemUpdateApply\(\)/);assert.match(a,/api\.systemRestart\(\)/);assert.match(a,/api\.tailscaleEnable\(\)/);assert.match(a,/api\.tailscaleDisable\(\)/);assert.match(a,/status:e\?\.code==="disconnected"\?"UNKNOWN":"FAILED"/);});
+
+
+test("Dashboard has four read-only control-plane summary cards and no admin action controls", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const start = html.indexOf('id="dashboard-control-summary"');
+  const end = html.indexOf("TECHNICAL ACTIVITY", start);
+  assert.ok(start >= 0 && end > start);
+  const block = html.slice(start, end);
+  for (const id of ["dashboard-system-summary", "dashboard-runtime-summary", "dashboard-certification-summary", "dashboard-tailscale-summary"]) assert.match(block, new RegExp(`id="${id}"`));
+  assert.match(block, /Read-only summaries/);
+  assert.match(block, /never[\s\S]*administrative mutation/);
+  assert.doesNotMatch(block, /<button|<form|data-runtime-|data-cert-|tailscale-enable|system-restart/i);
+});
+
+test("Dashboard summary generations reject stale responses and disconnect invalidates all snapshots", () => {
+  const x = {};
+  const first = beginDashboardSummaryRequest(x);
+  const second = beginDashboardSummaryRequest(x);
+  assert.equal(acceptDashboardSummary(x, first, { system: { service: { deployment_status: "VERIFIED" } } }), false);
+  assert.equal(acceptDashboardSummary(x, second, { system: { service: { deployment_status: "DIRTY" } } }), true);
+  assert.equal(x.dashboardSummary.system.service.deployment_status, "DIRTY");
+  assert.equal(rejectDashboardSummary(x, second, "Backend disconnected."), true);
+  assert.equal(x.dashboardSummary, null);
+  assert.equal(x.dashboardSummaryUnavailable, true);
+  assert.equal(acceptDashboardSummary(x, second, { system: { service: { deployment_status: "VERIFIED" } } }), false);
+});
+
+test("Dashboard deployment summary displays backend verdict and commits without comparing them", () => {
+  const html = renderDashboardSystemSummary({ service: { deployment_status: "MISMATCH", deployment_complete: false, process_commit: "process-aaa", checkout_head: "checkout-bbb" } });
+  assert.match(html, /MISMATCH/);
+  assert.match(html, /deployment_complete false/);
+  assert.match(html, /process-aaa/);
+  assert.match(html, /checkout-bbb/);
+  assert.doesNotMatch(html, /matches|same commit|derived/i);
+});
+
+test("Dashboard runtime and certification summaries remain configuration/projection only", () => {
+  const runtime = renderDashboardRuntimeSummary({ ollama_servers: [{ id: "a" }, { id: "b" }], workers: [{ worker_id: "w1" }] });
+  assert.match(runtime, /1 workers/);
+  assert.match(runtime, /2 Ollama servers/);
+  assert.match(runtime, /not live attestation/);
+  assert.doesNotMatch(runtime, /LIVE_ATTESTED|VERIFIED/);
+  const cert = renderDashboardCertificationSummary({ environment: "VALIDATION", workers: [{ worker_id: "w1", production_eligibility: { eligible: true } }] });
+  assert.match(cert, /VALIDATION/);
+  assert.match(cert, /1 certification workers/);
+  assert.match(cert, /does not derive Planner eligibility/);
+  assert.doesNotMatch(cert, />ELIGIBLE<|>BLOCKED</);
+});
+
+test("Dashboard remote-access summary keeps backend remote_access, Serve and intent distinct", () => {
+  const html = renderDashboardTailscaleSummary({ remote_access: "UNVERIFIED", serve: { status: "MISMATCH" }, intent: { enabled: true, alignment: "MISMATCH" } });
+  assert.match(html, /UNVERIFIED/);
+  assert.match(html, /Serve MISMATCH/);
+  assert.match(html, /intent enabled true/);
+  assert.match(html, /alignment MISMATCH/);
+  assert.match(html, /network\/Serve\/Host-path verdict only/);
+});
+
+test("Dashboard summary loader calls only GET admin projections and never mutates other admin state", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("async function loadDashboardSummaries()");
+  const end = appSource.indexOf("function settingsControls()", start);
+  assert.ok(start >= 0 && end > start);
+  const block = appSource.slice(start, end);
+  assert.match(block, /api\.system\(\)/);
+  assert.match(block, /api\.runtime\(\)/);
+  assert.match(block, /api\.certificationWorkers\(\)/);
+  assert.match(block, /api\.tailscale\(\)/);
+  assert.doesNotMatch(block, /systemRestart|systemUpdate|runtimeAttest|addOllama|registerRuntime|approveRuntime|certificationPreflight|startBaselineCertification|tailscaleEnable|tailscaleDisable/);
+  assert.doesNotMatch(block, /acceptRuntimeSnapshot|acceptCertificationWorkers|acceptSystemSnapshot|acceptTailscaleSnapshot/);
+  assert.match(block, /acceptDashboardSummary/);
+});
+
+test("Dashboard summary renderers escape backend-provided strings", () => {
+  const attack = '<img src=x onerror="alert(1)">';
+  assert.doesNotMatch(renderDashboardSystemSummary({ service: { deployment_status: attack, deployment_complete: attack, process_commit: attack, checkout_head: attack } }), /<img/);
+  assert.doesNotMatch(renderDashboardCertificationSummary({ environment: attack, workers: [] }), /<img/);
+  assert.doesNotMatch(renderDashboardTailscaleSummary({ remote_access: attack, serve: { status: attack }, intent: { enabled: attack, alignment: attack } }), /<img/);
+});
