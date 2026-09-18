@@ -15,6 +15,8 @@ import threading
 
 import pytest
 
+from code_slayer.planning.planner_certification import PLANNER_CERTIFICATION_POLICY_VERSION
+from code_slayer.planning.qualification_evidence import read_planner_qualification_evidence
 from code_slayer.security.live_certification import LiveOllamaRuntimeExpectation
 from code_slayer.security.live_planner_certification import (
     certify_live_planner_role,
@@ -49,6 +51,10 @@ class _Script:
         self.completion_status = 200
         self.completion_posts = 0
         self.default_completion = _plan_body()
+        # Every outgoing chat-completions request body, in order -- lets
+        # a test prove what was ACTUALLY sent (e.g. `max_tokens`), never
+        # just what the code claims to send.
+        self.captured_requests: list[dict | None] = []
 
 
 def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
@@ -80,6 +86,34 @@ def _text_body(text: str = "I cannot help with that.") -> bytes:
     ).encode()
 
 
+def _malformed_plan_body() -> bytes:
+    """A genuine tool call naming `emit_engineering_plan` but missing the
+    required `goal` field -- `parse_planner_output()` rejects it, which
+    `classify_planner_response()` maps to the CORRECTABLE `TOOL_SCHEMA_
+    INVALID` outcome, so `run_planner_case_with_correction()` retries
+    with feedback rather than terminating immediately."""
+    return json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "emit_engineering_plan",
+                                    "arguments": json.dumps({}),
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+    ).encode()
+
+
 def _make_handler(script: _Script) -> type:
     class Handler(http.server.BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes) -> None:
@@ -104,11 +138,15 @@ def _make_handler(script: _Script) -> type:
 
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length", 0))
-            self.rfile.read(length)
+            raw = self.rfile.read(length)
             path = self.path.split("?", 1)[0]
             if path != "/v1/chat/completions":
                 self._write(404, b"{}")
                 return
+            try:
+                script.captured_requests.append(json.loads(raw.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                script.captured_requests.append(None)
             script.completion_posts += 1
             if script.completions:
                 body = script.completions.pop(0)
@@ -257,8 +295,8 @@ def test_pass_creates_exactly_one_planner_role_certificate(
     assert after["baseline"] == before["baseline"]
     assert after["trust"] == before["trust"] == 0
     assert after["grants"] == before["grants"] == 0
-    # Exactly the fixed live suite -- two tasks, one repetition each.
-    assert script.completion_posts == 2
+    # Exactly the fixed live suite -- four tasks, one repetition each.
+    assert script.completion_posts == 4
 
 
 def test_certificate_binds_exact_runtime_and_role_evaluation_fingerprint(
@@ -521,7 +559,7 @@ def test_prior_planner_fail_does_not_block_new_certification(
 
     assert result.ok, result.reason
     assert result.outcome == RoleQualificationOutcome.PASS
-    assert script.completion_posts == 2
+    assert script.completion_posts == 4
     rows = RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER")
     assert len(rows) == 2
     assert {r.outcome for r in rows} == {"FAIL", "PASS"}
@@ -572,7 +610,7 @@ def test_stale_planner_policy_does_not_block_recertification(
 
     assert result.ok, result.reason
     assert result.outcome == RoleQualificationOutcome.PASS
-    assert script.completion_posts == 2
+    assert script.completion_posts == 4
 
 
 def test_role_evaluation_fingerprint_mismatch_does_not_block_recertification(
@@ -613,7 +651,7 @@ def test_role_evaluation_fingerprint_mismatch_does_not_block_recertification(
 
     assert result.ok, result.reason
     assert result.outcome == RoleQualificationOutcome.PASS
-    assert script.completion_posts == 2
+    assert script.completion_posts == 4
 
 
 def test_stale_role_certificate_never_bypasses_a_missing_baseline_match(
@@ -697,7 +735,207 @@ def test_currently_eligible_worker_allows_explicit_recertification(
     assert second.ok, second.reason
     assert second.outcome == RoleQualificationOutcome.PASS
     assert second.certificate_id != first.certificate_id
-    assert script.completion_posts == 4  # 2 for each of the two runs
+    assert script.completion_posts == 8  # 4 for each of the two runs
     rows = RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER")
     assert len(rows) == 2
     assert all(r.outcome == "PASS" for r in rows)
+
+
+# -- Review fix 1: output-token budget is enforced, not merely certified ----
+
+
+def test_output_token_budget_is_enforced_on_every_request_including_a_retry(
+    production_conn, blobs_dir, runtime_server,
+):
+    """Captures the ACTUAL outgoing completion request bodies (not just
+    the code's own claim) and proves every one of them -- across all
+    four suite tasks, including a forced correction retry -- carries
+    `max_tokens` equal to the exact configured output_token_budget."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+    # First live task's first attempt is schema-invalid (missing "goal")
+    # -> a CORRECTABLE outcome -> a real second request for that same
+    # instance. Every subsequent request (the retry, and the remaining
+    # three tasks) falls through to the good default_completion.
+    script.completions = [_malformed_plan_body()]
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    assert result.outcome == RoleQualificationOutcome.PASS
+    # 4 tasks + exactly 1 retry for the first task's schema-invalid attempt.
+    assert script.completion_posts == 5
+    assert len(script.captured_requests) == 5
+    for index, captured in enumerate(script.captured_requests):
+        assert captured is not None, f"request {index} was not valid JSON"
+        assert captured.get("max_tokens") == OUTPUT_TOKEN_BUDGET, (
+            f"request {index} did not carry the configured output_token_budget: {captured}"
+        )
+
+
+def test_evidence_records_output_budget_enforced_and_requested_max_tokens(
+    production_conn, blobs_dir, runtime_server,
+):
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        production_conn,
+        blobs_dir,
+        result.evidence_ref,
+        expected_runtime_identity_fingerprint=result.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.role_evaluation_fingerprint,
+    )
+    instances = document["instances"]
+    assert len(instances) == 4
+    for instance in instances:
+        assert instance["provenance"], instance
+        for attempt in instance["provenance"]:
+            assert attempt["output_budget_enforced"] is True, attempt
+            assert attempt["requested_max_tokens"] == OUTPUT_TOKEN_BUDGET, attempt
+
+
+def test_output_budget_not_enforced_refuses_certification(
+    production_conn, blobs_dir, runtime_server, monkeypatch,
+):
+    """Defense-in-depth: if the construction-level proof were ever
+    silently broken by a future change (e.g. `output_budget_
+    enforcement_verified` reverting to `False`), this module must
+    refuse to certify rather than mint a certificate from evidence that
+    does not actually prove the budget was enforced."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    import code_slayer.security.live_planner_certification as live_planner_certification_module
+    from code_slayer.planning.qualification import RuntimeContextProfile as RealProfile
+
+    def _unenforced_profile(**kwargs):
+        kwargs["output_budget_enforcement_verified"] = False
+        return RealProfile(**kwargs)
+
+    monkeypatch.setattr(
+        live_planner_certification_module, "RuntimeContextProfile", _unenforced_profile,
+    )
+    before = _counts(production_conn)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert not result.ok
+    assert result.reason == "output_token_budget_not_enforced"
+    assert _counts(production_conn) == before
+
+
+# -- Review fix 2: policy_version must equal the canonical constant, --------
+# -- checked before any model call -------------------------------------
+
+
+def test_matching_policy_version_proceeds(production_conn, blobs_dir, runtime_server):
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    result = _certify(production_conn, blobs_dir, root, )
+
+    assert result.ok, result.reason
+    assert script.completion_posts == 4
+
+
+def test_mismatched_configured_policy_blocks_before_any_model_call(
+    production_conn, blobs_dir, runtime_server,
+):
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+    before = _counts(production_conn)
+
+    result = certify_live_planner_role(
+        production_conn,
+        worker_id=WORKER,
+        blobs_dir=blobs_dir,
+        expected=_expected(root),
+        output_token_budget=OUTPUT_TOKEN_BUDGET,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        policy_version="some-other-policy-version",
+    )
+
+    assert not result.ok
+    assert result.reason == "planner_certification_policy_version_mismatch"
+    assert script.completion_posts == 0
+    assert _counts(production_conn) == before
+
+
+def test_certificate_and_role_evaluation_bind_the_exact_canonical_policy_version(
+    production_conn, blobs_dir, runtime_server,
+):
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    row = RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER")[0]
+    assert row.policy_version == PLANNER_CERTIFICATION_POLICY_VERSION
+    assert row.policy_version == POLICY_VERSION  # this test file's own constant agrees
+    identity = _identity(root)
+    expected_role_eval = role_evaluation_identity_from_config(
+        role=ProductionRole.PLANNER,
+        runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
+        output_token_budget=OUTPUT_TOKEN_BUDGET,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+    )
+    assert row.role_evaluation_fingerprint == expected_role_eval.role_evaluation_fingerprint
+
+
+# -- Review fix 3: PLANNER_CERTIFICATION_POLICY_VERSION is THE one ----------
+# -- authority-bearing identity, including for the live suite ---------------
+
+
+def test_certificate_under_an_older_policy_version_is_not_current_under_the_canonical_one(
+    production_conn, blobs_dir, runtime_server,
+):
+    """Simulates "the suite/policy changed": a certificate recorded
+    under an OLD policy version must be reported non-current by the
+    unmodified `evaluate_production_eligibility()` once evaluated
+    against the CURRENT canonical `PLANNER_CERTIFICATION_POLICY_
+    VERSION` -- proving a policy/suite bump has real authority effect,
+    never a decorative version nothing reads."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+    _seed_role_certificate(
+        production_conn, root,
+        outcome=RoleQualificationOutcome.PASS,
+        policy_version="planner-certification-v0-superseded",
+    )
+
+    identity = _identity(root)
+    role_eval_current = role_evaluation_identity_from_config(
+        role=ProductionRole.PLANNER,
+        runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
+        output_token_budget=OUTPUT_TOKEN_BUDGET,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+    )
+    decision = evaluate_production_eligibility(
+        production_conn,
+        worker_id=WORKER,
+        role=ProductionRole.PLANNER,
+        runtime_profile=identity,
+        role_evaluation=role_eval_current,
+        expected_role_policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+    )
+    assert decision.eligible is False
+    assert decision.reason in (
+        "role_certificate_policy_version_stale",
+        "role_certificate_evaluation_profile_mismatch",
+    )
+
+    # And -- per the "recertifiable" fix -- a fresh run under the
+    # CURRENT canonical policy still proceeds and certifies correctly.
+    result = _certify(production_conn, blobs_dir, root)
+    assert result.ok, result.reason
+    rows = RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER")
+    assert len(rows) == 2
+    current = next(r for r in rows if r.policy_version == PLANNER_CERTIFICATION_POLICY_VERSION)
+    assert current.outcome == "PASS"

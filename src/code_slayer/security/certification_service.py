@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from code_slayer.planning.planner_certification import PLANNER_CERTIFICATION_POLICY_VERSION
 from code_slayer.planning.qualification_evidence import read_planner_qualification_evidence
 from code_slayer.security.evidence import (
     read_baseline_security_evidence,
@@ -75,6 +76,7 @@ PLANNER_PREFLIGHT_CHECKS = (
     "worker_registration",
     "runtime_profile",
     "role_target_configured",
+    "policy_version_matches_canonical",
     "ollama_reachable",
     "ollama_version",
     "model_name",
@@ -799,6 +801,23 @@ class CertificationService:
         checks.append(_check(
             "role_target_configured", role_target is not None,
             "" if role_target is not None else "role_evaluation_not_configured",
+        ))
+        # H.2 fix: the configured policy version must equal EXACTLY the
+        # one `certify_planner_from_qualification()` itself uses
+        # (`planning.planner_certification.
+        # PLANNER_CERTIFICATION_POLICY_VERSION`) -- checked here, before
+        # any network I/O, so drifted persistent config can never reach
+        # `start_planner_certification()` at all. See `security.
+        # live_planner_certification`'s own module docstring ("One
+        # authoritative policy identity") for why this must never
+        # diverge.
+        policy_version_ok = (
+            role_target is not None
+            and role_target.policy_version == PLANNER_CERTIFICATION_POLICY_VERSION
+        )
+        checks.append(_check(
+            "policy_version_matches_canonical", policy_version_ok,
+            "" if policy_version_ok else "planner_certification_policy_version_mismatch",
         ))
         production_before = self._production_fingerprint()
 

@@ -59,18 +59,25 @@ introduces one.
 ## Pre-conditions, all fail-closed, all before any model call
 
 1. the worker exists in PRODUCTION.
-2. the live Ollama runtime is re-probed right now
+2. the caller-supplied `policy_version` (server-owned persistent
+   config; see `config.bindings.planner_role_evaluation_target_from_
+   worker`) equals EXACTLY `planning.planner_certification.
+   PLANNER_CERTIFICATION_POLICY_VERSION` -- the one canonical constant
+   `certify_planner_from_qualification()` itself uses to build the
+   certificate's own `policy_version`/`role_evaluation_fingerprint`.
+   See "One authoritative policy identity" below for why this check
+   exists at all and runs first, before any network I/O.
+3. the live Ollama runtime is re-probed right now
    (`security.live_certification.verify_ollama_runtime`) against the
    server-owned, config-derived `expected` -- a changed digest or
    runtime version fails closed here.
-3. the CURRENT common runtime identity is rebuilt from that verified
+4. the CURRENT common runtime identity is rebuilt from that verified
    probe and must recompute to exactly
    `expected.expected_runtime_identity_fingerprint`.
-4. a Planner `RoleEvaluationIdentity` is built from the caller-supplied
-   `role_target` (server-owned persistent config; see `config.bindings.
-   planner_role_evaluation_target_from_worker`) bound to that same
-   verified runtime identity.
-5. `workers.production_eligibility.evaluate_production_eligibility()`
+5. a Planner `RoleEvaluationIdentity` is built from the caller-supplied
+   `role_target` bound to that same verified runtime identity (using
+   the now-verified-canonical policy version from step 2).
+6. `workers.production_eligibility.evaluate_production_eligibility()`
    is consulted with that identity pair -- the SAME evaluator every
    other eligibility decision in this codebase uses, never a
    reimplementation of certificate matching. Before a role certificate
@@ -91,19 +98,99 @@ introduces one.
    -- or `eligible=True` outright (re-certifying an already-qualified
    worker) -- is the expected, proceed-past state: that is precisely
    the gap this module exists to fill.
-6. the live Ollama runtime is re-probed a SECOND time immediately
+7. the live Ollama runtime is re-probed a SECOND time immediately
    before certifying, closing the gap between the qualification run
    (which can take a while -- real model calls) and the PRODUCTION
    write, mirroring `live_certification.
    certify_live_baseline_security`'s own pre-record re-probe.
+8. after the qualification suite completes, every resulting attempt's
+   OWN durable provenance is checked to confirm the configured output-
+   token budget was actually enforced on that exact attempt (see
+   "Output-token budget is enforced, not merely certified" below) --
+   a failure here refuses certification rather than minting one from
+   unverified evidence.
 
 Only once every one of those holds does this module ever call the
-model.
+model, and only once step 8 also holds does it ever call
+`certify_planner_from_qualification()`.
+
+## One authoritative policy identity (no independent suite version)
+
+There is exactly ONE authority-bearing Planner certification policy
+identity: `planning.planner_certification.
+PLANNER_CERTIFICATION_POLICY_VERSION`. It already covers everything
+that identity needs to cover, because `workers.role_qualification.
+canonical_role_evaluation_spec()` already bakes `policy_version` into
+`role_evaluation_fingerprint`, and `record_role_certificate()` already
+stores it as the certificate's own `policy_version` column -- both
+pre-existing, unmodified mechanisms this module does not touch.
+
+This module deliberately does NOT define its own separate "live suite
+version" constant. The fixed task suite in `_live_qualification_suite()`
+is covered BY `PLANNER_CERTIFICATION_POLICY_VERSION`: changing what the
+suite tests (adding/removing/materially changing a task) is a change to
+what "Planner-certified" means, exactly like changing the certification
+rule itself would be, and MUST bump that one constant in `planning.
+planner_certification` -- never a second, independently-tracked
+identifier that nothing reads. Bumping it immediately makes every
+existing certificate non-current (`evaluate_production_eligibility()`'s
+`expected_role_policy_version` match, and the stored `role_evaluation_
+fingerprint` comparison, both fail for the old value) -- the exact
+authority effect a suite change needs, achieved entirely through
+machinery that already existed before H.2.
+
+Pre-condition 2 above is what makes this real rather than aspirational:
+a `role_target.policy_version` that has drifted from the current
+`PLANNER_CERTIFICATION_POLICY_VERSION` (e.g. stale persistent config
+after an operator bumped the constant but not every worker's config)
+is refused before any model call, rather than silently certifying
+under whichever value happened to be configured while `certify_
+planner_from_qualification()` itself uses the OTHER, canonical one --
+the exact divergence this pre-condition exists to close.
+
+## Output-token budget is enforced, not merely certified
+
+`planning.qualification.run_planner_case_with_correction()` only ever
+copies `context_profile.output_token_budget` onto the actual
+`PlannerRequest` sent to the model when `context_profile.
+output_budget_enforcement_verified` is `True`. This module sets that
+flag `True` because the mapping from there to an actual bounded
+provider request is a verified, unconditional chain in already-existing
+code, not an assumption:
+
+  `PlannerRequest.output_token_budget`
+    -> `workers.protocol.WorkerRequest.max_output_tokens`
+       (`planning.worker_planner.WorkerAdapterPlanner.plan()`,
+       unconditional)
+    -> the provider request's own `max_tokens` field
+       (`workers.openai_compatible_adapter.OpenAICompatibleAdapter`,
+       unconditional whenever `max_output_tokens is not None`)
+
+`tests/unit/test_live_planner_certification.py` proves this end to end
+against a real fake HTTP server, by capturing and asserting on the
+actual outgoing JSON body's `max_tokens` field for every attempt of
+every task, including a forced correction retry -- not merely on the
+boolean. Because `run_planner_case_with_correction()` sets `output_
+token_budget` on `current_request` once and `dataclasses.replace()`
+preserves it across every subsequent correction attempt, one verified
+mapping covers every attempt structurally.
+
+As defense-in-depth against a FUTURE regression silently breaking that
+chain (exactly the shape of bug this fix responds to), this module also
+re-verifies it at runtime, from the durable attempt provenance
+`build_attempt_provenance()` already records -- never trusting the
+static proof alone: after the suite completes, every
+`QualificationAttemptResult.provenance` entry must show
+`output_budget_enforced is True` and `requested_max_tokens ==
+output_token_budget`. Any attempt that does not is refused
+(`output_token_budget_not_enforced`) before `certify_planner_from_
+qualification()` is ever called -- fail closed rather than mint a
+certificate from evidence that does not actually prove what it claims.
 
 ## The security/runtime layer vs the role layer -- a semantic gate, not
 ## a reason-specific one
 
-Pre-condition 5 above is deliberately interpreted, never reason-listed
+Pre-condition 6 above is deliberately interpreted, never reason-listed
 by accident: `ROLE_LAYER_ELIGIBILITY_REASONS` names every reason
 `evaluate_production_eligibility()` can return once Baseline Security
 has ALREADY passed and only the role side remains unresolved
@@ -178,8 +265,10 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from code_slayer.intelligence.models import CommandCandidate, ProjectEvidence
 from code_slayer.planning.planner import PlannerRequest
 from code_slayer.planning.planner_certification import (
+    PLANNER_CERTIFICATION_POLICY_VERSION,
     RoleCertificationResult,
     certify_planner_from_qualification,
 )
@@ -215,17 +304,6 @@ from code_slayer.workers.security_baseline import (
     runtime_profile_identity_from_config,
 )
 
-# The fixed, code-owned identifier of the live qualification task suite
-# this module currently runs -- mirrors `security.evaluation.
-# EVALUATION_SUITE_VERSION`/`workers.conformance.SUITE_VERSION`'s own
-# role: a later change to what "the Planner live suite" even means
-# bumps this identifier rather than silently reinterpreting old runs.
-# v1 is deliberately small (two self-contained, low-ambiguity,
-# read-only-flavored tasks, one repetition each) to keep real model-call
-# volume bounded; widening it never requires touching the certification
-# or classification logic above.
-PLANNER_LIVE_QUALIFICATION_SUITE_VERSION = "planner-live-qualification-v1"
-
 ROLE_LAYER_ELIGIBILITY_REASONS = frozenset(
     {
         "no_role_certificate",
@@ -248,6 +326,46 @@ class PlannerLiveQualificationTask:
     allowed_scope: tuple[str, ...] | None = None
 
 
+# The fixed, code-owned live qualification task suite. THERE IS NO
+# SEPARATE SUITE-VERSION CONSTANT: the suite's content is authority-
+# bearing, covered by `PLANNER_CERTIFICATION_POLICY_VERSION` itself (see
+# "One authoritative policy identity" above). A change to this suite
+# (adding/removing/materially changing a task's classification-relevant
+# behavior) MUST bump `PLANNER_CERTIFICATION_POLICY_VERSION` in
+# `planning.planner_certification` -- that is what makes an old
+# certificate stop being current (both its stored `policy_version`
+# column and its `role_evaluation_fingerprint`, which embeds
+# `policy_version`, change), never a decorative identifier nobody reads.
+#
+# Four small, distinct, code-owned instances (`repetitions=1` each, kept
+# deliberately bounded for real model-call volume) exercising DIFFERENT
+# qualification dimensions the SAME existing `run_corrected_planner_
+# case()` / `classify_planner_response()` machinery already grades --
+# never a second classifier, never new semantics:
+#
+# - LIVE-PLANNER-001: minimal, no repo_context, no allowed_scope.
+#   Structured tool-call compliance and task relevance in their plainest
+#   form -- the baseline case.
+# - LIVE-PLANNER-002: real `repo_context`/`discovered_commands` evidence
+#   naming an existing file, and a request that asks the plan to modify
+#   THAT file. Exercises repository/evidence grounding -- the model has
+#   concrete evidence available and a request specific enough that a
+#   plausible plan should reference it.
+# - LIVE-PLANNER-003: `allowed_scope=("src/example_service/",)` plus a
+#   request that only makes sense as a change under that prefix.
+#   Exercises `classify_planner_response`'s SCOPE_VIOLATION path (opt-in
+#   via `allowed_scope`) and, for any claimed path, the always-on
+#   universal POLICY_VIOLATION path -- neither is exercised at all by a
+#   task that never sets `allowed_scope`.
+# - LIVE-PLANNER-004: a longer, multi-part request (several distinct
+#   requirements in one ask). Exercises the richer `PlannerStructuredOutput`
+#   fields (`requirements`/`planned_changes`/`verification_steps`) under
+#   more demanding task relevance than a single-sentence ask.
+#
+# Every instance still shares the SAME `context_profile` (runtime/context
+# binding) and the SAME default `max_correction_attempts` (bounded
+# correction behavior remains available, never disabled, for whichever
+# instance actually needs it) -- see `certify_live_planner_role()`.
 def _live_qualification_suite() -> tuple[PlannerLiveQualificationTask, ...]:
     return (
         PlannerLiveQualificationTask(
@@ -261,7 +379,48 @@ def _live_qualification_suite() -> tuple[PlannerLiveQualificationTask, ...]:
         PlannerLiveQualificationTask(
             qualification_class="LIVE-PLANNER-002",
             request=PlannerRequest(
-                original_request="Add a read-only health-check endpoint.",
+                original_request=(
+                    "The existing read-only status endpoint is implemented in "
+                    "src/example_service/status.py. Add a new field to its response "
+                    "that reports the service's current uptime in seconds."
+                ),
+                repo_context=(
+                    ProjectEvidence(
+                        kind="python",
+                        evidence_paths=("src/example_service/status.py",),
+                        facts={"framework": "flask"},
+                    ),
+                ),
+                discovered_commands=(
+                    CommandCandidate(
+                        command="pytest tests/test_status.py",
+                        purpose="test",
+                        evidence_source="src/example_service/status.py",
+                        confidence="high",
+                    ),
+                ),
+            ),
+        ),
+        PlannerLiveQualificationTask(
+            qualification_class="LIVE-PLANNER-003",
+            request=PlannerRequest(
+                original_request=(
+                    "Within src/example_service/ only, add a read-only endpoint "
+                    "that lists the service's configured feature flags."
+                ),
+            ),
+            allowed_scope=("src/example_service/",),
+        ),
+        PlannerLiveQualificationTask(
+            qualification_class="LIVE-PLANNER-004",
+            request=PlannerRequest(
+                original_request=(
+                    "Add a read-only reporting endpoint that: (1) returns the "
+                    "count of items processed in the last 24 hours, (2) returns "
+                    "the current queue depth, and (3) includes a timestamp of "
+                    "when the report was generated. Do not add any endpoint that "
+                    "mutates state."
+                ),
             ),
         ),
     )
@@ -362,6 +521,16 @@ def certify_live_planner_role(
         return _deny("malformed_planner_certification_request")
     if not isinstance(blobs_dir, (str, Path)) or not str(blobs_dir).strip():
         return _deny("missing_durable_qualification_evidence")
+    if not isinstance(policy_version, str) or not policy_version:
+        return _deny("malformed_planner_certification_request")
+    # Pre-condition 2 (module docstring, "One authoritative policy
+    # identity"): the configured policy version must equal EXACTLY the
+    # one `certify_planner_from_qualification()` itself will use --
+    # checked before any network I/O, so a drifted configuration can
+    # never certify under a policy identity different from the one the
+    # resulting certificate will actually claim.
+    if policy_version != PLANNER_CERTIFICATION_POLICY_VERSION:
+        return _deny("planner_certification_policy_version_mismatch")
     if WorkersRepo(production_conn).get(worker_id) is None:
         return _deny("unknown_worker")
 
@@ -427,7 +596,12 @@ def certify_live_planner_role(
         endpoint=expected.openai_base_url,
         runtime_version=expected.runtime_version,
         tool_choice_enforcement=tool_choice_enforcement,
-        output_budget_enforcement_verified=False,
+        # Verified True, not assumed -- see the module docstring's
+        # "Output-token budget is enforced, not merely certified" for
+        # the exact unconditional mapping this relies on, and the
+        # post-suite provenance re-check below that never trusts this
+        # flag alone.
+        output_budget_enforcement_verified=True,
         normalizer_id=expected.normalizer_id,
         normalizer_version=expected.normalizer_version,
         temperature=float(expected.temperature),
@@ -467,6 +641,25 @@ def certify_live_planner_role(
     )
     if combined_results and all(r.outcome in transport_outcomes for r in combined_results):
         any_early_stopped = True
+
+    # Fail closed rather than mint a certificate from evidence that does
+    # not actually prove the configured output-token budget was
+    # enforced -- see the module docstring's "Output-token budget is
+    # enforced, not merely certified". Runs only when there is real
+    # qualification evidence to check (an early-stopped run is already
+    # refused for that reason; no need to mask it with this one).
+    if not any_early_stopped:
+        for result in combined_results:
+            for attempt in result.provenance:
+                if (
+                    not attempt.output_budget_enforced
+                    or attempt.requested_max_tokens != output_token_budget
+                ):
+                    return _deny(
+                        "output_token_budget_not_enforced",
+                        runtime_identity_fingerprint=fingerprint,
+                        role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
+                    )
 
     # Close the gap between the (potentially slow, real-model-call)
     # qualification run and the PRODUCTION write: re-probe live Ollama
