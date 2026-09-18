@@ -47,6 +47,10 @@ def install_service(
 
     Does not depend on exported CODESLAYER_CERT_* variables. Existing
     state.db / evidence / certificates are not moved or deleted.
+
+    `systemctl --user daemon-reload` and `enable --now` are fail-closed:
+    a non-zero status aborts installation. Linger is best-effort and is
+    never labelled VERIFIED when it did not succeed.
     """
     run = runner or run_fixed
     create = venv_create or venv.create
@@ -83,14 +87,18 @@ def install_service(
         encoding="utf-8",
     )
     reload_r = run((SYSTEMCTL, "--user", "daemon-reload"))
+    if reload_r.returncode != 0:
+        raise ProcessError(
+            "systemctl_daemon_reload_failed",
+            reload_r.stderr.strip() or reload_r.stdout.strip(),
+        )
     enable_r = run((SYSTEMCTL, "--user", "enable", "--now", CODESLAYER_UNIT))
-    linger_r = None
-    user = os.environ.get("USER") or os.environ.get("LOGNAME")
-    if user:
-        try:
-            linger_r = run(("loginctl", "enable-linger", user), timeout=10.0)
-        except ProcessError:
-            linger_r = None
+    if enable_r.returncode != 0:
+        raise ProcessError(
+            "systemctl_enable_failed",
+            enable_r.stderr.strip() or enable_r.stdout.strip(),
+        )
+    linger = _enable_linger(run)
     return {
         "checkout": str(root),
         "webui_dir": str(webui),
@@ -99,8 +107,41 @@ def install_service(
         "unit_path": str(unit),
         "systemd_reload": _result_view(reload_r),
         "enable_start": _result_view(enable_r),
-        "linger": None if linger_r is None else _result_view(linger_r),
+        "linger": linger,
         "version": __version__,
+    }
+
+
+def _enable_linger(run) -> dict:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        return {
+            "attempted": False,
+            "ok": False,
+            "source": "UNVERIFIED",
+            "detail": "linger_user_unknown",
+        }
+    try:
+        result = run(("loginctl", "enable-linger", user), timeout=10.0)
+    except ProcessError as exc:
+        return {
+            "attempted": True,
+            "ok": False,
+            "source": "UNVERIFIED",
+            "detail": exc.code,
+        }
+    if result.returncode != 0:
+        return {
+            "attempted": True,
+            "ok": False,
+            "source": "UNVERIFIED",
+            "detail": "linger_failed",
+        }
+    return {
+        "attempted": True,
+        "ok": True,
+        "source": "VERIFIED",
+        "detail": "linger_enabled",
     }
 
 

@@ -224,10 +224,10 @@ exact fingerprint match).
 
 | Method / path | Returns |
 | --- | --- |
-| `GET /api/system` | Service running/stopped, version, running commit (`VERIFIED`/`UNVERIFIED`), uptime, health, local URL, bind host/port |
+| `GET /api/system` | Service running/stopped, version, **process_commit** captured at process start (`VERIFIED`/`UNVERIFIED`), **checkout_head** observed now (`OBSERVED`/`UNVERIFIED`), `deployment_status` (`VERIFIED`/`MISMATCH`/`UNVERIFIED`), `deployment_complete`. `running_commit` is the process-start SHA, never a later checkout HEAD. After `git merge` and before restart: process_commit OLD, checkout_head NEW, deployment MISMATCH |
 | `POST /api/system/restart` | `{ }` only. systemd --user restart of `codeslayer.service` |
 | `POST /api/system/update/check` | `{ }` only. Fail-closed git check: expected remotes only, dirty/divergent reported, never a deployment |
-| `POST /api/system/update/apply` | `{ }` only. Fast-forward only. Refuses dirty/divergent/unexpected remotes. `deployment_complete` is false until `GET /api/system` shows the new `running_commit` after restart. `git merge` is not a completed deployment |
+| `POST /api/system/update/apply` | `{ }` only. Fast-forward only. Refuses dirty/divergent/unexpected remotes. `deployment_complete` is false until `GET /api/system` shows `process_commit == checkout_head` after restart. `git merge` is not a completed deployment |
 | `GET /api/runtime` | Config-bound Ollama servers and workers. **Does not probe live.** Provenance labels are `CONFIG_BOUND` / `UNVERIFIED` |
 | `POST /api/runtime/attest` | `{ }` only. Live-attests configured workers (`VERIFIED`/`MISMATCH`/`UNREACHABLE`/`OBSERVED`/`UNVERIFIED`) |
 | `POST /api/runtime/ollama-servers` | `{id, origin}` only. Tests the origin then saves it. Invalid origin: 400. Unreachable: 409, not saved |
@@ -235,7 +235,7 @@ exact fingerprint match).
 | `POST /api/runtime/workers` | `{worker_id, ollama_server_id, model_tag}` plus optional kind/network_class/context/temperature/normalizer. **Rejects digest/fingerprint/outcome/adapter/evidence_ref.** Preserves any already-approved identity |
 | `POST /api/runtime/workers/{id}/approve` | `{ }` only. Approves the live-attested digest/version. Mismatch against an existing approved identity returns `MISMATCH` and does not overwrite |
 | `POST /api/runtime/workers/{id}/approve-new-identity` | `{ }` only. Replaces the approved identity from live attestation. Does not transfer certificates |
-| `GET /api/tailscale` | Local Tailscale CLI status plus configured Serve backend |
+| `GET /api/tailscale` | Node connectivity from `tailscale status --json` (`OBSERVED`) plus Serve mapping from `tailscale serve status --json`. CSLR remote access is `VERIFIED` only when the node is Connected **and** Serve proxies the configured loopback backend. Connected-without-Serve is `UNVERIFIED`. Wrong backend or Funnel is `MISMATCH`. Malformed/unavailable Serve status is `UNVERIFIED`/`ERROR`, never `VERIFIED` |
 | `POST /api/tailscale/enable` | `{ }` only. `tailscale serve --bg http://127.0.0.1:PORT`. Rejects non-loopback backends. Never Funnel |
 | `POST /api/tailscale/disable` | `{ }` only. `tailscale serve reset` |
 

@@ -6,6 +6,7 @@ import ast
 import http.server
 import inspect
 import json
+import subprocess
 import threading
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from code_slayer.admin.process import ProcessError, ProcessResult
 from code_slayer.admin.service import install_service, service_status
 from code_slayer.admin.systemd import render_user_unit
 from code_slayer.admin.tailscale import enable_serve
+from code_slayer.admin.tailscale import status as tailscale_status
 from code_slayer.admin.updates import apply_update, check_for_update
 from code_slayer.api import create_app
 from code_slayer.cli.main import cli
@@ -231,6 +233,115 @@ def test_install_service_preserves_state_and_writes_unit(tmp_path, monkeypatch):
     loaded = load_config(path=config_path)
     assert loaded.server.checkout == str(checkout.resolve())
     assert loaded.server.host == "127.0.0.1"
+    assert result["linger"]["source"] in {"VERIFIED", "UNVERIFIED"}
+
+
+def _install_checkout(tmp_path: Path) -> Path:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "pyproject.toml").write_text("[project]\nname='code-slayer'\n")
+    webui = checkout / "webui"
+    (webui / "static").mkdir(parents=True)
+    (webui / "index.html").write_text("<html></html>")
+    (webui / "static" / "app.js").write_text("")
+    return checkout
+
+
+def _fake_venv(path, with_pip=True, clear=False):
+    bin_dir = Path(path) / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
+    (bin_dir / "codeslayer").write_text("#!/bin/sh\n")
+
+
+def test_install_service_fails_closed_on_daemon_reload(tmp_path):
+    checkout = _install_checkout(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        if argv[:3] == ("systemctl", "--user", "daemon-reload"):
+            return ProcessResult(tuple(argv), 1, "", "reload failed")
+        return _ok(argv)
+
+    with pytest.raises(ProcessError) as caught:
+        install_service(
+            checkout=checkout,
+            config_path=tmp_path / "config.toml",
+            state_root=tmp_path / "state",
+            runner=fake_run,
+            venv_create=_fake_venv,
+        )
+    assert caught.value.code == "systemctl_daemon_reload_failed"
+
+
+def test_install_service_fails_closed_on_enable(tmp_path):
+    checkout = _install_checkout(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        if argv[:3] == ("systemctl", "--user", "enable"):
+            return ProcessResult(tuple(argv), 1, "", "enable failed")
+        return _ok(argv)
+
+    with pytest.raises(ProcessError) as caught:
+        install_service(
+            checkout=checkout,
+            config_path=tmp_path / "config.toml",
+            state_root=tmp_path / "state",
+            runner=fake_run,
+            venv_create=_fake_venv,
+        )
+    assert caught.value.code == "systemctl_enable_failed"
+
+
+def test_cli_install_service_does_not_print_installed_on_reload_or_enable_failure(
+    tmp_path, monkeypatch,
+):
+    checkout = _install_checkout(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("CODESLAYER_STATE_ROOT", str(tmp_path / "state"))
+    monkeypatch.setattr("code_slayer.admin.service.venv.create", _fake_venv)
+
+    def fail_reload(argv, **kwargs):
+        if argv[:3] == ("systemctl", "--user", "daemon-reload"):
+            return ProcessResult(tuple(argv), 5, "", "reload failed")
+        return _ok(argv)
+
+    monkeypatch.setattr("code_slayer.admin.service.run_fixed", fail_reload)
+    reload_result = CliRunner().invoke(cli, ["install-service", "--checkout", str(checkout)])
+    assert reload_result.exit_code != 0
+    assert "installed" not in reload_result.output.lower()
+    assert "systemctl_daemon_reload_failed" in reload_result.output
+
+    def fail_enable(argv, **kwargs):
+        if argv[:3] == ("systemctl", "--user", "enable"):
+            return ProcessResult(tuple(argv), 1, "", "enable failed")
+        return _ok(argv)
+
+    monkeypatch.setattr("code_slayer.admin.service.run_fixed", fail_enable)
+    enable_result = CliRunner().invoke(cli, ["install-service", "--checkout", str(checkout)])
+    assert enable_result.exit_code != 0
+    assert "installed" not in enable_result.output.lower()
+    assert "systemctl_enable_failed" in enable_result.output
+
+
+def test_install_service_linger_failure_is_unverified_not_blocking(tmp_path):
+    checkout = _install_checkout(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "loginctl":
+            return ProcessResult(tuple(argv), 1, "", "linger denied")
+        return _ok(argv)
+
+    result = install_service(
+        checkout=checkout,
+        config_path=tmp_path / "config.toml",
+        state_root=tmp_path / "state",
+        runner=fake_run,
+        venv_create=_fake_venv,
+    )
+    assert result["enable_start"]["ok"] is True
+    assert result["linger"]["ok"] is False
+    assert result["linger"]["source"] == "UNVERIFIED"
+    assert result["linger"]["source"] != "VERIFIED"
 
 
 def test_get_runtime_is_config_bound_not_a_live_probe(admin_app):
@@ -355,6 +466,7 @@ def test_system_status_and_forbidden_authority_fields(admin_app):
     status = client.get("/api/system").get_json()
     assert status["network"]["bind_host"] == "127.0.0.1"
     assert status["service"]["running_commit_source"] in {"VERIFIED", "UNVERIFIED"}
+    assert status["service"]["process_commit"] == status["service"]["running_commit"]
     for path in (
         "/api/system/restart",
         "/api/system/update/check",
@@ -363,6 +475,33 @@ def test_system_status_and_forbidden_authority_fields(admin_app):
     ):
         response = client.post(path, json={"cmd": "rm -rf /"})
         assert response.status_code == 400
+
+
+def test_process_commit_does_not_follow_checkout_head(admin_app):
+    client, _app, _config, repo = admin_app
+    first = client.get("/api/system").get_json()["service"]
+    process = first["process_commit"]
+    assert process
+    assert first["process_commit_source"] == "VERIFIED"
+    assert first["running_commit"] == process
+    assert first["running_commit_source"] == "VERIFIED"
+    assert first["checkout_head"] == process
+    assert first["checkout_head_source"] == "OBSERVED"
+    assert first["deployment_status"] == "VERIFIED"
+    assert first["deployment_complete"] is True
+    (repo / "after-start.txt").write_text("new\n")
+    subprocess.run(["git", "add", "after-start.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "after start"], cwd=repo, check=True, capture_output=True,
+    )
+    second = client.get("/api/system").get_json()["service"]
+    assert second["process_commit"] == process
+    assert second["running_commit"] == process
+    assert second["checkout_head"] != process
+    assert len(second["checkout_head"]) == 40
+    assert second["checkout_head_source"] == "OBSERVED"
+    assert second["deployment_complete"] is False
+    assert second["deployment_status"] == "MISMATCH"
 
 
 def test_tailscale_never_funnel_and_loopback_only():
@@ -384,6 +523,119 @@ def test_tailscale_never_funnel_and_loopback_only():
     assert "funnel" not in captured[0]
     with pytest.raises(ProcessError, match="loopback"):
         enable_serve(runner=runner, backend_host="0.0.0.0", backend_port=8765)
+
+
+def _tailscale_runner(node_doc, serve_doc, *, serve_code=0, serve_raw=None):
+    def runner(argv, **kwargs):
+        if argv[:3] == ("tailscale", "status", "--json"):
+            return _ok(argv, json.dumps(node_doc))
+        if argv[:4] == ("tailscale", "serve", "status", "--json"):
+            body = serve_raw if serve_raw is not None else json.dumps(serve_doc)
+            return ProcessResult(tuple(argv), serve_code, body, "")
+        return _ok(argv)
+    return runner
+
+
+def test_tailscale_connected_without_serve_is_not_remote_verified():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            {"BackendState": "Running", "Self": {"DNSName": "node.ts.net."}},
+            {},
+        ),
+        backend_host="127.0.0.1",
+        backend_port=8765,
+    )
+    assert view.node_state == "Connected"
+    assert view.serve_status == "not_configured"
+    assert view.remote_access != "VERIFIED"
+    assert view.remote_access == "UNVERIFIED"
+
+
+def test_tailscale_wrong_serve_backend_is_mismatch():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            {"BackendState": "Running", "Self": {"DNSName": "node.ts.net."}},
+            {
+                "TCP": {"443": {"HTTPS": True}},
+                "Web": {
+                    "node.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
+                    },
+                },
+            },
+        ),
+    )
+    assert view.serve_status == "MISMATCH"
+    assert view.remote_access == "MISMATCH"
+    assert view.observed_backend == "http://127.0.0.1:9999"
+
+
+def test_tailscale_correct_serve_backend_is_verified():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            {"BackendState": "Running", "Self": {"DNSName": "node.ts.net."}},
+            {
+                "TCP": {"443": {"HTTPS": True}},
+                "Web": {
+                    "node.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8765"}},
+                    },
+                },
+            },
+        ),
+    )
+    assert view.serve_status == "VERIFIED"
+    assert view.remote_access == "VERIFIED"
+    assert view.node_state == "Connected"
+    assert view.funnel_detected is False
+    assert _normalize_check(view.observed_backend) == "http://127.0.0.1:8765"
+
+
+def _normalize_check(value: str | None) -> str:
+    from code_slayer.admin.tailscale import _normalize_proxy
+    assert value is not None
+    return _normalize_proxy(value)
+
+
+def test_tailscale_malformed_or_unavailable_serve_is_never_verified():
+    connected = {"BackendState": "Running", "Self": {"DNSName": "node.ts.net."}}
+    malformed = tailscale_status(
+        runner=_tailscale_runner(connected, None, serve_raw="not-json"),
+    )
+    assert malformed.serve_status == "ERROR"
+    assert malformed.remote_access != "VERIFIED"
+    failed = tailscale_status(
+        runner=_tailscale_runner(connected, {}, serve_code=1),
+    )
+    assert failed.serve_status == "ERROR"
+    assert failed.remote_access != "VERIFIED"
+    missing = tailscale_status(
+        runner=lambda argv, **kwargs: (_ for _ in ()).throw(
+            ProcessError("executable_missing", "tailscale"),
+        ),
+    )
+    assert missing.remote_access != "VERIFIED"
+    assert missing.serve_status == "UNVERIFIED"
+
+
+def test_tailscale_funnel_mapping_is_mismatch_not_verified():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            {"BackendState": "Running", "Self": {"DNSName": "node.ts.net."}},
+            {
+                "TCP": {"443": {"HTTPS": True}},
+                "Web": {
+                    "node.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:8765"}},
+                    },
+                },
+                "AllowFunnel": {"node.ts.net:443": True},
+            },
+        ),
+    )
+    assert view.funnel_detected is True
+    assert view.serve_status == "MISMATCH"
+    assert view.remote_access != "VERIFIED"
 
 
 def test_update_refuses_unexpected_remote_dirty_and_divergent(tmp_path):

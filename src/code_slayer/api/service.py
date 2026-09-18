@@ -97,6 +97,7 @@ class ApplicationService:
         self._explicit_bindings = bindings or RuntimeBindings()
         self._started_at = time.monotonic()
         self._started_wall = time.time()
+        self.process_commit, self.process_commit_source = self._capture_process_commit()
         self.bindings = self._compose_bindings()
         # Initialize through the real application service, including existing
         # migrations, and idempotently register every runtime-declared
@@ -147,6 +148,26 @@ class ApplicationService:
             ),
         )
         self._certification_executor.start()
+
+    def _capture_process_commit(self) -> tuple[str | None, str]:
+        """Retain checkout HEAD at process start. Not re-read later.
+
+        A later `git rev-parse HEAD` is checkout_head, not running_commit.
+        """
+        from code_slayer.admin.process import git_rev_parse_head
+
+        sha = git_rev_parse_head(self.repo_path)
+        if sha is None:
+            return None, "UNVERIFIED"
+        return sha, "VERIFIED"
+
+    def current_checkout_head(self) -> tuple[str | None, str]:
+        from code_slayer.admin.process import git_rev_parse_head
+
+        sha = git_rev_parse_head(self.repo_path)
+        if sha is None:
+            return None, "UNVERIFIED"
+        return sha, "OBSERVED"
 
     def _compose_bindings(self) -> RuntimeBindings:
         explicit = self._explicit_bindings

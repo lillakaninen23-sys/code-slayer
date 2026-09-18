@@ -68,6 +68,10 @@ def install_service_cmd(checkout: str | None) -> None:
     click.echo("installed")
     for key in ("checkout", "venv", "config_path", "unit_path", "version"):
         click.echo(f"{key}: {result[key]}")
+    linger = result.get("linger") or {}
+    click.echo(
+        f"linger: {linger.get('source', 'UNVERIFIED')} ({linger.get('detail', '')})"
+    )
     click.echo("local_url: http://127.0.0.1:8765")
     click.echo("Ordinary administration is in the WebUI. Terminal is for recovery.")
 

@@ -330,7 +330,10 @@ async function renderSystem() {
         ${badge(health.status || "unknown", statusKind(health.status))}
       </div>
       <p>Version: <code>${escapeHtml(service.version)}</code></p>
-      <p>Running commit: <code>${escapeHtml(service.running_commit || "")}</code> ${badge(service.running_commit_source || "UNVERIFIED", statusKind(service.running_commit_source))}</p>
+      <p>Process commit (running): <code>${escapeHtml(service.process_commit || service.running_commit || "")}</code> ${badge(service.process_commit_source || service.running_commit_source || "UNVERIFIED", statusKind(service.process_commit_source || service.running_commit_source))}</p>
+      <p>Checkout HEAD: <code>${escapeHtml(service.checkout_head || "")}</code> ${badge(service.checkout_head_source || "UNVERIFIED", statusKind(service.checkout_head_source))}</p>
+      <p>Deployment: ${badge(service.deployment_status || "UNVERIFIED", statusKind(service.deployment_status))} complete=<code>${escapeHtml(service.deployment_complete)}</code></p>
+      <p class="note">Process commit is captured at process start and does not follow git HEAD until restart.</p>
       <p>Uptime: <code>${escapeHtml(service.uptime_seconds)}</code> seconds (${escapeHtml(service.source || "")})</p>
       <p>Health schema: <code>${escapeHtml(health.schema_version)}</code> ${badge(health.source || "", statusKind(health.source))}</p>
       <p>Local URL: <a href="${escapeHtml(network.local_url || "")}">${escapeHtml(network.local_url || "")}</a></p>
@@ -347,14 +350,14 @@ async function renderSystem() {
     box.innerHTML = "<p class='muted'>Restart requested…</p>";
     try {
       await api("/api/system/restart", { method: "POST", body: "{}" });
-      box.innerHTML = "<p>Restart requested. Reload this page in a few seconds and confirm the running commit.</p>";
+      box.innerHTML = "<p>Restart requested. Reload this page in a few seconds and confirm process_commit equals checkout_head.</p>";
     } catch (err) {
       box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
     }
   };
   document.getElementById("update-check").onclick = () => runUpdate("check");
   document.getElementById("update-apply").onclick = () => {
-    if (!confirm("Apply a fast-forward update? Dirty or divergent trees are refused. git merge is not a completed deployment until the service restarts on the new commit.")) return;
+    if (!confirm("Apply a fast-forward update? Dirty or divergent trees are refused. git merge is not a completed deployment until process_commit matches checkout_head after restart.")) return;
     runUpdate("apply");
   };
 }
@@ -572,13 +575,22 @@ async function approveWorker(workerId, replace) {
 async function renderTailscale() {
   app.innerHTML = "<p class='muted'>Loading Tailscale…</p>";
   const data = await api("/api/tailscale");
+  const node = data.node || {};
+  const serve = data.serve || {};
   app.innerHTML = `
     <h1>Tailscale</h1>
     <div class="card">
-      <div class="row">${badge(data.state || "UNVERIFIED", statusKind(data.state))} ${badge(data.source || "", "muted")}</div>
-      <p>Serve backend: <code>${escapeHtml(data.backend)}</code></p>
+      <div class="row">
+        ${badge("node " + (node.state || "UNVERIFIED"), statusKind(node.state))}
+        ${badge(node.source || "", "muted")}
+        ${badge("serve " + (serve.status || "UNVERIFIED"), statusKind(serve.status))}
+        ${badge("remote " + (data.remote_access || "UNVERIFIED"), statusKind(data.remote_access))}
+      </div>
+      <p>Expected Serve backend: <code>${escapeHtml((serve.expected_backend || data.backend) || "")}</code></p>
+      <p>Observed Serve backend: <code>${escapeHtml(serve.observed_backend || "")}</code> ${badge(serve.source || "", "muted")}</p>
       <p>URL: ${data.url ? `<a href="${escapeHtml(data.url)}">${escapeHtml(data.url)}</a>` : "<span class='muted'>none</span>"}</p>
-      <p class="muted">${escapeHtml(data.detail || "")}. Funnel is never used. Serve is tailnet-only of the loopback WebUI.</p>
+      <p>Config enabled: <code>${escapeHtml(data.enabled)}</code> ${badge(data.enabled_source || "CONFIG_BOUND", "muted")}</p>
+      <p class="muted">${escapeHtml(data.detail || "")}. Funnel is never used. Node connectivity is not proof of CSLR Serve.</p>
       <div class="form-actions">
         <button id="ts-enable">Enable Serve</button>
         <button class="secondary" id="ts-disable">Disable Serve</button>

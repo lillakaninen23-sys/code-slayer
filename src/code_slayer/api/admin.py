@@ -27,21 +27,19 @@ class AdminFacade:
         self._app = application
 
     def system_status(self) -> dict:
-        from code_slayer.admin.process import run_fixed
-
         status = service_status()
-        commit = None
-        commit_source = "UNVERIFIED"
-        try:
-            result = run_fixed(
-                ("git", "-C", str(self._app.repo_path), "rev-parse", "HEAD"),
-                timeout=5.0,
-            )
-            if result.returncode == 0 and len(result.stdout.strip()) == 40:
-                commit = result.stdout.strip()
-                commit_source = "VERIFIED"
-        except ProcessError:
-            commit_source = "UNVERIFIED"
+        process = self._app.process_commit
+        process_source = self._app.process_commit_source
+        checkout, checkout_source = self._app.current_checkout_head()
+        if process is None or checkout is None:
+            deployment_status = "UNVERIFIED"
+            deployment_complete = False
+        elif process == checkout:
+            deployment_status = "VERIFIED"
+            deployment_complete = True
+        else:
+            deployment_status = "MISMATCH"
+            deployment_complete = False
         cfg = self._app.persistent_config()
         return {
             "service": {
@@ -50,8 +48,14 @@ class AdminFacade:
                 "unit": status.unit,
                 "source": status.source,
                 "version": __version__,
-                "running_commit": commit,
-                "running_commit_source": commit_source,
+                "process_commit": process,
+                "process_commit_source": process_source,
+                "running_commit": process,
+                "running_commit_source": process_source,
+                "checkout_head": checkout,
+                "checkout_head_source": checkout_source,
+                "deployment_status": deployment_status,
+                "deployment_complete": deployment_complete,
                 "uptime_seconds": int(time.monotonic() - self._app._started_at),
             },
             "network": {
@@ -292,7 +296,7 @@ class AdminFacade:
         payload["deployment_complete"] = False
         payload["deployment_note"] = (
             "git merge is not a completed deployment; poll GET /api/system "
-            "for running_commit after restart"
+            "for process_commit == checkout_head after restart"
         )
         return payload
 
@@ -302,12 +306,21 @@ class AdminFacade:
             backend_host=cfg.server.host, backend_port=cfg.server.port,
         )
         return {
-            "state": view.state,
+            "node": {"state": view.node_state, "source": view.node_source},
+            "serve": {
+                "status": view.serve_status,
+                "source": view.serve_source,
+                "expected_backend": view.expected_backend,
+                "observed_backend": view.observed_backend,
+                "funnel_detected": view.funnel_detected,
+            },
+            "remote_access": view.remote_access,
             "url": view.url,
-            "backend": view.backend,
-            "source": view.source,
-            "detail": view.detail,
+            "backend": view.expected_backend,
             "enabled": cfg.tailscale.enabled,
+            "enabled_source": "CONFIG_BOUND",
+            "detail": view.detail,
+            "source": view.source,
         }
 
     def tailscale_set(self, enabled: bool) -> dict:

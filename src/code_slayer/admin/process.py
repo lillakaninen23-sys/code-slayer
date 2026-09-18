@@ -51,3 +51,23 @@ def run_fixed(
         stdout=completed.stdout or "",
         stderr=completed.stderr or "",
     )
+
+
+def git_rev_parse_head(checkout: Path, *, runner=None) -> str | None:
+    """Return the current checkout HEAD SHA, or None if it cannot be resolved.
+
+    This is a live observation of Git, not proof of which revision a
+    already-running process loaded. Callers that capture it at process
+    start must retain that value themselves.
+    """
+    run = runner or run_fixed
+    try:
+        result = run(("git", "-C", str(checkout), "rev-parse", "HEAD"), timeout=5.0)
+    except ProcessError:
+        return None
+    sha = (result.stdout or "").strip().lower()
+    if result.returncode != 0 or len(sha) != 40:
+        return None
+    if any(ch not in "0123456789abcdef" for ch in sha):
+        return None
+    return sha
