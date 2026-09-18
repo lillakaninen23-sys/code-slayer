@@ -6,6 +6,7 @@ import ast
 import http.server
 import inspect
 import json
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -187,6 +188,81 @@ def test_systemd_unit_is_loopback_and_has_no_cert_env():
     )
     assert "--host" not in unit
     assert "serve" in unit
+    assert _working_directory_line(unit) == "WorkingDirectory=/tmp/code-slayer"
+    assert 'WorkingDirectory="' not in unit
+    assert 'ExecStart="/tmp/venv/bin/codeslayer" serve --repo "/tmp/code-slayer"' in unit
+
+
+def _working_directory_line(unit: str) -> str:
+    for line in unit.splitlines():
+        if line.startswith("WorkingDirectory="):
+            return line
+    raise AssertionError("generated unit is missing WorkingDirectory")
+
+
+def test_working_directory_with_spaces_is_unquoted_absolute():
+    checkout = Path("/tmp/Code Slayer/code-slayer")
+    webui = checkout / "webui"
+    unit = render_user_unit(
+        python_or_codeslayer=Path("/tmp/venv/bin/codeslayer"),
+        checkout=checkout,
+        webui_dir=webui,
+    )
+    assert _working_directory_line(unit) == (
+        "WorkingDirectory=/tmp/Code Slayer/code-slayer"
+    )
+    assert 'WorkingDirectory="' not in unit
+    assert "WorkingDirectory=\"/tmp/Code Slayer/code-slayer\"" not in unit
+    assert '--repo "/tmp/Code Slayer/code-slayer"' in unit
+    assert '--webui-dir "/tmp/Code Slayer/code-slayer/webui"' in unit
+    assert "Restart=on-failure" in unit
+    assert "0.0.0.0" not in unit
+
+
+def test_working_directory_escapes_systemd_specifiers_without_quoting():
+    checkout = Path("/tmp/100%ready/code-slayer")
+    unit = render_user_unit(
+        python_or_codeslayer=Path("/tmp/venv/bin/codeslayer"),
+        checkout=checkout,
+        webui_dir=checkout / "webui",
+    )
+    assert _working_directory_line(unit) == (
+        "WorkingDirectory=/tmp/100%%ready/code-slayer"
+    )
+    assert 'WorkingDirectory="' not in unit
+    assert '--repo "/tmp/100%%ready/code-slayer"' in unit
+
+
+def test_generated_unit_passes_systemd_analyze_when_available(tmp_path):
+    analyze = shutil.which("systemd-analyze")
+    if analyze is None:
+        pytest.skip("systemd-analyze is not available")
+    checkout = tmp_path / "Code Slayer" / "code-slayer"
+    webui = checkout / "webui"
+    (webui / "static").mkdir(parents=True)
+    (webui / "index.html").write_text("<html></html>")
+    exe = tmp_path / "venv" / "bin" / "codeslayer"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    unit_text = render_user_unit(
+        python_or_codeslayer=exe,
+        checkout=checkout,
+        webui_dir=webui,
+    )
+    assert 'WorkingDirectory="' not in unit_text
+    assert _working_directory_line(unit_text) == f"WorkingDirectory={checkout}"
+    unit_file = tmp_path / "codeslayer.service"
+    unit_file.write_text(unit_text, encoding="utf-8")
+    result = subprocess.run(
+        [analyze, "verify", str(unit_file)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert "path is not absolute" not in combined
+    assert result.returncode == 0, combined
 
 
 def test_install_service_preserves_state_and_writes_unit(tmp_path, monkeypatch):
