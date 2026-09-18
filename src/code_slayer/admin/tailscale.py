@@ -76,7 +76,7 @@ def status(
     expected = f"http://{backend_host}:{backend_port}"
     node_state, node_source, url, node_detail, dns_name, dns_source = _node_status(run)
     serve_status, serve_source, observed, funnel, serve_detail, serve_hosts = _serve_status(
-        run, expected_backend=expected,
+        run, expected_backend=expected, expected_host=dns_name,
     )
     trusted = LiveTrustedHosts(
         static_trusted_hosts,
@@ -120,10 +120,14 @@ def intent_alignment(enabled: bool, serve_status: str) -> str:
 
 
 def expected_serve_mapping(view: TailscaleView) -> bool:
-    """Live Serve proxies the configured loopback backend and is not Funnel.
+    """Live Serve is the exact CSLR-owned topology and is not Funnel.
 
-    ``serve_status == VERIFIED`` is this mapping only. It is not by itself
-    a usable remote path and must not be used as an adoption predicate.
+    ``serve_status == VERIFIED`` means HTTPS :443, the machine MagicDNS
+    host, handler ``/``, and only the configured loopback proxy. Extra
+    proxies, hosts, handlers, or TCP forwards are ``MISMATCH``, not
+    ``VERIFIED``. This is the disable-reset predicate. It is not by
+    itself a usable remote path and must not be used as an adoption
+    predicate.
     """
     return (
         view.serve_status == "VERIFIED"
@@ -250,7 +254,7 @@ def _node_status(run) -> tuple[str, str, str | None, str, str | None, str]:
 
 
 def _serve_status(
-    run, *, expected_backend: str,
+    run, *, expected_backend: str, expected_host: str | None = None,
 ) -> tuple[str, str, str | None, bool, str, tuple[str, ...]]:
     try:
         result = run((TAILSCALE, "serve", "status", "--json"), timeout=10.0)
@@ -272,16 +276,201 @@ def _serve_status(
     funnel = _allow_funnel_enabled(payload)
     proxies = _collect_proxies(payload)
     hosts = tuple(_serve_web_hosts(payload))
-    if funnel:
-        observed = proxies[0] if proxies else None
-        return "MISMATCH", "LIVE_ATTESTED", observed, True, "funnel_detected", hosts
-    if not proxies:
-        return "not_configured", "LIVE_ATTESTED", None, False, "serve_not_configured", hosts
     expected_norm = _normalize_proxy(expected_backend)
     matching = [item for item in proxies if _normalize_proxy(item) == expected_norm]
-    if matching:
-        return "VERIFIED", "LIVE_ATTESTED", matching[0], False, "serve_backend_matches", hosts
-    return "MISMATCH", "LIVE_ATTESTED", proxies[0], False, "serve_backend_mismatch", hosts
+    observed = matching[0] if matching else (proxies[0] if proxies else None)
+    topology = _live_serve_topology(
+        payload, expected_backend=expected_backend, expected_host=expected_host,
+    )
+    if funnel:
+        return "MISMATCH", "LIVE_ATTESTED", observed, True, "funnel_detected", hosts
+    if topology == "absent":
+        return "not_configured", "LIVE_ATTESTED", None, False, "serve_not_configured", hosts
+    if topology == "exact":
+        return "VERIFIED", "LIVE_ATTESTED", observed, False, "serve_backend_matches", hosts
+    detail = "serve_backend_mismatch" if proxies and not matching else "serve_topology_mismatch"
+    return "MISMATCH", "LIVE_ATTESTED", observed, False, detail, hosts
+
+
+_KNOWN_SERVE_KEYS = frozenset({"TCP", "Web", "AllowFunnel", "Foreground", "Services"})
+_HANDLER_FORWARDING_FIELDS = ("Path", "Text")
+
+
+def _live_serve_topology(
+    payload: dict, *, expected_backend: str, expected_host: str | None,
+) -> str:
+    """Classify forwarding topology: ``absent``, ``exact``, or ``conflict``.
+
+    ``exact`` is only the CSLR-owned Serve mapping: HTTPS :443, the
+    machine MagicDNS host, handler ``/``, configured loopback proxy,
+    Funnel already excluded by the caller. Any extra proxy, host,
+    handler, TCP forward, foreground session, or service is ``conflict``.
+    Informational non-forwarding fields are ignored.
+    """
+    if _extra_block_present(payload.get("Foreground")):
+        return "conflict"
+    if _extra_block_present(payload.get("Services")):
+        return "conflict"
+    if _unknown_forwarding(payload):
+        return "conflict"
+    tcp_state = _tcp_https_443_state(payload.get("TCP"))
+    if tcp_state == "conflict":
+        return "conflict"
+    web = payload.get("Web")
+    if isinstance(web, dict) and len(web) > 1:
+        return "conflict"
+    mounts = _web_mounts(web)
+    if mounts is None:
+        return "conflict"
+    if not mounts:
+        return "absent" if tcp_state in {"missing", "exact"} else "conflict"
+    if (
+        tcp_state == "exact"
+        and expected_host
+        and len(mounts) == 1
+        and _is_exact_cslr_mount(mounts[0], expected_host, expected_backend)
+    ):
+        return "exact"
+    return "conflict"
+
+
+def _extra_block_present(value: object) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, dict):
+        return len(value) > 0
+    if isinstance(value, list):
+        return len(value) > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _unknown_forwarding(payload: dict) -> bool:
+    for key, value in payload.items():
+        if key in _KNOWN_SERVE_KEYS:
+            continue
+        if _contains_forwarding(value):
+            return True
+    return False
+
+
+def _contains_forwarding(doc: object) -> bool:
+    if isinstance(doc, dict):
+        proxy = doc.get("Proxy")
+        if isinstance(proxy, str) and proxy.strip():
+            return True
+        forward = doc.get("TCPForward")
+        if isinstance(forward, str) and forward.strip():
+            return True
+        for field in _HANDLER_FORWARDING_FIELDS:
+            value = doc.get(field)
+            if isinstance(value, str) and value.strip():
+                return True
+        for key, value in doc.items():
+            if key in {"Handlers", "TCP", "Web", "Foreground", "Services"}:
+                if _extra_block_present(value):
+                    return True
+            if _contains_forwarding(value):
+                return True
+        return False
+    if isinstance(doc, list):
+        return any(_contains_forwarding(item) for item in doc)
+    return False
+
+
+def _tcp_https_443_state(tcp: object) -> str:
+    """Return ``missing``, ``exact``, or ``conflict`` for the TCP map."""
+    if tcp is None:
+        return "missing"
+    if not isinstance(tcp, dict):
+        return "conflict"
+    if not tcp:
+        return "missing"
+    if len(tcp) != 1:
+        return "conflict"
+    port_key, handler = next(iter(tcp.items()))
+    if str(port_key) != "443":
+        return "conflict"
+    if not isinstance(handler, dict):
+        return "conflict"
+    if handler.get("HTTPS") is not True:
+        return "conflict"
+    if handler.get("HTTP"):
+        return "conflict"
+    forward = handler.get("TCPForward")
+    if isinstance(forward, str) and forward.strip():
+        return "conflict"
+    terminate = handler.get("TerminateTLS")
+    if isinstance(terminate, str) and terminate.strip():
+        return "conflict"
+    return "exact"
+
+
+def _web_mounts(web: object) -> list[tuple[str | None, int | None, str, dict]] | None:
+    if web is None:
+        return []
+    if not isinstance(web, dict):
+        return None
+    mounts: list[tuple[str | None, int | None, str, dict]] = []
+    for key, server in web.items():
+        if not isinstance(server, dict):
+            return None
+        handlers = server.get("Handlers")
+        if handlers is None:
+            continue
+        if not isinstance(handlers, dict):
+            return None
+        if not handlers:
+            continue
+        host, port = _parse_serve_host_port(key)
+        for path, handler in handlers.items():
+            if not isinstance(path, str) or not isinstance(handler, dict):
+                return None
+            mounts.append((host, port, path, handler))
+        if _contains_forwarding({k: v for k, v in server.items() if k != "Handlers"}):
+            return None
+    return mounts
+
+
+def _is_exact_cslr_mount(
+    mount: tuple[str | None, int | None, str, dict],
+    expected_host: str,
+    expected_backend: str,
+) -> bool:
+    host, port, path, handler = mount
+    if host != expected_host or port != 443 or path != "/":
+        return False
+    return _handler_is_exact_proxy(handler, expected_backend)
+
+
+def _handler_is_exact_proxy(handler: dict, expected_backend: str) -> bool:
+    proxy = handler.get("Proxy")
+    if not isinstance(proxy, str) or not proxy.strip():
+        return False
+    if _normalize_proxy(proxy) != _normalize_proxy(expected_backend):
+        return False
+    for field in _HANDLER_FORWARDING_FIELDS:
+        value = handler.get(field)
+        if isinstance(value, str) and value.strip():
+            return False
+    return True
+
+
+def _parse_serve_host_port(key: object) -> tuple[str | None, int | None]:
+    if not isinstance(key, str) or not key.strip():
+        return None, None
+    text = key.strip().split("/", 1)[0]
+    host_raw = text
+    port_raw: str | None = None
+    if ":" in text:
+        host_raw, port_raw = text.rsplit(":", 1)
+    host = normalize_tailscale_dns_name(host_raw)
+    if port_raw is None:
+        return host, None
+    if not port_raw.isdigit():
+        return host, None
+    return host, int(port_raw)
 
 
 def _remote_host_candidate(*, dns_name: str | None, serve_hosts: tuple[str, ...]) -> str | None:

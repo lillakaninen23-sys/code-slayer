@@ -873,6 +873,119 @@ def test_tailscale_correct_serve_backend_is_verified():
     assert view.dns_name == "node.ts.net"
     assert view.dns_name_source == "VERIFIED"
     assert _normalize_check(view.observed_backend) == "http://127.0.0.1:8765"
+    assert exact_desired_live_serve(view) is True
+    assert plan_enable(view) == "adopt"
+    assert plan_disable(view) == "reset"
+
+
+def _serve_with(
+    *, dns="node.ts.net", handlers=None, extra_web=None, extra_tcp=None, extra_top=None,
+):
+    web = {
+        f"{dns}:443": {
+            "Handlers": handlers or {"/": {"Proxy": "http://127.0.0.1:8765"}},
+        },
+    }
+    if extra_web:
+        web.update(extra_web)
+    tcp = {"443": {"HTTPS": True}}
+    if extra_tcp:
+        tcp.update(extra_tcp)
+    doc = {"TCP": tcp, "Web": web}
+    if extra_top:
+        doc.update(extra_top)
+    return doc
+
+
+def test_exact_serve_topology_ignores_informational_fields():
+    dns = "node.ts.net"
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            _connected(dns + "."),
+            _serve_with(
+                dns=dns,
+                extra_top={"ETag": "abc", "Comment": "not forwarding"},
+            ),
+        ),
+    )
+    assert view.serve_status == "VERIFIED"
+    assert view.remote_access == "VERIFIED"
+    assert view.funnel_detected is False
+
+
+@pytest.mark.parametrize(
+    "serve_doc",
+    [
+        _serve_with(
+            handlers={
+                "/": {"Proxy": "http://127.0.0.1:8765"},
+                "/extra": {"Proxy": "http://127.0.0.1:9999"},
+            },
+        ),
+        _serve_with(
+            handlers={
+                "/": {"Proxy": "http://127.0.0.1:8765"},
+                "/other": {"Proxy": "http://127.0.0.1:8765"},
+            },
+        ),
+        _serve_with(
+            extra_web={
+                "other.ts.net:443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
+                },
+            },
+        ),
+        _serve_with(extra_web={"other.ts.net:443": {}}),
+        _serve_with(extra_tcp={"22": {"TCPForward": "127.0.0.1:22"}}),
+        _serve_with(extra_tcp={"8443": {"HTTPS": True}}),
+        _serve_with(
+            extra_web={
+                "node.ts.net:8443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}},
+                },
+            },
+        ),
+        _serve_with(
+            extra_top={
+                "Foreground": {
+                    "sess": {
+                        "TCP": {"8443": {"HTTPS": True}},
+                        "Web": {
+                            "node.ts.net:8443": {
+                                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}},
+                            },
+                        },
+                    },
+                },
+            },
+        ),
+        _serve_with(
+            extra_top={
+                "Services": {
+                    "svc": {
+                        "TCP": {"443": {"HTTPS": True}},
+                        "Web": {
+                            "svc.ts.net:443": {
+                                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}},
+                            },
+                        },
+                    },
+                },
+            },
+        ),
+    ],
+)
+def test_mixed_serve_topology_is_mismatch_not_verified(serve_doc):
+    view = tailscale_status(
+        runner=_tailscale_runner(_connected("node.ts.net."), serve_doc),
+    )
+    assert view.serve_status == "MISMATCH"
+    assert view.serve_status != "VERIFIED"
+    assert view.remote_access != "VERIFIED"
+    assert view.funnel_detected is False
+    assert exact_desired_live_serve(view) is False
+    assert plan_enable(view) == "tailscale_serve_mismatch"
+    assert plan_disable(view) == "tailscale_serve_mismatch"
 
 
 def _normalize_check(value: str | None) -> str:
@@ -1024,10 +1137,11 @@ def test_serve_match_without_accepted_host_is_not_remote_verified():
             _matching_serve("node.ts.net"),
         ),
     )
-    assert view.serve_status == "VERIFIED"
+    assert view.serve_status != "VERIFIED"
+    assert view.serve_status == "MISMATCH"
     assert view.host_accepted is False
     assert view.remote_access != "VERIFIED"
-    assert view.remote_access == "UNVERIFIED"
+    assert view.remote_access == "MISMATCH"
 
 
 def test_serve_host_mismatch_is_not_remote_verified():
@@ -1037,7 +1151,8 @@ def test_serve_host_mismatch_is_not_remote_verified():
             _matching_serve("other.ts.net"),
         ),
     )
-    assert view.serve_status == "VERIFIED"
+    assert view.serve_status != "VERIFIED"
+    assert view.serve_status == "MISMATCH"
     assert view.remote_access != "VERIFIED"
     assert view.host_accepted is False
 
@@ -1287,7 +1402,7 @@ def test_enable_rejects_matching_backend_when_node_not_connected(
         application.extensions["codeslayer"].close()
 
 
-def test_enable_rejects_matching_backend_when_host_not_accepted(
+def test_enable_rejects_when_magicdns_host_unknown(
     git_repo_with_commit, tmp_path,
 ):
     dns = "node.ts.net"
@@ -1295,19 +1410,20 @@ def test_enable_rejects_matching_backend_when_host_not_accepted(
     application, client, config = _opened(git_repo_with_commit, tmp_path, runner)
     try:
         view = client.get("/api/tailscale").get_json()
-        assert view["serve"]["status"] == "VERIFIED"
+        assert view["serve"]["status"] != "VERIFIED"
+        assert view["serve"]["status"] == "MISMATCH"
         assert view["host"]["accepted"] is False
         assert view["remote_access"] != "VERIFIED"
         response = client.post("/api/tailscale/enable", json={})
         assert response.status_code == 409
-        assert response.get_json()["error"]["code"] == "tailscale_host_not_accepted"
+        assert response.get_json()["error"]["code"] == "tailscale_serve_mismatch"
         assert load_config(path=config).tailscale.enabled is False
         assert _enable_calls(captured) == []
     finally:
         application.extensions["codeslayer"].close()
 
 
-def test_enable_rejects_when_remote_access_not_verified(
+def test_enable_rejects_when_serve_host_is_not_machine_magicdns(
     git_repo_with_commit, tmp_path,
 ):
     runner, captured = _live_runner(
@@ -1317,11 +1433,11 @@ def test_enable_rejects_when_remote_access_not_verified(
     application, client, config = _opened(git_repo_with_commit, tmp_path, runner)
     try:
         view = client.get("/api/tailscale").get_json()
-        assert view["serve"]["status"] == "VERIFIED"
+        assert view["serve"]["status"] == "MISMATCH"
         assert view["remote_access"] != "VERIFIED"
         response = client.post("/api/tailscale/enable", json={})
         assert response.status_code == 409
-        assert response.get_json()["error"]["code"] == "tailscale_host_not_accepted"
+        assert response.get_json()["error"]["code"] == "tailscale_serve_mismatch"
         assert load_config(path=config).tailscale.enabled is False
         assert _enable_calls(captured) == []
     finally:
@@ -1583,6 +1699,108 @@ def test_disable_mismatch_funnel_error_unverified_do_not_reset(
             assert _reset_calls(captured) == []
         finally:
             application.extensions["codeslayer"].close()
+
+
+def _mixed_topology_docs(dns="node.ts.net"):
+    expected = {"/": {"Proxy": "http://127.0.0.1:8765"}}
+    return [
+        ("extra-proxy.toml", _serve_with(
+            dns=dns,
+            handlers={**expected, "/extra": {"Proxy": "http://127.0.0.1:9999"}},
+        )),
+        ("extra-path.toml", _serve_with(
+            dns=dns,
+            handlers={**expected, "/other": {"Proxy": "http://127.0.0.1:8765"}},
+        )),
+        ("extra-host.toml", _serve_with(
+            dns=dns,
+            extra_web={
+                "other.ts.net:443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
+                },
+            },
+        )),
+        ("empty-extra-host.toml", _serve_with(
+            dns=dns, extra_web={"other.ts.net:443": {}},
+        )),
+        ("extra-tcp.toml", _serve_with(
+            dns=dns, extra_tcp={"22": {"TCPForward": "127.0.0.1:22"}},
+        )),
+        ("multi-proxy.toml", _serve_with(
+            dns=dns,
+            extra_web={
+                f"{dns}:8443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}},
+                },
+            },
+        )),
+    ]
+
+
+def test_enable_does_not_adopt_or_overwrite_mixed_topology(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "node.ts.net"
+    for name, serve in _mixed_topology_docs(dns):
+        runner, captured = _live_runner(_connected(dns + "."), serve)
+        application, client, config = _opened(
+            git_repo_with_commit, tmp_path, runner, name=name,
+        )
+        try:
+            view = client.get("/api/tailscale").get_json()
+            assert view["serve"]["status"] == "MISMATCH", name
+            assert view["enabled"] is False
+            response = client.post("/api/tailscale/enable", json={})
+            assert response.status_code == 409, name
+            assert response.get_json()["error"]["code"] == "tailscale_serve_mismatch"
+            assert load_config(path=config).tailscale.enabled is False
+            assert _enable_calls(captured) == []
+            assert _reset_calls(captured) == []
+        finally:
+            application.extensions["codeslayer"].close()
+
+
+def test_disable_does_not_reset_mixed_topology(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "node.ts.net"
+    for name, serve in _mixed_topology_docs(dns):
+        runner, captured = _live_runner(_connected(dns + "."), serve)
+        application, client, config = _opened(
+            git_repo_with_commit, tmp_path, runner, name=name,
+            config=CSLRConfig().with_tailscale_enabled(True),
+        )
+        try:
+            assert load_config(path=config).tailscale.enabled is True
+            response = client.post("/api/tailscale/disable", json={})
+            assert response.status_code == 409, name
+            assert response.get_json()["error"]["code"] == "tailscale_serve_mismatch"
+            assert load_config(path=config).tailscale.enabled is True
+            assert _reset_calls(captured) == []
+            assert _enable_calls(captured) == []
+        finally:
+            application.extensions["codeslayer"].close()
+
+
+def test_disable_does_not_reset_when_magicdns_host_unknown(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "node.ts.net"
+    runner, captured = _live_runner(
+        {"BackendState": "Running", "Self": {}}, _matching_serve(dns),
+    )
+    application, client, config = _opened(
+        git_repo_with_commit, tmp_path, runner,
+        config=CSLRConfig().with_tailscale_enabled(True),
+    )
+    try:
+        response = client.post("/api/tailscale/disable", json={})
+        assert response.status_code == 409
+        assert response.get_json()["error"]["code"] == "tailscale_serve_mismatch"
+        assert load_config(path=config).tailscale.enabled is True
+        assert _reset_calls(captured) == []
+    finally:
+        application.extensions["codeslayer"].close()
 
 
 def test_systemd_unit_does_not_bind_tailscale_or_wildcard_addresses():
