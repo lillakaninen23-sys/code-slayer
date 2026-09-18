@@ -292,8 +292,20 @@ export function certificationPollDelay(hidden) {
   return hidden ? 15000 : 2000;
 }
 
-export function certificationStartEnabled(worker) {
+export function certificationStartEnabled(worker, options = {}) {
+  if (options.busy === true) return false;
+  if (isCertificationActive(options.activeRun?.state)) return false;
   return worker?.ready_for_certification === true;
+}
+
+export function certificationPreflightEnabled(options = {}) {
+  if (options.busy === true) return false;
+  if (isCertificationActive(options.activeRun?.state)) return false;
+  return true;
+}
+
+export function certificationWorkerSelectEnabled(options = {}) {
+  return options.busy !== true;
 }
 
 export function bindCertificationEvidence(evidence, runId) {
@@ -305,6 +317,13 @@ export function clearCertificationTransient(certState) {
   certState.selectedCertificationWorker = null;
   certState.certificationActiveRun = null;
   certState.certificationHistory = null;
+  certState.certificationEvidence = null;
+  certState.certificationEvidenceError = null;
+  certState.certificationEvidenceRequestId = null;
+}
+
+export function beginCertificationPreflight(certState) {
+  certState.certificationActiveRun = null;
   certState.certificationEvidence = null;
   certState.certificationEvidenceError = null;
   certState.certificationEvidenceRequestId = null;
@@ -330,9 +349,13 @@ export function selectCertificationWorkerId(certState, workerId) {
   return certState.certificationSelectionVersion;
 }
 
+export function certificationSelectionMatches(certState, workerId, version) {
+  return certState.selectedCertificationWorkerId === workerId
+    && (version == null || version === certState.certificationSelectionVersion);
+}
+
 export function acceptCertificationWorker(certState, workerId, detail, version) {
-  if (certState.selectedCertificationWorkerId !== workerId) return false;
-  if (version != null && version !== certState.certificationSelectionVersion) return false;
+  if (!certificationSelectionMatches(certState, workerId, version)) return false;
   certState.selectedCertificationWorker = detail;
   certState.certificationHistory = detail?.history || null;
   certState.certificationUnavailable = false;
@@ -344,6 +367,23 @@ export function beginCertificationRun(certState, run) {
   certState.certificationEvidence = null;
   certState.certificationEvidenceError = null;
   certState.certificationEvidenceRequestId = null;
+}
+
+export function acceptCertificationStart(certState, workerId, version, run) {
+  if (!certificationSelectionMatches(certState, workerId, version)) return false;
+  if (!run || !run.run_id) {
+    certState.certificationActiveRun = null;
+    return false;
+  }
+  certState.certificationActiveRun = run;
+  certState.certificationEvidence = null;
+  certState.certificationEvidenceError = null;
+  certState.certificationEvidenceRequestId = null;
+  return true;
+}
+
+export function acceptCertificationPreflight(certState, workerId, version) {
+  return certificationSelectionMatches(certState, workerId, version);
 }
 
 export function applyCertificationPoll(certState, run) {
@@ -448,23 +488,24 @@ export function renderCertificationEvidence(evidence, error) {
   return `<div class="cert-panel" data-cert-evidence-run="${escapeHTML(evidence.run_id)}"><div class="section-label">Verified evidence</div><div class="model-meta">run_id ${escapeHTML(evidence.run_id)}</div>${certificationStateBadge(evidence.environment)}<div class="model-meta">evidence_ref ${escapeHTML(evidence.evidence_ref)}</div><pre>${escapeHTML(document)}</pre><p class="muted-text">The browser does not interpret evidence into a certification verdict.</p></div>`;
 }
 
-export function renderCertificationWorkerSummary(worker, selectedId, environment) {
+export function renderCertificationWorkerSummary(worker, selectedId, environment, options = {}) {
   if (!worker) return "";
   const selected = worker.worker_id === selectedId ? " selected" : "";
   const eligibility = plannerEligibilityLabel(worker.production_eligibility);
   const roles = worker.roles && typeof worker.roles === "object"
     ? Object.entries(worker.roles).map(([role, status]) => `${escapeHTML(role)} ${escapeHTML(status?.status)}`).join(" · ")
     : "";
-  return `<button type="button" class="cert-item${selected}" data-cert-worker="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(environment || worker.environment)}</div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="model-meta">runtime ${escapeHTML(worker.runtime?.status)} ${escapeHTML(worker.runtime?.reason)}</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">Baseline Security VALIDATION ${escapeHTML(worker.baseline_security?.status)} outcome ${escapeHTML(worker.baseline_security?.outcome)} environment ${escapeHTML(worker.baseline_security?.environment)}</div>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">roles ${roles}</div><div class="model-meta">Production eligibility — Planner</div>${certificationStateBadge(eligibility)}<div class="model-meta">${escapeHTML(worker.production_eligibility?.reason)}</div><div class="model-meta">source ${escapeHTML(worker.production_eligibility?.source)}</div><div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div></button>`;
+  const disabled = certificationWorkerSelectEnabled(options) ? "" : "disabled";
+  return `<button type="button" class="cert-item${selected}" data-cert-worker="${escapeHTML(worker.worker_id)}" ${disabled}><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(environment || worker.environment)}</div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="model-meta">runtime ${escapeHTML(worker.runtime?.status)} ${escapeHTML(worker.runtime?.reason)}</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">Baseline Security VALIDATION ${escapeHTML(worker.baseline_security?.status)} outcome ${escapeHTML(worker.baseline_security?.outcome)} environment ${escapeHTML(worker.baseline_security?.environment)}</div>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">roles ${roles}</div><div class="model-meta">Production eligibility — Planner</div>${certificationStateBadge(eligibility)}<div class="model-meta">${escapeHTML(worker.production_eligibility?.reason)}</div><div class="model-meta">source ${escapeHTML(worker.production_eligibility?.source)}</div><div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div></button>`;
 }
 
-export function renderCertificationWorkers(payload, selectedId) {
+export function renderCertificationWorkers(payload, selectedId, options = {}) {
   const workers = payload?.workers;
   if (!Array.isArray(workers) || !workers.length) {
     return '<p class="muted-text">No certification workers in this projection.</p>';
   }
   return workers
-    .map((worker) => renderCertificationWorkerSummary(worker, selectedId, payload.environment))
+    .map((worker) => renderCertificationWorkerSummary(worker, selectedId, payload.environment, options))
     .join("");
 }
 
@@ -489,11 +530,10 @@ export function renderCertificationWorkerDetail(worker, options = {}) {
   if (!worker) {
     return '<p class="muted-text">Select a certification worker.</p>';
   }
-  const busy = options.busy === true;
-  const disabled = busy ? "disabled" : "";
-  const startEnabled = certificationStartEnabled(worker) && !busy;
+  const startEnabled = certificationStartEnabled(worker, options);
+  const preflightEnabled = certificationPreflightEnabled(options);
   const correlation = (options.registryIds || []).includes(worker.worker_id)
     ? '<p class="muted-text">Also listed in the model registry (display correlation only; not evidence).</p>'
     : "";
-  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${disabled}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p></div>`;
+  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p></div>`;
 }

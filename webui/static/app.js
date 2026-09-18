@@ -53,6 +53,13 @@ import {
   beginCertificationEvidenceRequest,
   acceptCertificationEvidence,
   rejectCertificationEvidence,
+  certificationSelectionMatches,
+  acceptCertificationStart,
+  acceptCertificationPreflight,
+  beginCertificationPreflight,
+  isCertificationActive,
+  certificationStartEnabled,
+  certificationPreflightEnabled,
   renderCertificationWorkers,
   renderCertificationWorkerDetail,
   renderCertificationRun,
@@ -564,15 +571,21 @@ async function loadPrivacy() {
 }
 function certificationControls() {
   const busy = state.certificationBusy || !state.connected;
-  document
-    .querySelectorAll("[data-cert-preflight], [data-cert-start], [data-cert-evidence]")
-    .forEach((el) => {
-      if (el.hasAttribute("data-cert-start")) {
-        el.disabled = busy || state.selectedCertificationWorker?.ready_for_certification !== true;
-        return;
-      }
-      el.disabled = busy;
-    });
+  const active = isCertificationActive(state.certificationActiveRun?.state);
+  document.querySelectorAll("[data-cert-worker]").forEach((el) => {
+    el.disabled = busy;
+  });
+  document.querySelectorAll("[data-cert-preflight]").forEach((el) => {
+    el.disabled = busy || active;
+  });
+  document.querySelectorAll("[data-cert-start]").forEach((el) => {
+    el.disabled = busy
+      || active
+      || state.selectedCertificationWorker?.ready_for_certification !== true;
+  });
+  document.querySelectorAll("[data-cert-evidence]").forEach((el) => {
+    el.disabled = busy;
+  });
 }
 function renderCertificationView() {
   const workers = $("cert-workers");
@@ -601,9 +614,11 @@ function renderCertificationView() {
       workers: state.certificationWorkers,
     },
     state.selectedCertificationWorkerId,
+    { busy: state.certificationBusy },
   );
   detail.innerHTML = renderCertificationWorkerDetail(state.selectedCertificationWorker, {
     busy: state.certificationBusy,
+    activeRun: state.certificationActiveRun,
     registryIds: state.workers.map((worker) => worker.worker_id),
   });
   if (state.selectedCertificationWorker) {
@@ -652,8 +667,7 @@ async function loadCertificationWorker(workerId, version) {
     if (!acceptCertificationWorker(state, workerId, detail, version)) return;
     renderCertificationView();
   } catch (error) {
-    if (state.selectedCertificationWorkerId !== workerId) return;
-    if (version != null && version !== state.certificationSelectionVersion) return;
+    if (!certificationSelectionMatches(state, workerId, version)) return;
     state.selectedCertificationWorker = null;
     state.certificationHistory = null;
     renderCertificationView();
@@ -661,6 +675,20 @@ async function loadCertificationWorker(workerId, version) {
       $("cert-detail").innerHTML =
         `<p class="notice error">${esc(error.message)}</p>`;
     }
+  }
+}
+async function refreshCertificationProjection(workerId, version) {
+  try {
+    const payload = await api.certificationWorkers();
+    if (!certificationSelectionMatches(state, workerId, version)) return false;
+    acceptCertificationWorkers(state, payload);
+    await loadCertificationWorker(workerId, version);
+    return certificationSelectionMatches(state, workerId, version);
+  } catch (error) {
+    if (!certificationSelectionMatches(state, workerId, version)) throw error;
+    rejectCertificationSnapshot(state);
+    renderCertificationView();
+    throw error;
   }
 }
 function scheduleCertificationPoll() {
@@ -680,7 +708,7 @@ async function pollCertificationRun() {
     if (!applyCertificationPoll(state, run)) return;
     renderCertificationView();
     if (isCertificationTerminal(run.state)) {
-      if (workerId) await loadCertificationWorker(workerId, version);
+      if (workerId) await refreshCertificationProjection(workerId, version);
       return;
     }
   } catch (error) {
@@ -1161,6 +1189,7 @@ $("cert-stack").addEventListener("click", (event) => {
   const startButton = event.target.closest("[data-cert-start]");
   const evidenceButton = event.target.closest("[data-cert-evidence]");
   if (workerButton) {
+    if (state.certificationBusy) return;
     const workerId = workerButton.dataset.certWorker;
     const version = selectCertificationWorkerId(state, workerId);
     renderCertificationView();
@@ -1169,13 +1198,26 @@ $("cert-stack").addEventListener("click", (event) => {
   }
   if (preflightButton) {
     const workerId = preflightButton.dataset.certPreflight;
+    const version = state.certificationSelectionVersion;
+    if (!certificationPreflightEnabled({
+      busy: state.certificationBusy,
+      activeRun: state.certificationActiveRun,
+    })) return;
     certificationAction(async () => {
-      beginCertificationEvidenceRequest(state, null);
+      beginCertificationPreflight(state);
+      renderCertificationView();
       try {
         await api.certificationPreflight(workerId);
-        await loadCertificationWorker(workerId, state.certificationSelectionVersion);
+        if (!acceptCertificationPreflight(state, workerId, version)) return;
+        await refreshCertificationProjection(workerId, version);
       } catch (error) {
-        await loadCertificationWorker(workerId, state.certificationSelectionVersion);
+        if (certificationSelectionMatches(state, workerId, version)) {
+          try {
+            await refreshCertificationProjection(workerId, version);
+          } catch {
+            /* refresh already fail-closed the snapshot */
+          }
+        }
         throw error;
       }
     }, "Baseline Security preflight recorded.");
@@ -1183,16 +1225,22 @@ $("cert-stack").addEventListener("click", (event) => {
   }
   if (startButton) {
     const workerId = startButton.dataset.certStart;
-    if (state.selectedCertificationWorker?.ready_for_certification !== true) return;
+    const version = state.certificationSelectionVersion;
+    if (!certificationStartEnabled(state.selectedCertificationWorker, {
+      busy: state.certificationBusy,
+      activeRun: state.certificationActiveRun,
+    })) return;
     certificationAction(async () => {
       beginCertificationRun(state, null);
       try {
         const run = await api.startBaselineCertification(workerId);
-        beginCertificationRun(state, run);
+        if (!acceptCertificationStart(state, workerId, version, run)) return;
         renderCertificationView();
         scheduleCertificationPoll();
       } catch (error) {
-        beginCertificationRun(state, null);
+        if (certificationSelectionMatches(state, workerId, version)) {
+          beginCertificationRun(state, null);
+        }
         throw error;
       }
     }, "Baseline Security certification accepted. Closing this browser does not cancel the run.");

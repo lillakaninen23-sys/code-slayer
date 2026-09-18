@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -1634,4 +1634,107 @@ test("certification app wiring uses dedicated state, no fetch, and no mutation r
   );
   assert.doesNotMatch(loadWorker, /certificationEvidence/);
   assert.match(appSource, /ready_for_certification !== true/);
+});
+
+test("certification worker selection is disabled and ignored while busy", () => {
+  const idle = renderCertificationWorkers({ environment: "VALIDATION", workers: [certWorker] }, "cw1");
+  assert.match(idle, /data-cert-worker="cw1"/);
+  assert.doesNotMatch(idle, /data-cert-worker="cw1" disabled/);
+  const busy = renderCertificationWorkers(
+    { environment: "VALIDATION", workers: [certWorker] },
+    "cw1",
+    { busy: true },
+  );
+  assert.match(busy, /data-cert-worker="cw1" disabled/);
+});
+
+test("a start or preflight response cannot bind to a different selected worker", () => {
+  const certState = {};
+  const versionA = selectCertificationWorkerId(certState, "a");
+  selectCertificationWorkerId(certState, "b");
+  assert.equal(certificationSelectionMatches(certState, "a", versionA), false);
+  assert.equal(acceptCertificationStart(certState, "a", versionA, {
+    run_id: "run-a",
+    worker_id: "a",
+    state: "QUEUED",
+  }), false);
+  assert.notEqual(certState.certificationActiveRun?.run_id, "run-a");
+  assert.equal(certState.selectedCertificationWorkerId, "b");
+  assert.equal(acceptCertificationPreflight(certState, "a", versionA), false);
+  const versionB = certState.certificationSelectionVersion;
+  assert.equal(acceptCertificationStart(certState, "b", versionB, {
+    run_id: "run-b",
+    worker_id: "b",
+    state: "QUEUED",
+  }), true);
+  assert.equal(certState.certificationActiveRun.run_id, "run-b");
+});
+
+test("beginning a new preflight clears an old run and evidence without dropping the worker", () => {
+  const certState = {
+    selectedCertificationWorkerId: "cw1",
+    selectedCertificationWorker: certWorker,
+    certificationHistory: certWorker.history,
+    certificationActiveRun: { run_id: "old-pass", state: "PASS", has_certificate: true },
+    certificationEvidence: { run_id: "old-pass", document: { ok: true } },
+    certificationEvidenceError: "stale",
+    certificationEvidenceRequestId: "old-pass",
+  };
+  beginCertificationPreflight(certState);
+  assert.equal(certState.certificationActiveRun, null);
+  assert.equal(certState.certificationEvidence, null);
+  assert.equal(certState.certificationEvidenceError, null);
+  assert.equal(certState.certificationEvidenceRequestId, null);
+  assert.equal(certState.selectedCertificationWorker, certWorker);
+  assert.equal(certState.selectedCertificationWorkerId, "cw1");
+  assert.equal(certState.certificationHistory, certWorker.history);
+});
+
+test("QUEUED and RUNNING active runs disable start and preflight; terminal states do not derive readiness", () => {
+  const readyWorker = { ...certWorker, ready_for_certification: true };
+  assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state: "QUEUED" } }), false);
+  assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state: "RUNNING" } }), false);
+  assert.equal(certificationPreflightEnabled({ activeRun: { state: "QUEUED" } }), false);
+  assert.equal(certificationPreflightEnabled({ activeRun: { state: "RUNNING" } }), false);
+  const queued = renderCertificationWorkerDetail(readyWorker, { activeRun: { state: "QUEUED" } });
+  assert.match(queued, /data-cert-start="cw1" disabled/);
+  assert.match(queued, /data-cert-preflight="cw1" disabled/);
+  const running = renderCertificationWorkerDetail(readyWorker, { activeRun: { state: "RUNNING" } });
+  assert.match(running, /data-cert-start="cw1" disabled/);
+  assert.match(running, /data-cert-preflight="cw1" disabled/);
+  for (const state of ["PASS", "FAIL", "HARD_DISQUALIFIED", "INCOMPLETE"]) {
+    assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state } }), true);
+    assert.equal(certificationStartEnabled(certWorker, { activeRun: { state } }), false);
+    assert.equal(certificationPreflightEnabled({ activeRun: { state } }), true);
+  }
+  const passNotReady = renderCertificationWorkerDetail(certWorker, { activeRun: { state: "PASS" } });
+  assert.match(passNotReady, /data-cert-start="cw1" disabled/);
+  assert.doesNotMatch(passNotReady, /data-cert-preflight="cw1" disabled/);
+});
+
+test("preflight and terminal runs refresh server worker summaries without inferring them", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const refreshFn = appSource.slice(
+    appSource.indexOf("async function refreshCertificationProjection"),
+    appSource.indexOf("function scheduleCertificationPoll"),
+  );
+  assert.match(refreshFn, /api\.certificationWorkers\(\)/);
+  assert.match(refreshFn, /loadCertificationWorker\(workerId, version\)/);
+  assert.match(refreshFn, /rejectCertificationSnapshot\(state\)/);
+  assert.doesNotMatch(refreshFn, /ready_for_certification\s*=/);
+  assert.doesNotMatch(refreshFn, /baseline_security\s*=/);
+  assert.doesNotMatch(refreshFn, /production_eligibility\s*=/);
+  const preflightBlock = appSource.slice(appSource.indexOf("if (preflightButton)"), appSource.indexOf("if (startButton)"));
+  assert.match(preflightBlock, /beginCertificationPreflight\(state\)/);
+  assert.match(preflightBlock, /acceptCertificationPreflight\(state, workerId, version\)/);
+  assert.match(preflightBlock, /refreshCertificationProjection\(workerId, version\)/);
+  assert.doesNotMatch(preflightBlock, /startBaselineCertification/);
+  const startBlock = appSource.slice(appSource.indexOf("if (startButton)"), appSource.indexOf("if (evidenceButton)"));
+  assert.match(startBlock, /acceptCertificationStart\(state, workerId, version, run\)/);
+  const pollFn = appSource.slice(
+    appSource.indexOf("async function pollCertificationRun"),
+    appSource.indexOf("async function certificationAction"),
+  );
+  assert.match(pollFn, /refreshCertificationProjection\(workerId, version\)/);
+  assert.match(appSource, /if \(state\.certificationBusy\) return/);
 });
