@@ -65,6 +65,14 @@ import {
   renderCertificationRun,
   renderCertificationHistory,
   renderCertificationEvidence,
+  beginSystemRequest,
+  acceptSystemSnapshot,
+  rejectSystemSnapshot,
+  beginTailscaleRequest,
+  acceptTailscaleSnapshot,
+  rejectTailscaleSnapshot,
+  renderSystemSettings,
+  renderTailscaleSettings,
 } from "./views-admin.js";
 
 const api = createAPI();
@@ -109,6 +117,20 @@ const state = {
   certificationEvidenceError: null,
   certificationEvidenceRequestId: null,
   certificationSelectionVersion: 0,
+  system: null,
+  systemUnavailable: false,
+  systemBusy: false,
+  systemError: null,
+  systemUpdateCheck: null,
+  systemOperation: null,
+  systemConfirm: null,
+  systemRequestVersion: 0,
+  tailscale: null,
+  tailscaleUnavailable: false,
+  tailscaleBusy: false,
+  tailscaleError: null,
+  tailscaleConfirm: null,
+  tailscaleRequestVersion: 0,
 };
 let timer;
 let activeJobTimer;
@@ -128,6 +150,7 @@ function view(name) {
   if (name === "planning") loadPlanning();
   if (name === "privacy") loadPrivacy();
   if (name === "models") loadRuntime();
+  if (name === "settings") loadSettings();
 }
 document
   .querySelectorAll(".nav-item")
@@ -167,22 +190,19 @@ function connected(value) {
   const wasConnected = state.connected;
   state.connected = value;
   $("connection-dot").classList.toggle("offline", !value);
-  $("connection-label").textContent = value
-    ? "Backend connected"
-    : "Disconnected";
+  $("connection-label").textContent = value ? "Backend connected" : "Disconnected";
   $("backend-status").textContent = value ? "CONNECTED" : "DISCONNECTED";
-  controls();
-  runtimeControls();
+  controls(); runtimeControls();
   if (!value) {
-    rejectRuntimeSnapshot(state);
-    renderRuntimeView();
-    rejectCertificationSnapshot(state);
-    renderCertificationView();
+    rejectRuntimeSnapshot(state); renderRuntimeView();
+    rejectCertificationSnapshot(state); renderCertificationView();
+    rejectSystemSnapshot(state); rejectTailscaleSnapshot(state);
+    state.systemError = "Backend disconnected."; state.tailscaleError = "Backend disconnected.";
+    renderSettingsView();
   } else if (!wasConnected) {
-    if (document.getElementById("models")?.classList.contains("active"))
-      loadRuntime();
-    if (document.getElementById("privacy")?.classList.contains("active"))
-      loadPrivacy();
+    if (document.getElementById("models")?.classList.contains("active")) loadRuntime();
+    if (document.getElementById("privacy")?.classList.contains("active")) loadPrivacy();
+    if (document.getElementById("settings")?.classList.contains("active")) loadSettings();
   }
 }
 async function workerDetail(workerId) {
@@ -395,6 +415,20 @@ async function observeServerTest(serverId) {
     throw error;
   }
 }
+function settingsControls(){
+ const sr=$("system-refresh");if(sr)sr.disabled=!state.connected||state.systemBusy;
+ for(const id of ["system-update-check","system-update-apply-ask","system-restart-ask"]){const e=$(id);if(e)e.disabled=!state.connected||state.systemBusy||!state.system;}
+ for(const id of ["system-update-apply-confirm","system-restart-confirm","system-confirm-cancel"]){const e=$(id);if(e)e.disabled=!state.connected||state.systemBusy;}
+ const tr=$("tailscale-refresh");if(tr)tr.disabled=!state.connected||state.tailscaleBusy;
+ for(const id of ["tailscale-enable","tailscale-disable-ask"]){const e=$(id);if(e)e.disabled=!state.connected||state.tailscaleBusy||!state.tailscale;}
+ for(const id of ["tailscale-disable-confirm","tailscale-confirm-cancel"]){const e=$(id);if(e)e.disabled=!state.connected||state.tailscaleBusy;}
+}
+function renderSettingsView(){const a=$("system-settings"),b=$("tailscale-settings");if(a)a.innerHTML=renderSystemSettings(state.system,{busy:state.systemBusy,error:state.systemError,updateCheck:state.systemUpdateCheck,operation:state.systemOperation,confirm:state.systemConfirm});if(b)b.innerHTML=renderTailscaleSettings(state.tailscale,{busy:state.tailscaleBusy,error:state.tailscaleError,confirm:state.tailscaleConfirm});settingsControls();}
+async function loadSystemSettings(o={}){if(!state.connected)return;if(state.systemBusy&&o.allowBusy!==true)return;const v=beginSystemRequest(state);state.systemError=null;try{const x=await api.system();acceptSystemSnapshot(state,x,v);}catch(e){if(rejectSystemSnapshot(state,v))state.systemError=e.message;}renderSettingsView();}
+async function loadTailscaleSettings(o={}){if(!state.connected)return;if(state.tailscaleBusy&&o.allowBusy!==true)return;const v=beginTailscaleRequest(state);state.tailscaleError=null;try{const x=await api.tailscale();acceptTailscaleSnapshot(state,x,v);}catch(e){if(rejectTailscaleSnapshot(state,v))state.tailscaleError=e.message;}renderSettingsView();}
+async function loadSettings(){if(!state.connected){rejectSystemSnapshot(state);rejectTailscaleSnapshot(state);state.systemError="Backend disconnected.";state.tailscaleError="Backend disconnected.";renderSettingsView();return;}await Promise.all([loadSystemSettings(),loadTailscaleSettings()]);}
+async function runSystemMutation(kind,work,msg){if(!state.connected||state.systemBusy||!state.system)return;state.systemBusy=true;state.systemConfirm=null;state.systemUpdateCheck=null;state.systemOperation=null;state.systemError=null;rejectSystemSnapshot(state);renderSettingsView();try{const result=await work();state.systemOperation={kind,status:"RESPONSE_RECEIVED",result};notice(msg);await loadSystemSettings({allowBusy:true});}catch(e){state.systemOperation={kind,status:e?.code==="disconnected"?"UNKNOWN":"FAILED",detail:e.message};state.systemError="Current system state is unavailable. Refresh current state before another mutation.";notice(e?.code==="disconnected"?"Connection was lost during the action. Outcome is UNKNOWN until current system state is refreshed.":e.message,true);}finally{state.systemBusy=false;renderSettingsView();}}
+async function runTailscaleMutation(work,msg){if(!state.connected||state.tailscaleBusy||!state.tailscale)return;state.tailscaleBusy=true;state.tailscaleConfirm=null;state.tailscaleError=null;rejectTailscaleSnapshot(state);const v=state.tailscaleRequestVersion;renderSettingsView();try{const result=await work();if(acceptTailscaleSnapshot(state,result,v))notice(msg);}catch(e){if(rejectTailscaleSnapshot(state,v))state.tailscaleError=e.message;notice(e.message,true);}finally{state.tailscaleBusy=false;renderSettingsView();}}
 async function loadIntelligence() {
   if (!state.connected) {
     $("intel-badge").textContent = "DISCONNECTED";
@@ -1263,6 +1297,22 @@ $("cert-stack").addEventListener("click", (event) => {
     });
   }
 });
+$("system-settings-card").addEventListener("click",async(event)=>{
+ if(event.target.closest("#system-refresh")){await loadSystemSettings();return;}
+ if(event.target.closest("#system-update-check")){if(!state.connected||state.systemBusy||!state.system)return;state.systemBusy=true;state.systemUpdateCheck=null;renderSettingsView();try{state.systemUpdateCheck=await api.systemUpdateCheck();notice("Update check completed.");}catch(e){notice(e.message,true);}finally{state.systemBusy=false;renderSettingsView();}return;}
+ if(event.target.closest("#system-update-apply-ask")){if(!state.connected||state.systemBusy||!state.system)return;state.systemConfirm="apply";renderSettingsView();return;}
+ if(event.target.closest("#system-restart-ask")){if(!state.connected||state.systemBusy||!state.system)return;state.systemConfirm="restart";renderSettingsView();return;}
+ if(event.target.closest("#system-confirm-cancel")){state.systemConfirm=null;renderSettingsView();return;}
+ if(event.target.closest("#system-update-apply-confirm")){await runSystemMutation("update_apply",()=>api.systemUpdateApply(),"Update apply returned. Current deployment state is being refreshed.");return;}
+ if(event.target.closest("#system-restart-confirm")){await runSystemMutation("restart",()=>api.systemRestart(),"Restart request returned. Current system state is being refreshed.");}
+});
+$("tailscale-settings-card").addEventListener("click",async(event)=>{
+ if(event.target.closest("#tailscale-refresh")){await loadTailscaleSettings();return;}
+ if(event.target.closest("#tailscale-enable")){await runTailscaleMutation(()=>api.tailscaleEnable(),"Tailscale Serve enable action completed with fresh backend evidence.");return;}
+ if(event.target.closest("#tailscale-disable-ask")){if(!state.connected||state.tailscaleBusy||!state.tailscale)return;state.tailscaleConfirm="disable";renderSettingsView();return;}
+ if(event.target.closest("#tailscale-confirm-cancel")){state.tailscaleConfirm=null;renderSettingsView();return;}
+ if(event.target.closest("#tailscale-disable-confirm")){await runTailscaleMutation(()=>api.tailscaleDisable(),"Tailscale Serve disable action completed with fresh backend evidence.");}
+});
 $("load-more").addEventListener("click", async () => {
   $("load-more").disabled = true;
   try {
@@ -1301,6 +1351,8 @@ function refreshOnReturn() {
     loadPrivacy();
   if (document.getElementById("models")?.classList.contains("active"))
     loadRuntime();
+  if (document.getElementById("settings")?.classList.contains("active"))
+    loadSettings();
   if (shouldContinueCertificationPoll(state.certificationActiveRun))
     scheduleCertificationPoll();
 }

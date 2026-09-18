@@ -1546,61 +1546,18 @@
            SETTINGS
            =================================================== -->
 
-      <section
-        id="settings"
-        class="view"
-      >
+      <section id="settings" class="view">
 
-        <article class="card">
+        <article class="card" id="system-settings-card">
+          <div class="card-head"><div><div class="eyebrow">SYSTEM</div><h2>System &amp; deployment</h2></div></div>
+          <p class="muted-text">Current deployment state comes only from GET /api/system. Process and checkout state are shown separately; the browser does not derive deployment verification.</p>
+          <div id="system-settings">Loading…</div>
+        </article>
 
-          <div class="card-head">
-
-            <h2>
-              Settings
-            </h2>
-
-          </div>
-
-          <div class="settings-grid">
-
-
-            <!-- Theme -->
-
-            <label>
-
-              Theme
-
-              <select disabled>
-                <option>
-                  Dark
-                </option>
-              </select>
-
-            </label>
-
-
-            <!-- Cloud authorization -->
-
-            <label>
-
-              Cloud authorization
-
-              <select disabled>
-                <option>
-                  Not exposed in this API
-                </option>
-              </select>
-
-            </label>
-
-          </div>
-
-          <p class="muted-text">
-            API discovery: same-origin /api.
-            Worker adapters and prompt analysis are configured on the server.
-            Trust, policy, leases, and worktrees are controlled by the backend.
-          </p>
-
+        <article class="card" id="tailscale-settings-card">
+          <div class="card-head"><div><div class="eyebrow">REMOTE ACCESS</div><h2>Remote access — Tailscale Serve</h2></div></div>
+          <p class="muted-text">Server-observed Tailscale node, Serve, host, intent, and remote-access state. No public-ingress control or arbitrary topology editor is exposed here.</p>
+          <div id="tailscale-settings">Loading…</div>
         </article>
 
       </section>
