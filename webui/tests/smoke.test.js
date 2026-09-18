@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -588,6 +589,7 @@ test("shipped modules keep same-origin transport and never use web storage", asy
     "../static/views.js",
     "../static/aliases.js",
     "../static/app.css",
+    "../static/views-admin.js",
   ];
   for (const rel of files) {
     const source = await readFile(new URL(rel, import.meta.url), "utf8");
@@ -803,4 +805,216 @@ test("api.js never constructs client-authority request fields", async () => {
   assert.match(apiSource, /cache: "no-store"/);
   assert.match(apiSource, /data === undefined \? 10000 : 120000/);
   assert.match(apiSource, /Refresh durable run state before trying again/);
+});
+
+const runtimeConfig = {
+  ollama_servers: [
+    { id: "local", origin: "http://127.0.0.1:9", origin_source: "CONFIG_BOUND" },
+  ],
+  workers: [
+    {
+      worker_id: "w1",
+      kind: "openai_compatible",
+      network_class: "local",
+      ollama_server_id: "local",
+      model_tag: { value: "qwen", source: "CONFIG_BOUND" },
+      approved_model_digest: { value: "sha256:abc", source: "CONFIG_BOUND" },
+      approved_runtime_version: { value: "0.11.0", source: "CONFIG_BOUND" },
+      effective_context_tokens: { value: 16384, source: "CONFIG_BOUND", measured_by_ollama: false },
+      temperature: { value: 0, source: "CONFIG_BOUND" },
+      normalizer_id: { value: null, source: "CONFIG_BOUND" },
+      normalizer_version: { value: null, source: "CONFIG_BOUND" },
+      identity_approved: true,
+      attestation: null,
+    },
+  ],
+};
+
+test("Models view keeps the registry and a separate Runtime configuration area", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.match(html, /id="workers-list"/);
+  assert.match(html, /id="worker-detail"/);
+  assert.match(html, /MODEL REGISTRY/);
+  assert.match(html, /Runtime configuration/);
+  assert.match(html, /Ollama servers/);
+  assert.match(html, /Runtime workers/);
+  assert.match(html, /id="runtime-attest"/);
+  assert.match(html, /Live attest runtime/);
+  assert.match(html, /Configured runtime state is not a live probe/);
+  assert.match(html, /GET \/api\/runtime is CONFIG_BOUND \/ UNVERIFIED/);
+  assert.match(html, /id="ollama-server-form"/);
+  assert.match(html, /id="runtime-worker-form"/);
+  assert.match(html, /id="runtime-worker-advanced"/);
+  assert.doesNotMatch(html, /<details[^>]*\sopen/);
+  assert.doesNotMatch(html, /192\.168\.32\.8/);
+  assert.doesNotMatch(html, /name="digest"|name="approved_model_digest"|name="fingerprint"|name="outcome"|name="evidence_ref"|name="adapter"/);
+});
+
+test("GET runtime load never auto-attests; live attest is an explicit control", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const loadStart = appSource.indexOf("async function loadRuntime");
+  const loadEnd = appSource.indexOf("async function runtimeAction");
+  const loadFn = appSource.slice(loadStart, loadEnd);
+  assert.match(loadFn, /api\.runtime\(\)/);
+  assert.doesNotMatch(loadFn, /runtimeAttest/);
+  const refreshStart = appSource.indexOf("async function refresh");
+  const refreshEnd = appSource.indexOf("async function action");
+  assert.doesNotMatch(appSource.slice(refreshStart, refreshEnd), /runtimeAttest/);
+  assert.equal((appSource.match(/api\.runtimeAttest\(/g) || []).length, 1);
+  assert.match(appSource, /\$\("runtime-attest"\)\.addEventListener\("click"/);
+  assert.match(appSource, /if \(state\.runtimeBusy\) return/);
+});
+
+test("config-bound servers and live tests keep distinct provenance", () => {
+  assert.equal(provenanceClass("CONFIG_BOUND"), "provenance-config");
+  assert.equal(provenanceClass("LIVE_ATTESTED"), "provenance-live");
+  assert.equal(provenanceClass("VERIFIED"), "provenance-verified");
+  assert.equal(provenanceClass("MISMATCH"), "provenance-mismatch");
+  assert.equal(provenanceClass("UNREACHABLE"), "provenance-unreachable");
+  assert.equal(provenanceClass("READY"), "provenance-unknown");
+  assert.notEqual(provenanceClass("VERIFIED"), provenanceClass("READY"));
+  assert.notEqual(provenanceClass("MISMATCH"), provenanceClass("VERIFIED"));
+  assert.notEqual(provenanceClass("UNREACHABLE"), provenanceClass("VERIFIED"));
+  assert.notEqual(provenanceClass("LIVE_ATTESTED"), provenanceClass("CONFIG_BOUND"));
+  const html = renderRuntimeServers(runtimeConfig);
+  assert.match(html, /CONFIG_BOUND/);
+  assert.match(html, /provenance-config/);
+  assert.doesNotMatch(html, /LIVE_ATTESTED|provenance-live|provenance-verified/);
+  assert.match(html, /data-runtime-test-server="local"/);
+  const live = renderRuntimeServers(runtimeConfig, {
+    live: { local: { status: "UNREACHABLE", reason: "runtime_probe_unavailable" } },
+    tests: { local: { status: "LIVE_ATTESTED", runtime_version: "0.11.0", models: [{ name: "qwen", digest: "sha256:abc" }] } },
+  });
+  assert.match(live, /provenance-config/);
+  assert.match(live, /provenance-live/);
+  assert.match(live, /LIVE ATTESTATION/);
+  assert.match(live, /SERVER TEST \(OBSERVATION\)/);
+  assert.match(live, /UNREACHABLE/);
+  assert.match(live, /provenance-unreachable/);
+  assert.doesNotMatch(live, /class="badge provenance provenance-verified">UNREACHABLE/);
+  assert.doesNotMatch(live, /class="badge provenance provenance-verified">MISMATCH/);
+  const mismatch = renderRuntimeAttestation({
+    workers: [{ worker_id: "w1", attestation: { status: "MISMATCH", reason: "runtime_identity_mismatch" } }],
+  });
+  assert.match(mismatch, /MISMATCH/);
+  assert.match(mismatch, /provenance-mismatch/);
+  assert.doesNotMatch(mismatch, /provenance-verified">MISMATCH/);
+});
+
+test("runtime server and worker renderers escape untrusted values", () => {
+  const attack = '<img src=x onerror="alert(1)">';
+  assert.doesNotMatch(renderRuntimeServers({ ollama_servers: [{ id: attack, origin: attack, origin_source: attack }] }), /<img/);
+  assert.doesNotMatch(renderOllamaServerTest({ status: attack, runtime_version: attack, models: [{ name: attack, digest: attack }] }), /<img/);
+  assert.doesNotMatch(renderRuntimeWorkers({ workers: [{
+    worker_id: attack, kind: attack, network_class: attack, ollama_server_id: attack,
+    model_tag: { value: attack, source: attack },
+    approved_model_digest: { value: attack, source: attack },
+    approved_runtime_version: { value: attack, source: attack },
+    effective_context_tokens: { value: attack, source: attack, measured_by_ollama: attack },
+    temperature: { value: attack, source: attack },
+    normalizer_id: { value: attack, source: attack },
+    normalizer_version: { value: attack, source: attack },
+    identity_approved: attack,
+  }] }), /<img/);
+  assert.doesNotMatch(renderRuntimeIdentityResult({ status: attack, reason: attack, configured_digest: attack, observed_digest: attack }), /<img/);
+  assert.doesNotMatch(renderReplaceIdentityConfirm(attack), /<img/);
+  assert.doesNotMatch(provenanceBadge(attack), /<img/);
+});
+
+test("runtime workers display digest and version and do not post them", () => {
+  const html = renderRuntimeWorkers(runtimeConfig);
+  assert.match(html, /approved_model_digest/);
+  assert.match(html, /sha256:abc/);
+  assert.match(html, /0\.11\.0/);
+  assert.match(html, /measured_by_ollama: false/);
+  assert.match(html, /identity_approved: true/);
+  assert.doesNotMatch(html, /<input[^>]+name="digest"/);
+  assert.doesNotMatch(html, /<input[^>]+name="approved_model_digest"/);
+  assert.doesNotMatch(html, /<input[^>]+name="fingerprint"/);
+  assert.match(html, /data-runtime-approve="w1"/);
+  assert.match(html, /data-runtime-replace-ask="w1"/);
+  assert.doesNotMatch(html, /data-runtime-replace-confirm/);
+});
+
+test("registerRuntimeWorker payload copies only supplied allowlisted fields", () => {
+  assert.deepEqual(runtimeRegistrationPayload({
+    worker_id: "w1",
+    ollama_server_id: "local",
+    model_tag: "qwen",
+    kind: "",
+    digest: "abc",
+    approved_model_digest: "abc",
+    fingerprint: "fp",
+    outcome: "pass",
+  }), { worker_id: "w1", ollama_server_id: "local", model_tag: "qwen" });
+  assert.deepEqual(runtimeRegistrationPayload({
+    worker_id: "w1",
+    ollama_server_id: "local",
+    model_tag: "qwen",
+    kind: "openai_compatible",
+    network_class: "local",
+    effective_context_tokens: "16384",
+    temperature: "0",
+    normalizer_id: "norm",
+    normalizer_version: "1",
+  }), {
+    worker_id: "w1",
+    ollama_server_id: "local",
+    model_tag: "qwen",
+    kind: "openai_compatible",
+    network_class: "local",
+    effective_context_tokens: 16384,
+    temperature: 0,
+    normalizer_id: "norm",
+    normalizer_version: 1,
+  });
+  const options = renderRuntimeServerOptions(runtimeConfig.ollama_servers);
+  assert.match(options, /value="local"/);
+});
+
+test("identity approval is explicit and MISMATCH does not replace", async () => {
+  const mismatch = renderRuntimeIdentityResult({
+    status: "MISMATCH",
+    reason: "runtime_identity_mismatch",
+    configured_digest: "sha256:old",
+    observed_digest: "sha256:new",
+    replaced: false,
+  });
+  assert.match(mismatch, /MISMATCH/);
+  assert.match(mismatch, /Approved identity was not replaced/);
+  assert.doesNotMatch(mismatch, /data-runtime-replace-confirm/);
+  const confirm = renderReplaceIdentityConfirm("w1");
+  assert.match(confirm, /replaces the currently approved runtime identity/);
+  assert.match(confirm, /Certificates are NOT transferred automatically/);
+  assert.match(confirm, /Production eligibility must not be assumed/);
+  assert.match(confirm, /data-runtime-replace-confirm="w1"/);
+  const withConfirm = renderRuntimeWorkers(runtimeConfig, { replacePending: "w1" });
+  assert.match(withConfirm, /data-runtime-replace-confirm="w1"/);
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  assert.match(appSource, /api\.approveRuntimeWorker\(workerId\)/);
+  assert.match(appSource, /api\.approveNewRuntimeIdentity\(workerId\)/);
+  assert.match(appSource, /result\.status !== "MISMATCH"/);
+  assert.match(appSource, /api\.addOllamaServer\(serverId, origin\)/);
+  assert.equal((appSource.match(/api\.addOllamaServer\(/g) || []).length, 1);
+  const approveBlock = appSource.slice(appSource.indexOf("if (approveButton)"), appSource.indexOf("if (replaceAsk)"));
+  assert.doesNotMatch(approveBlock, /approveNewRuntimeIdentity/);
+});
+
+test("Models runtime UI keeps fetch out of app and admin views", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const adminSource = await readFile(new URL("../static/views-admin.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.doesNotMatch(appSource, /fetch\(/);
+  assert.doesNotMatch(adminSource, /fetch\(/);
+  assert.doesNotMatch(adminSource, /localStorage|sessionStorage|indexedDB/i);
+  assert.match(appSource, /from "\.\/views-admin\.js"/);
+  assert.match(html, /name="kind"/);
+  assert.match(html, /name="network_class"/);
+  assert.match(html, /name="effective_context_tokens"/);
+  assert.match(html, /name="temperature"/);
+  assert.match(html, /name="normalizer_id"/);
+  assert.match(html, /name="normalizer_version"/);
+  assert.doesNotMatch(html, /name="output_token_budget"|name="tool_choice_enforcement"|name="planner_policy_version"/);
+  assert.doesNotMatch(html, /Funnel/i);
+  assert.doesNotMatch(adminSource, /statusClass/);
 });

@@ -1337,6 +1337,132 @@ button:disabled {
     margin-top: 10px;
 }
 
+.runtime-stack {
+    display: grid;
+    gap: 16px;
+    margin-top: 16px;
+}
+
+.runtime-item {
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    border-radius: 12px;
+    padding: 15px;
+    margin-top: 12px;
+}
+
+.runtime-field {
+    display: grid;
+    grid-template-columns: minmax(120px, 200px) minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    align-items: center;
+    margin-top: 8px;
+}
+
+.runtime-field-label {
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.runtime-field-value {
+    overflow-wrap: anywhere;
+    font-size: 13px;
+}
+
+.runtime-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.runtime-live,
+.runtime-identity-result,
+.runtime-confirm {
+    margin-top: 12px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(var(--ice-rgb), 0.03);
+}
+
+.runtime-confirm {
+    border-color: rgba(242, 202, 115, 0.35);
+}
+
+.runtime-attest-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    margin-top: 8px;
+}
+
+.runtime-model-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+#runtime-worker-advanced {
+    margin-top: 4px;
+}
+
+#runtime-worker-advanced label {
+    margin-top: 12px;
+}
+
+.badge.provenance-config {
+    color: rgba(var(--ice-rgb), 0.82);
+    border-color: rgba(var(--ice-rgb), 0.22);
+    background: rgba(var(--ice-rgb), 0.06);
+}
+
+.badge.provenance-live {
+    color: #9ad7ff;
+    border-color: rgba(154, 215, 255, 0.35);
+    background: rgba(154, 215, 255, 0.08);
+}
+
+.badge.provenance-verified {
+    color: #7ee0c3;
+    border-color: rgba(126, 224, 195, 0.38);
+    background: rgba(126, 224, 195, 0.08);
+}
+
+.badge.provenance-observed {
+    color: #c9b6ff;
+    border-color: rgba(201, 182, 255, 0.35);
+    background: rgba(201, 182, 255, 0.08);
+}
+
+.badge.provenance-mismatch {
+    color: #ffb36b;
+    border-color: rgba(255, 179, 107, 0.4);
+    background: rgba(255, 179, 107, 0.08);
+}
+
+.badge.provenance-unreachable {
+    color: #ff8aa0;
+    border-color: rgba(255, 138, 160, 0.4);
+    background: rgba(255, 138, 160, 0.08);
+}
+
+.badge.provenance-unverified,
+.badge.provenance-unknown {
+    color: var(--muted);
+    border-color: rgba(var(--ice-rgb), 0.12);
+}
+
+@media (max-width: 700px) {
+    .runtime-field {
+        grid-template-columns: 1fr;
+    }
+}
+
 .model-title {
     font-weight: 800;
 

@@ -758,6 +758,259 @@
 
         </div>
 
+        <div
+          id="runtime-stack"
+          class="runtime-stack"
+        >
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  RUNTIME
+                </div>
+
+                <h2>
+                  Runtime configuration
+                </h2>
+              </div>
+
+              <button
+                id="runtime-attest"
+                class="ghost small"
+                type="button"
+              >
+                Live attest runtime
+              </button>
+
+            </div>
+
+            <p class="muted-text">
+              Configured runtime state is not a live probe.
+              GET /api/runtime is CONFIG_BOUND / UNVERIFIED information.
+              Live attestation appears only after the explicit control below.
+            </p>
+
+            <div id="runtime-attestation">
+              <p class="muted-text">
+                No live attestation in this session. Configured runtime state is not a live probe.
+              </p>
+            </div>
+
+          </article>
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  CONNECT
+                </div>
+
+                <h2>
+                  Ollama servers
+                </h2>
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Operator-entered connect targets, not LAN discovery.
+              A test is live observation, not model identity approval.
+            </p>
+
+            <div id="runtime-servers">
+              Loading…
+            </div>
+
+            <form id="ollama-server-form">
+
+              <label>
+                Server ID
+                <input
+                  id="ollama-server-id"
+                  name="server_id"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <label>
+                Origin
+                <input
+                  id="ollama-server-origin"
+                  name="origin"
+                  required
+                  maxlength="500"
+                  autocomplete="off"
+                  placeholder="http://127.0.0.1:<port>"
+                >
+              </label>
+
+              <button
+                id="ollama-server-submit"
+                class="small"
+                type="submit"
+              >
+                Add Ollama server
+              </button>
+
+            </form>
+
+          </article>
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  RUNTIME WORKERS
+                </div>
+
+                <h2>
+                  Runtime workers
+                </h2>
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Persistent Runtime configuration — distinct from the model
+              registry above. Digest and version values are display-only.
+            </p>
+
+            <div id="runtime-workers">
+              Loading…
+            </div>
+
+            <form id="runtime-worker-form">
+
+              <label>
+                Worker ID
+                <input
+                  id="runtime-worker-id"
+                  name="worker_id"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <label>
+                Ollama server
+                <select
+                  id="runtime-worker-server"
+                  name="ollama_server_id"
+                  required
+                >
+                  <option value="">
+                    No configured servers
+                  </option>
+                </select>
+              </label>
+
+              <label>
+                Model tag
+                <input
+                  id="runtime-worker-model"
+                  name="model_tag"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <details id="runtime-worker-advanced">
+
+                <summary>
+                  Advanced settings
+                </summary>
+
+                <label>
+                  Kind
+                  <input
+                    id="runtime-worker-kind"
+                    name="kind"
+                    maxlength="100"
+                    autocomplete="off"
+                    placeholder="openai_compatible"
+                  >
+                </label>
+
+                <label>
+                  Network class
+                  <input
+                    id="runtime-worker-network"
+                    name="network_class"
+                    maxlength="100"
+                    autocomplete="off"
+                    placeholder="local"
+                  >
+                </label>
+
+                <label>
+                  Effective context tokens
+                  <input
+                    id="runtime-worker-context"
+                    name="effective_context_tokens"
+                    inputmode="numeric"
+                    autocomplete="off"
+                    placeholder="16384"
+                  >
+                </label>
+
+                <label>
+                  Temperature
+                  <input
+                    id="runtime-worker-temperature"
+                    name="temperature"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    placeholder="0"
+                  >
+                </label>
+
+                <label>
+                  Normalizer ID
+                  <input
+                    id="runtime-worker-normalizer-id"
+                    name="normalizer_id"
+                    maxlength="200"
+                    autocomplete="off"
+                  >
+                </label>
+
+                <label>
+                  Normalizer version
+                  <input
+                    id="runtime-worker-normalizer-version"
+                    name="normalizer_version"
+                    inputmode="numeric"
+                    autocomplete="off"
+                  >
+                </label>
+
+              </details>
+
+              <button
+                id="runtime-worker-submit"
+                class="small"
+                type="submit"
+              >
+                Register runtime worker
+              </button>
+
+            </form>
+
+          </article>
+
+        </div>
+
       </section>
 
 

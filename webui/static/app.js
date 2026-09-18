@@ -27,6 +27,13 @@ import {
   renderActivePermissionGrants,
   renderPermissionHistory,
 } from "./views.js";
+import {
+  renderRuntimeServers,
+  renderRuntimeWorkers,
+  renderRuntimeAttestation,
+  renderRuntimeServerOptions,
+  runtimeRegistrationPayload,
+} from "./views-admin.js";
 
 const api = createAPI();
 const $ = (id) => document.getElementById(id);
@@ -51,6 +58,12 @@ const state = {
   privacyBusy: false,
   permissionRequests: [],
   permissionGrants: [],
+  runtime: null,
+  runtimeBusy: false,
+  runtimeAttestation: null,
+  runtimeServerTests: {},
+  runtimeIdentityResults: {},
+  runtimeReplacePending: null,
 };
 let timer;
 let activeJobTimer;
@@ -68,6 +81,7 @@ function view(name) {
   if (name === "intelligence") loadIntelligence();
   if (name === "planning") loadPlanning();
   if (name === "privacy") loadPrivacy();
+  if (name === "models") loadRuntime();
 }
 document
   .querySelectorAll(".nav-item")
@@ -111,6 +125,7 @@ function connected(value) {
     : "Disconnected";
   $("backend-status").textContent = value ? "CONNECTED" : "DISCONNECTED";
   controls();
+  runtimeControls();
 }
 async function workerDetail(workerId) {
   state.workerId = workerId;
@@ -193,6 +208,114 @@ async function workerDetail(workerId) {
     .forEach((el) => {
       el.open = expanded.has(el.querySelector("summary").textContent);
     });
+}
+function runtimeControls() {
+  const busy = state.runtimeBusy || !state.connected;
+  const attest = $("runtime-attest");
+  if (attest) attest.disabled = busy;
+  for (const id of [
+    "ollama-server-id",
+    "ollama-server-origin",
+    "ollama-server-submit",
+    "runtime-worker-id",
+    "runtime-worker-server",
+    "runtime-worker-model",
+    "runtime-worker-submit",
+    "runtime-worker-kind",
+    "runtime-worker-network",
+    "runtime-worker-context",
+    "runtime-worker-temperature",
+    "runtime-worker-normalizer-id",
+    "runtime-worker-normalizer-version",
+  ]) {
+    const el = $(id);
+    if (el) el.disabled = busy;
+  }
+  document
+    .querySelectorAll(
+      "[data-runtime-test-server], [data-runtime-approve], [data-runtime-replace-ask], [data-runtime-replace-confirm], [data-runtime-replace-cancel]",
+    )
+    .forEach((el) => {
+      el.disabled = busy;
+    });
+}
+function liveByServer(attestation) {
+  const map = {};
+  for (const server of attestation?.ollama_servers || []) {
+    if (server.live) map[server.id] = server.live;
+  }
+  return map;
+}
+function attestationByWorker(attestation) {
+  const map = {};
+  for (const worker of attestation?.workers || []) {
+    if (worker.attestation) map[worker.worker_id] = worker.attestation;
+  }
+  return map;
+}
+function renderRuntimeView() {
+  const servers = $("runtime-servers");
+  const workers = $("runtime-workers");
+  const attestation = $("runtime-attestation");
+  const select = $("runtime-worker-server");
+  if (!servers || !workers || !attestation) return;
+  if (!state.connected) {
+    const message =
+      '<p class="notice error">Backend disconnected. Runtime configuration is unavailable until the connection returns.</p>';
+    servers.innerHTML = message;
+    workers.innerHTML = message;
+    attestation.innerHTML = message;
+    return;
+  }
+  servers.innerHTML = renderRuntimeServers(state.runtime, {
+    tests: state.runtimeServerTests,
+    live: liveByServer(state.runtimeAttestation),
+    busy: state.runtimeBusy,
+  });
+  workers.innerHTML = renderRuntimeWorkers(state.runtime, {
+    attestations: attestationByWorker(state.runtimeAttestation),
+    identityResults: state.runtimeIdentityResults,
+    replacePending: state.runtimeReplacePending,
+    registryIds: state.workers.map((worker) => worker.worker_id),
+    busy: state.runtimeBusy,
+  });
+  attestation.innerHTML = renderRuntimeAttestation(state.runtimeAttestation);
+  if (select) {
+    const previous = select.value;
+    select.innerHTML = renderRuntimeServerOptions(state.runtime?.ollama_servers);
+    if ([...select.options].some((option) => option.value === previous))
+      select.value = previous;
+  }
+  runtimeControls();
+}
+async function loadRuntime() {
+  if (!state.connected) {
+    renderRuntimeView();
+    return;
+  }
+  try {
+    state.runtime = await api.runtime();
+    renderRuntimeView();
+  } catch (error) {
+    $("runtime-servers").innerHTML =
+      `<p class="notice error">${esc(error.message)}</p>`;
+    $("runtime-workers").innerHTML =
+      `<p class="notice error">${esc(error.message)}</p>`;
+  }
+}
+async function runtimeAction(work, success) {
+  if (state.runtimeBusy) return;
+  state.runtimeBusy = true;
+  runtimeControls();
+  try {
+    await work();
+    if (success) notice(success);
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    state.runtimeBusy = false;
+    renderRuntimeView();
+  }
 }
 async function loadIntelligence() {
   if (!state.connected) {
@@ -587,6 +710,101 @@ $("workers-list").addEventListener("click", async (event) => {
       notice(error.message, true);
     }
 });
+$("runtime-attest").addEventListener("click", () => {
+  runtimeAction(async () => {
+    state.runtimeAttestation = await api.runtimeAttest();
+  }, "Live runtime attestation recorded from the backend.");
+});
+$("ollama-server-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const serverId = $("ollama-server-id").value.trim();
+  const origin = $("ollama-server-origin").value.trim();
+  if (!serverId || !origin || state.runtimeBusy) return;
+  runtimeAction(async () => {
+    state.runtime = await api.addOllamaServer(serverId, origin);
+    state.runtimeAttestation = null;
+    $("ollama-server-form").reset();
+  }, "Ollama server saved from the backend.");
+});
+$("runtime-worker-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (state.runtimeBusy) return;
+  const payload = runtimeRegistrationPayload({
+    worker_id: $("runtime-worker-id").value,
+    ollama_server_id: $("runtime-worker-server").value,
+    model_tag: $("runtime-worker-model").value,
+    kind: $("runtime-worker-kind").value,
+    network_class: $("runtime-worker-network").value,
+    effective_context_tokens: $("runtime-worker-context").value,
+    temperature: $("runtime-worker-temperature").value,
+    normalizer_id: $("runtime-worker-normalizer-id").value,
+    normalizer_version: $("runtime-worker-normalizer-version").value,
+  });
+  if (!payload.worker_id || !payload.ollama_server_id || !payload.model_tag)
+    return;
+  runtimeAction(async () => {
+    state.runtime = await api.registerRuntimeWorker(payload);
+    state.runtimeAttestation = null;
+    $("runtime-worker-form").reset();
+  }, "Runtime worker saved from the backend.");
+});
+$("runtime-stack").addEventListener("click", (event) => {
+  const testButton = event.target.closest("[data-runtime-test-server]");
+  const approveButton = event.target.closest("[data-runtime-approve]");
+  const replaceAsk = event.target.closest("[data-runtime-replace-ask]");
+  const replaceConfirm = event.target.closest("[data-runtime-replace-confirm]");
+  const replaceCancel = event.target.closest("[data-runtime-replace-cancel]");
+  if (testButton) {
+    const serverId = testButton.dataset.runtimeTestServer;
+    runtimeAction(async () => {
+      const result = await api.testOllamaServer(serverId);
+      state.runtimeServerTests = {
+        ...state.runtimeServerTests,
+        [serverId]: result,
+      };
+    });
+    return;
+  }
+  if (approveButton) {
+    const workerId = approveButton.dataset.runtimeApprove;
+    runtimeAction(async () => {
+      const result = await api.approveRuntimeWorker(workerId);
+      state.runtimeIdentityResults = {
+        ...state.runtimeIdentityResults,
+        [workerId]: result,
+      };
+      if (result.status !== "MISMATCH") {
+        state.runtime = await api.runtime();
+        state.runtimeAttestation = null;
+      }
+    });
+    return;
+  }
+  if (replaceAsk) {
+    if (state.runtimeBusy) return;
+    state.runtimeReplacePending = replaceAsk.dataset.runtimeReplaceAsk;
+    renderRuntimeView();
+    return;
+  }
+  if (replaceCancel) {
+    state.runtimeReplacePending = null;
+    renderRuntimeView();
+    return;
+  }
+  if (replaceConfirm) {
+    const workerId = replaceConfirm.dataset.runtimeReplaceConfirm;
+    runtimeAction(async () => {
+      const result = await api.approveNewRuntimeIdentity(workerId);
+      state.runtimeIdentityResults = {
+        ...state.runtimeIdentityResults,
+        [workerId]: result,
+      };
+      state.runtimeReplacePending = null;
+      state.runtime = await api.runtime();
+      state.runtimeAttestation = null;
+    });
+  }
+});
 $("intel-refresh").addEventListener("click", async () => {
   if (state.intelBusy || !state.connected) return;
   state.intelBusy = true;
@@ -776,6 +994,8 @@ function refreshOnReturn() {
     loadPlanning();
   if (document.getElementById("privacy")?.classList.contains("active"))
     loadPrivacy();
+  if (document.getElementById("models")?.classList.contains("active"))
+    loadRuntime();
 }
 document.addEventListener("visibilitychange", refreshOnReturn);
 window.addEventListener("pageshow", refreshOnReturn);
