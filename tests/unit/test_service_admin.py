@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from code_slayer.admin.process import ProcessError, ProcessResult
+from code_slayer.admin.process import ProcessError, ProcessResult, inspect_checkout
 from code_slayer.admin.service import install_service, service_status
 from code_slayer.admin.systemd import render_user_unit
 from code_slayer.admin.tailscale import enable_serve
@@ -465,8 +465,13 @@ def test_system_status_and_forbidden_authority_fields(admin_app):
     client, _app, _config, _repo = admin_app
     status = client.get("/api/system").get_json()
     assert status["network"]["bind_host"] == "127.0.0.1"
-    assert status["service"]["running_commit_source"] in {"VERIFIED", "UNVERIFIED"}
+    assert status["service"]["process_commit_source"] == "VERIFIED"
+    assert status["service"]["running_commit_source"] == "VERIFIED"
     assert status["service"]["process_commit"] == status["service"]["running_commit"]
+    assert status["service"]["process_source_dirty"] is False
+    assert status["service"]["process_source_state"] == "clean"
+    assert status["service"]["checkout_source_dirty"] is False
+    assert status["service"]["deployment_complete"] is True
     for path in (
         "/api/system/restart",
         "/api/system/update/check",
@@ -485,8 +490,11 @@ def test_process_commit_does_not_follow_checkout_head(admin_app):
     assert first["process_commit_source"] == "VERIFIED"
     assert first["running_commit"] == process
     assert first["running_commit_source"] == "VERIFIED"
+    assert first["process_source_dirty"] is False
+    assert first["process_source_state"] == "clean"
     assert first["checkout_head"] == process
     assert first["checkout_head_source"] == "OBSERVED"
+    assert first["checkout_source_dirty"] is False
     assert first["deployment_status"] == "VERIFIED"
     assert first["deployment_complete"] is True
     (repo / "after-start.txt").write_text("new\n")
@@ -502,6 +510,156 @@ def test_process_commit_does_not_follow_checkout_head(admin_app):
     assert second["checkout_head_source"] == "OBSERVED"
     assert second["deployment_complete"] is False
     assert second["deployment_status"] == "MISMATCH"
+    assert second["process_commit_source"] == "VERIFIED"
+    assert second["process_source_dirty"] is False
+
+
+def _opened_admin(repo: Path, tmp_path: Path):
+    return create_app(
+        repo,
+        config_path=tmp_path / "config.toml",
+        load_persistent_config=True,
+    )
+
+
+def _system_service(application):
+    return application.test_client().get("/api/system").get_json()["service"]
+
+
+def test_inspect_checkout_status_failure_is_unverified_even_with_head():
+    def runner(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _ok(argv, "a" * 40)
+        if "status" in argv:
+            return ProcessResult(tuple(argv), 128, "", "not a git repository")
+        return _ok(argv)
+
+    identity = inspect_checkout(Path("/tmp"), runner=runner)
+    assert identity.commit == "a" * 40
+    assert identity.dirty is None
+    assert identity.commit_source == "UNVERIFIED"
+    assert identity.commit_source != "VERIFIED"
+    assert identity.state == "unverified"
+
+
+def test_inspect_checkout_untracked_and_tracked_porcelain_is_dirty():
+    sha = "b" * 40
+
+    def tracked(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _ok(argv, sha)
+        if "status" in argv:
+            return _ok(argv, " M README.md\n")
+        return _ok(argv)
+
+    dirty_tracked = inspect_checkout(Path("/tmp"), runner=tracked)
+    assert dirty_tracked.commit == sha
+    assert dirty_tracked.dirty is True
+    assert dirty_tracked.commit_source == "DIRTY"
+    assert dirty_tracked.commit_source != "VERIFIED"
+
+    def untracked(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _ok(argv, sha)
+        if "status" in argv:
+            return _ok(argv, "?? extra_module.py\n")
+        return _ok(argv)
+
+    dirty_untracked = inspect_checkout(Path("/tmp"), runner=untracked)
+    assert dirty_untracked.commit == sha
+    assert dirty_untracked.dirty is True
+    assert dirty_untracked.commit_source != "VERIFIED"
+    assert dirty_untracked.commit_source == "DIRTY"
+
+
+def test_dirty_tracked_file_at_startup_is_not_verified(git_repo_with_commit, tmp_path):
+    (git_repo_with_commit / "README.md").write_text("changed tracked source\n")
+    application = _opened_admin(git_repo_with_commit, tmp_path)
+    try:
+        service = _system_service(application)
+        assert service["process_commit"]
+        assert len(service["process_commit"]) == 40
+        assert service["process_commit"] == service["checkout_head"]
+        assert service["process_commit_source"] != "VERIFIED"
+        assert service["process_commit_source"] == "DIRTY"
+        assert service["running_commit_source"] == "DIRTY"
+        assert service["process_source_dirty"] is True
+        assert service["process_source_state"] == "dirty"
+        assert service["checkout_source_dirty"] is True
+        assert service["deployment_complete"] is False
+        assert service["deployment_status"] == "DIRTY"
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_untracked_source_file_at_startup_is_not_verified(git_repo_with_commit, tmp_path):
+    (git_repo_with_commit / "extra_module.py").write_text("VALUE = 1\n")
+    application = _opened_admin(git_repo_with_commit, tmp_path)
+    try:
+        service = _system_service(application)
+        assert service["process_commit"]
+        assert service["process_commit"] == service["checkout_head"]
+        assert service["process_commit_source"] != "VERIFIED"
+        assert service["process_commit_source"] == "DIRTY"
+        assert service["process_source_dirty"] is True
+        assert service["process_source_state"] == "dirty"
+        assert service["checkout_source_dirty"] is True
+        assert service["deployment_complete"] is False
+        assert service["deployment_status"] == "DIRTY"
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_dirty_after_startup_does_not_rewrite_process_source(admin_app):
+    client, _application, _config, repo = admin_app
+    first = client.get("/api/system").get_json()["service"]
+    assert first["process_commit_source"] == "VERIFIED"
+    assert first["process_source_dirty"] is False
+    assert first["process_source_state"] == "clean"
+    assert first["checkout_source_dirty"] is False
+    assert first["deployment_complete"] is True
+    process = first["process_commit"]
+    (repo / "README.md").write_text("changed after process start\n")
+    second = client.get("/api/system").get_json()["service"]
+    assert second["process_commit"] == process
+    assert second["running_commit"] == process
+    assert second["process_commit_source"] == "VERIFIED"
+    assert second["process_source_dirty"] is False
+    assert second["process_source_state"] == "clean"
+    assert second["checkout_head"] == process
+    assert second["checkout_head_source"] == "OBSERVED"
+    assert second["checkout_source_dirty"] is True
+    assert second["checkout_source_state"] == "dirty"
+    assert second["deployment_complete"] is False
+    assert second["deployment_status"] == "DIRTY"
+
+
+def test_deployment_complete_requires_verified_clean_process_source(
+    git_repo_with_commit, tmp_path,
+):
+    readme = git_repo_with_commit / "README.md"
+    original = readme.read_text()
+    readme.write_text("dirty at process start\n")
+    application = _opened_admin(git_repo_with_commit, tmp_path)
+    try:
+        client = application.test_client()
+        dirty = client.get("/api/system").get_json()["service"]
+        assert dirty["process_commit"] == dirty["checkout_head"]
+        assert dirty["process_commit_source"] != "VERIFIED"
+        assert dirty["deployment_complete"] is False
+        assert dirty["deployment_status"] == "DIRTY"
+        readme.write_text(original)
+        cleaned = client.get("/api/system").get_json()["service"]
+        assert cleaned["process_commit"] == cleaned["checkout_head"]
+        assert cleaned["checkout_source_dirty"] is False
+        assert cleaned["checkout_source_state"] == "clean"
+        assert cleaned["process_commit_source"] != "VERIFIED"
+        assert cleaned["process_source_dirty"] is True
+        assert cleaned["process_source_state"] == "dirty"
+        assert cleaned["deployment_complete"] is False
+        assert cleaned["deployment_status"] == "DIRTY"
+    finally:
+        application.extensions["codeslayer"].close()
 
 
 def test_tailscale_never_funnel_and_loopback_only():

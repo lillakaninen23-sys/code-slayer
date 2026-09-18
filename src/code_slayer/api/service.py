@@ -97,7 +97,11 @@ class ApplicationService:
         self._explicit_bindings = bindings or RuntimeBindings()
         self._started_at = time.monotonic()
         self._started_wall = time.time()
-        self.process_commit, self.process_commit_source = self._capture_process_commit()
+        self.process_identity = self._capture_process_identity()
+        self.process_commit = self.process_identity.commit
+        self.process_commit_source = self.process_identity.commit_source
+        self.process_source_dirty = self.process_identity.dirty
+        self.process_source_state = self.process_identity.state
         self.bindings = self._compose_bindings()
         # Initialize through the real application service, including existing
         # migrations, and idempotently register every runtime-declared
@@ -149,25 +153,26 @@ class ApplicationService:
         )
         self._certification_executor.start()
 
-    def _capture_process_commit(self) -> tuple[str | None, str]:
-        """Retain checkout HEAD at process start. Not re-read later.
+    def _capture_process_identity(self):
+        """Retain checkout HEAD and dirtiness at process start. Not re-read later.
 
-        A later `git rev-parse HEAD` is checkout_head, not running_commit.
+        Editable installs can load dirty/untracked source while HEAD is
+        unchanged. A dirty start is never labelled VERIFIED.
         """
-        from code_slayer.admin.process import git_rev_parse_head
+        from code_slayer.admin.process import inspect_checkout
 
-        sha = git_rev_parse_head(self.repo_path)
-        if sha is None:
-            return None, "UNVERIFIED"
-        return sha, "VERIFIED"
+        return inspect_checkout(self.repo_path)
+
+    def current_checkout_identity(self):
+        from code_slayer.admin.process import inspect_checkout
+
+        return inspect_checkout(self.repo_path)
 
     def current_checkout_head(self) -> tuple[str | None, str]:
-        from code_slayer.admin.process import git_rev_parse_head
-
-        sha = git_rev_parse_head(self.repo_path)
-        if sha is None:
+        identity = self.current_checkout_identity()
+        if identity.commit is None:
             return None, "UNVERIFIED"
-        return sha, "OBSERVED"
+        return identity.commit, "OBSERVED"
 
     def _compose_bindings(self) -> RuntimeBindings:
         explicit = self._explicit_bindings

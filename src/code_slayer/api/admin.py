@@ -28,18 +28,29 @@ class AdminFacade:
 
     def system_status(self) -> dict:
         status = service_status()
-        process = self._app.process_commit
-        process_source = self._app.process_commit_source
-        checkout, checkout_source = self._app.current_checkout_head()
-        if process is None or checkout is None:
+        process = self._app.process_identity
+        checkout = self._app.current_checkout_identity()
+        checkout_head_source = "OBSERVED" if checkout.commit is not None else "UNVERIFIED"
+        checkout_state_source = (
+            "OBSERVED" if checkout.dirty is not None else "UNVERIFIED"
+        )
+        if (
+            process.commit is None
+            or checkout.commit is None
+            or process.dirty is None
+            or checkout.dirty is None
+        ):
             deployment_status = "UNVERIFIED"
             deployment_complete = False
-        elif process == checkout:
-            deployment_status = "VERIFIED"
-            deployment_complete = True
-        else:
+        elif process.commit != checkout.commit:
             deployment_status = "MISMATCH"
             deployment_complete = False
+        elif process.commit_source != "VERIFIED" or checkout.dirty:
+            deployment_status = "DIRTY"
+            deployment_complete = False
+        else:
+            deployment_status = "VERIFIED"
+            deployment_complete = True
         cfg = self._app.persistent_config()
         return {
             "service": {
@@ -48,12 +59,17 @@ class AdminFacade:
                 "unit": status.unit,
                 "source": status.source,
                 "version": __version__,
-                "process_commit": process,
-                "process_commit_source": process_source,
-                "running_commit": process,
-                "running_commit_source": process_source,
-                "checkout_head": checkout,
-                "checkout_head_source": checkout_source,
+                "process_commit": process.commit,
+                "process_commit_source": process.commit_source,
+                "process_source_dirty": process.dirty,
+                "process_source_state": process.state,
+                "running_commit": process.commit,
+                "running_commit_source": process.commit_source,
+                "checkout_head": checkout.commit,
+                "checkout_head_source": checkout_head_source,
+                "checkout_source_dirty": checkout.dirty,
+                "checkout_source_state": checkout.state,
+                "checkout_source_state_source": checkout_state_source,
                 "deployment_status": deployment_status,
                 "deployment_complete": deployment_complete,
                 "uptime_seconds": int(time.monotonic() - self._app._started_at),
@@ -296,7 +312,8 @@ class AdminFacade:
         payload["deployment_complete"] = False
         payload["deployment_note"] = (
             "git merge is not a completed deployment; poll GET /api/system "
-            "for process_commit == checkout_head after restart"
+            "for process_commit == checkout_head with process_commit_source "
+            "VERIFIED and a clean checkout after restart"
         )
         return payload
 

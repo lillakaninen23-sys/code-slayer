@@ -49,6 +49,8 @@ function statusKind(status) {
     status === "BLOCKED" ||
     status === "HARD_DISQUALIFIED" ||
     status === "MISMATCH" ||
+    status === "DIRTY" ||
+    status === "dirty" ||
     status === "UNREACHABLE" ||
     status === "ERROR" ||
     status === "failed" ||
@@ -330,10 +332,10 @@ async function renderSystem() {
         ${badge(health.status || "unknown", statusKind(health.status))}
       </div>
       <p>Version: <code>${escapeHtml(service.version)}</code></p>
-      <p>Process commit (running): <code>${escapeHtml(service.process_commit || service.running_commit || "")}</code> ${badge(service.process_commit_source || service.running_commit_source || "UNVERIFIED", statusKind(service.process_commit_source || service.running_commit_source))}</p>
-      <p>Checkout HEAD: <code>${escapeHtml(service.checkout_head || "")}</code> ${badge(service.checkout_head_source || "UNVERIFIED", statusKind(service.checkout_head_source))}</p>
+      <p>Process commit (running): <code>${escapeHtml(service.process_commit || service.running_commit || "")}</code> ${badge(service.process_commit_source || service.running_commit_source || "UNVERIFIED", statusKind(service.process_commit_source || service.running_commit_source))} ${badge(service.process_source_state || "", statusKind(service.process_source_state === "clean" ? "VERIFIED" : service.process_source_state))}</p>
+      <p>Checkout HEAD: <code>${escapeHtml(service.checkout_head || "")}</code> ${badge(service.checkout_head_source || "UNVERIFIED", statusKind(service.checkout_head_source))} ${badge((service.checkout_source_state || "") + (service.checkout_source_dirty ? " dirty" : ""), statusKind(service.checkout_source_state === "clean" ? "VERIFIED" : "DIRTY"))}</p>
       <p>Deployment: ${badge(service.deployment_status || "UNVERIFIED", statusKind(service.deployment_status))} complete=<code>${escapeHtml(service.deployment_complete)}</code></p>
-      <p class="note">Process commit is captured at process start and does not follow git HEAD until restart.</p>
+      <p class="note">Process commit is captured at process start. A dirty editable checkout is not VERIFIED even if HEAD is unchanged. Current checkout dirtiness is observed separately.</p>
       <p>Uptime: <code>${escapeHtml(service.uptime_seconds)}</code> seconds (${escapeHtml(service.source || "")})</p>
       <p>Health schema: <code>${escapeHtml(health.schema_version)}</code> ${badge(health.source || "", statusKind(health.source))}</p>
       <p>Local URL: <a href="${escapeHtml(network.local_url || "")}">${escapeHtml(network.local_url || "")}</a></p>
@@ -350,7 +352,7 @@ async function renderSystem() {
     box.innerHTML = "<p class='muted'>Restart requested…</p>";
     try {
       await api("/api/system/restart", { method: "POST", body: "{}" });
-      box.innerHTML = "<p>Restart requested. Reload this page in a few seconds and confirm process_commit equals checkout_head.</p>";
+      box.innerHTML = "<p>Restart requested. Reload this page in a few seconds and confirm process_commit equals checkout_head with a verified clean process source.</p>";
     } catch (err) {
       box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
     }
