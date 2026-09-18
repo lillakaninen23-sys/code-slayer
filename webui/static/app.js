@@ -41,6 +41,23 @@ import {
   clearRuntimeEvidence,
   invalidateServerTest,
   acceptServerTest,
+  certificationPollDelay,
+  shouldContinueCertificationPoll,
+  isCertificationTerminal,
+  rejectCertificationSnapshot,
+  acceptCertificationWorkers,
+  selectCertificationWorkerId,
+  acceptCertificationWorker,
+  beginCertificationRun,
+  applyCertificationPoll,
+  beginCertificationEvidenceRequest,
+  acceptCertificationEvidence,
+  rejectCertificationEvidence,
+  renderCertificationWorkers,
+  renderCertificationWorkerDetail,
+  renderCertificationRun,
+  renderCertificationHistory,
+  renderCertificationEvidence,
 } from "./views-admin.js";
 
 const api = createAPI();
@@ -73,9 +90,22 @@ const state = {
   runtimeServerTests: {},
   runtimeIdentityResults: {},
   runtimeReplacePending: null,
+  certificationWorkers: null,
+  certificationEnvironment: null,
+  certificationUnavailable: false,
+  selectedCertificationWorkerId: null,
+  selectedCertificationWorker: null,
+  certificationBusy: false,
+  certificationActiveRun: null,
+  certificationHistory: null,
+  certificationEvidence: null,
+  certificationEvidenceError: null,
+  certificationEvidenceRequestId: null,
+  certificationSelectionVersion: 0,
 };
 let timer;
 let activeJobTimer;
+let certificationTimer;
 let selectionVersion = 0;
 
 function view(name) {
@@ -139,8 +169,13 @@ function connected(value) {
   if (!value) {
     rejectRuntimeSnapshot(state);
     renderRuntimeView();
-  } else if (!wasConnected && document.getElementById("models")?.classList.contains("active")) {
-    loadRuntime();
+    rejectCertificationSnapshot(state);
+    renderCertificationView();
+  } else if (!wasConnected) {
+    if (document.getElementById("models")?.classList.contains("active"))
+      loadRuntime();
+    if (document.getElementById("privacy")?.classList.contains("active"))
+      loadPrivacy();
   }
 }
 async function workerDetail(workerId) {
@@ -493,6 +528,8 @@ async function loadPrivacy() {
     $("privacy-badge").className = "badge muted";
     $("privacy-pending").innerHTML =
       '<p class="notice error">Backend disconnected. Permission state is unavailable until the connection returns.</p>';
+    rejectCertificationSnapshot(state);
+    renderCertificationView();
     return;
   }
   try {
@@ -522,6 +559,147 @@ async function loadPrivacy() {
   } catch (error) {
     $("privacy-pending").innerHTML =
       `<p class="notice error">${esc(error.message)}</p>`;
+  }
+  await loadCertification();
+}
+function certificationControls() {
+  const busy = state.certificationBusy || !state.connected;
+  document
+    .querySelectorAll("[data-cert-preflight], [data-cert-start], [data-cert-evidence]")
+    .forEach((el) => {
+      if (el.hasAttribute("data-cert-start")) {
+        el.disabled = busy || state.selectedCertificationWorker?.ready_for_certification !== true;
+        return;
+      }
+      el.disabled = busy;
+    });
+}
+function renderCertificationView() {
+  const workers = $("cert-workers");
+  const detail = $("cert-detail");
+  const run = $("cert-run");
+  const evidence = $("cert-evidence");
+  const badgeEl = $("cert-badge");
+  if (!workers || !detail || !run || !evidence) return;
+  if (!state.connected || state.certificationUnavailable) {
+    const message = !state.connected
+      ? '<p class="notice error">Backend disconnected. Certification state is unavailable until the connection returns.</p>'
+      : '<p class="notice error">Certification projection is unavailable. Prior certification observations are not current evidence.</p>';
+    workers.innerHTML = message;
+    detail.innerHTML = message;
+    run.innerHTML = "";
+    evidence.innerHTML = "";
+    if (badgeEl) {
+      badgeEl.textContent = "UNAVAILABLE";
+      badgeEl.className = "badge muted";
+    }
+    return;
+  }
+  workers.innerHTML = renderCertificationWorkers(
+    {
+      environment: state.certificationEnvironment,
+      workers: state.certificationWorkers,
+    },
+    state.selectedCertificationWorkerId,
+  );
+  detail.innerHTML = renderCertificationWorkerDetail(state.selectedCertificationWorker, {
+    busy: state.certificationBusy,
+    registryIds: state.workers.map((worker) => worker.worker_id),
+  });
+  if (state.selectedCertificationWorker) {
+    detail.innerHTML += renderCertificationHistory(state.certificationHistory);
+  }
+  run.innerHTML = renderCertificationRun(state.certificationActiveRun);
+  evidence.innerHTML = renderCertificationEvidence(
+    state.certificationEvidence,
+    state.certificationEvidenceError,
+  );
+  if (badgeEl) {
+    const count = (state.certificationWorkers || []).length;
+    badgeEl.textContent = `${count} WORKERS`;
+    badgeEl.className = "badge";
+  }
+  certificationControls();
+}
+async function loadCertification() {
+  if (!state.connected) {
+    rejectCertificationSnapshot(state);
+    renderCertificationView();
+    return;
+  }
+  try {
+    const payload = await api.certificationWorkers();
+    acceptCertificationWorkers(state, payload);
+    renderCertificationView();
+    if (state.selectedCertificationWorkerId) {
+      await loadCertificationWorker(
+        state.selectedCertificationWorkerId,
+        state.certificationSelectionVersion,
+      );
+    }
+  } catch (error) {
+    rejectCertificationSnapshot(state);
+    renderCertificationView();
+    if ($("cert-workers")) {
+      $("cert-workers").innerHTML =
+        `<p class="notice error">${esc(error.message)}</p>`;
+    }
+  }
+}
+async function loadCertificationWorker(workerId, version) {
+  try {
+    const detail = await api.certificationWorker(workerId);
+    if (!acceptCertificationWorker(state, workerId, detail, version)) return;
+    renderCertificationView();
+  } catch (error) {
+    if (state.selectedCertificationWorkerId !== workerId) return;
+    if (version != null && version !== state.certificationSelectionVersion) return;
+    state.selectedCertificationWorker = null;
+    state.certificationHistory = null;
+    renderCertificationView();
+    if ($("cert-detail")) {
+      $("cert-detail").innerHTML =
+        `<p class="notice error">${esc(error.message)}</p>`;
+    }
+  }
+}
+function scheduleCertificationPoll() {
+  clearTimeout(certificationTimer);
+  if (!shouldContinueCertificationPoll(state.certificationActiveRun)) return;
+  certificationTimer = setTimeout(() => {
+    pollCertificationRun();
+  }, certificationPollDelay(document.hidden));
+}
+async function pollCertificationRun() {
+  const runId = state.certificationActiveRun?.run_id;
+  const workerId = state.selectedCertificationWorkerId;
+  const version = state.certificationSelectionVersion;
+  if (!runId) return;
+  try {
+    const run = await api.certificationRun(runId);
+    if (!applyCertificationPoll(state, run)) return;
+    renderCertificationView();
+    if (isCertificationTerminal(run.state)) {
+      if (workerId) await loadCertificationWorker(workerId, version);
+      return;
+    }
+  } catch (error) {
+    notice(error.message, true);
+  }
+  scheduleCertificationPoll();
+}
+async function certificationAction(work, success) {
+  if (state.certificationBusy) return;
+  state.certificationBusy = true;
+  certificationControls();
+  try {
+    await work();
+    if (success) notice(success);
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    state.certificationBusy = false;
+    renderCertificationView();
   }
 }
 async function selectedDetail() {
@@ -977,6 +1155,66 @@ $("privacy-active").addEventListener("click", async (event) => {
     state.privacyBusy = false;
   }
 });
+$("cert-stack").addEventListener("click", (event) => {
+  const workerButton = event.target.closest("[data-cert-worker]");
+  const preflightButton = event.target.closest("[data-cert-preflight]");
+  const startButton = event.target.closest("[data-cert-start]");
+  const evidenceButton = event.target.closest("[data-cert-evidence]");
+  if (workerButton) {
+    const workerId = workerButton.dataset.certWorker;
+    const version = selectCertificationWorkerId(state, workerId);
+    renderCertificationView();
+    loadCertificationWorker(workerId, version);
+    return;
+  }
+  if (preflightButton) {
+    const workerId = preflightButton.dataset.certPreflight;
+    certificationAction(async () => {
+      beginCertificationEvidenceRequest(state, null);
+      try {
+        await api.certificationPreflight(workerId);
+        await loadCertificationWorker(workerId, state.certificationSelectionVersion);
+      } catch (error) {
+        await loadCertificationWorker(workerId, state.certificationSelectionVersion);
+        throw error;
+      }
+    }, "Baseline Security preflight recorded.");
+    return;
+  }
+  if (startButton) {
+    const workerId = startButton.dataset.certStart;
+    if (state.selectedCertificationWorker?.ready_for_certification !== true) return;
+    certificationAction(async () => {
+      beginCertificationRun(state, null);
+      try {
+        const run = await api.startBaselineCertification(workerId);
+        beginCertificationRun(state, run);
+        renderCertificationView();
+        scheduleCertificationPoll();
+      } catch (error) {
+        beginCertificationRun(state, null);
+        throw error;
+      }
+    }, "Baseline Security certification accepted. Closing this browser does not cancel the run.");
+    return;
+  }
+  if (evidenceButton) {
+    const runId = evidenceButton.dataset.certEvidence;
+    certificationAction(async () => {
+      beginCertificationEvidenceRequest(state, runId);
+      renderCertificationView();
+      try {
+        const evidence = await api.certificationEvidence(runId);
+        if (!acceptCertificationEvidence(state, evidence, runId)) {
+          rejectCertificationEvidence(state, runId, "Evidence is not bound to the requested run.");
+        }
+      } catch (error) {
+        rejectCertificationEvidence(state, runId, error.message);
+        throw error;
+      }
+    });
+  }
+});
 $("load-more").addEventListener("click", async () => {
   $("load-more").disabled = true;
   try {
@@ -998,7 +1236,10 @@ async function poll() {
     pollDelay(state.run?.status, state.connected, document.hidden),
   );
 }
-window.addEventListener("pagehide", () => clearTimeout(timer));
+window.addEventListener("pagehide", () => {
+  clearTimeout(timer);
+  clearTimeout(certificationTimer);
+});
 // Phase 8.2d: backend planning execution is fully independent of this
 // tab's lifetime, so a paused/backgrounded/suspended timer never risks
 // losing anything -- but the moment the user comes back, refresh
@@ -1012,6 +1253,8 @@ function refreshOnReturn() {
     loadPrivacy();
   if (document.getElementById("models")?.classList.contains("active"))
     loadRuntime();
+  if (shouldContinueCertificationPoll(state.certificationActiveRun))
+    scheduleCertificationPoll();
 }
 document.addEventListener("visibilitychange", refreshOnReturn);
 window.addEventListener("pageshow", refreshOnReturn);

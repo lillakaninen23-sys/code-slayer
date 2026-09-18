@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -1360,4 +1360,278 @@ test("runtime mutations are not retried after a lost response", async () => {
   assert.doesNotMatch(actionFn, /for \(.*work\(\)/);
   const apiSource = await readFile(new URL("../static/api.js", import.meta.url), "utf8");
   assert.match(apiSource, /Refresh durable run state before trying again/);
+});
+
+const certWorker = {
+  worker_id: "cw1",
+  kind: "openai_compatible",
+  network_class: "local",
+  environment: "VALIDATION",
+  runtime: { status: "UNKNOWN", reason: "not_probed" },
+  baseline_security: {
+    status: "CERTIFIED",
+    outcome: "PASS",
+    environment: "VALIDATION",
+    certificate_id: "cert-val",
+  },
+  roles: {
+    planner: { status: "NOT_CERTIFIED", certificate_id: null, outcome: null },
+  },
+  production_eligibility: {
+    eligible: false,
+    reason: "missing_role_certificate",
+    source: "evaluate_production_eligibility",
+    security_certificate_id: null,
+    role_certificate_id: null,
+  },
+  ready_for_certification: false,
+  future_actions: [
+    { role: "planner", available: false, reason: "live_role_certification_unavailable" },
+  ],
+  identity: {
+    model_tag: { value: "qwen", source: "CONFIG_BOUND" },
+    model_digest: { value: "sha256:abc", source: "CONFIG_BOUND" },
+    runtime_identity_fingerprint: { value: "fp", source: "CONFIG_BOUND" },
+    endpoint: { value: "http://127.0.0.1:9", source: "CONFIG_BOUND" },
+    ollama_root: { value: "/models", source: "CONFIG_BOUND" },
+    runtime_version: { value: "0.11.0", source: "CONFIG_BOUND" },
+    normalizer_id: { value: null, source: "CONFIG_BOUND" },
+    normalizer_version: { value: null, source: "CONFIG_BOUND" },
+    effective_context_tokens: { value: 16384, source: "CONFIG_BOUND", measured_by_ollama: false },
+    temperature: { value: 0, source: "CONFIG_BOUND" },
+  },
+  last_preflight: {
+    run_id: "pre-1",
+    state: "INCOMPLETE",
+    ready: false,
+    checks: [{ name: "digest_matches", ok: false, detail: "runtime_model_digest_mismatch" }],
+  },
+  history: {
+    runs: [{ run_id: "run-inc", state: "INCOMPLETE", has_certificate: false }],
+    validation_certificates: [{ certificate_id: "cert-val", outcome: "PASS", environment: "VALIDATION", issued_at: "now" }],
+    production_certificates: [],
+  },
+};
+
+test("Privacy permission UI remains and Certification Center is a separate section", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.match(html, /id="privacy-pending"/);
+  assert.match(html, /id="privacy-active"/);
+  assert.match(html, /id="privacy-history"/);
+  assert.match(html, /id="privacy-badge"/);
+  assert.match(html, /id="cert-stack"/);
+  assert.match(html, /id="cert-badge"/);
+  assert.match(html, /CERTIFICATION CENTER/);
+  assert.match(html, /isolated VALIDATION state/);
+  assert.match(html, /They do not grant trust, permissions, or production eligibility/);
+  assert.ok(html.indexOf("id=\"privacy-history\"") < html.indexOf("id=\"cert-stack\""));
+});
+
+test("certification state namespace is distinct from run status and runtime provenance", () => {
+  assert.equal(certificationStateClass("READY"), "cert-ready");
+  assert.equal(certificationStateClass("INCOMPLETE"), "cert-incomplete");
+  assert.equal(certificationStateClass("QUEUED"), "cert-queued");
+  assert.equal(certificationStateClass("RUNNING"), "cert-running");
+  assert.equal(certificationStateClass("PASS"), "cert-pass");
+  assert.equal(certificationStateClass("FAIL"), "cert-fail");
+  assert.equal(certificationStateClass("HARD_DISQUALIFIED"), "cert-hard");
+  assert.equal(certificationStateClass("CERTIFIED"), "cert-certified");
+  assert.equal(certificationStateClass("FAILED"), "cert-failed");
+  assert.equal(certificationStateClass("NOT_CERTIFIED"), "cert-not-certified");
+  assert.equal(certificationStateClass("VERIFIED"), "cert-runtime-verified");
+  assert.equal(certificationStateClass("MISMATCH"), "cert-runtime-mismatch");
+  assert.equal(certificationStateClass("UNREACHABLE"), "cert-runtime-unreachable");
+  assert.equal(certificationStateClass("UNKNOWN"), "cert-runtime-unknown");
+  assert.notEqual(certificationStateClass("VERIFIED"), provenanceClass("VERIFIED"));
+  assert.notEqual(certificationStateClass("MISMATCH"), provenanceClass("MISMATCH"));
+  assert.notEqual(certificationStateClass("UNKNOWN"), certificationStateClass("VERIFIED"));
+  assert.notEqual(certificationStateClass("UNREACHABLE"), certificationStateClass("VERIFIED"));
+  assert.notEqual(certificationStateClass("MISMATCH"), certificationStateClass("VERIFIED"));
+  assert.notEqual(certificationStateClass("PASS"), certificationStateClass("FAIL"));
+  assert.notEqual(certificationStateClass("INCOMPLETE"), certificationStateClass("PASS"));
+  assert.notEqual(certificationStateClass("HARD_DISQUALIFIED"), certificationStateClass("PASS"));
+  assert.notEqual(certificationStateClass("CERTIFIED"), certificationStateClass("ELIGIBLE"));
+  assert.match(certificationStateBadge("UNKNOWN"), /cert-runtime-unknown/);
+  assert.doesNotMatch(certificationStateBadge("UNKNOWN"), /provenance-verified|cert-runtime-verified/);
+  assert.doesNotMatch(certificationStateBadge("MISMATCH"), /cert-runtime-verified|provenance-verified/);
+});
+
+test("certification summaries keep VALIDATION, runtime unknowns, and Planner eligibility distinct", () => {
+  const html = renderCertificationWorkers({ environment: "VALIDATION", workers: [certWorker] }, "cw1");
+  assert.match(html, /VALIDATION/);
+  assert.match(html, /cert-validation/);
+  assert.match(html, /UNKNOWN/);
+  assert.match(html, /cert-runtime-unknown/);
+  assert.doesNotMatch(html, /cert-runtime-verified">UNKNOWN/);
+  assert.match(html, /Production eligibility — Planner/);
+  assert.match(html, /BLOCKED/);
+  assert.match(html, /missing_role_certificate/);
+  assert.doesNotMatch(html, />ELIGIBLE</);
+  assert.match(html, /CERTIFIED/);
+  const mismatch = renderCertificationWorkerSummary({
+    ...certWorker,
+    runtime: { status: "MISMATCH", reason: "runtime_model_digest_mismatch" },
+    production_eligibility: { eligible: true, reason: "eligible", source: "evaluate_production_eligibility" },
+  }, null, "VALIDATION");
+  assert.match(mismatch, /MISMATCH/);
+  assert.match(mismatch, /cert-runtime-mismatch/);
+  assert.doesNotMatch(mismatch, /cert-runtime-verified">MISMATCH/);
+  assert.match(mismatch, />ELIGIBLE</);
+  assert.equal(plannerEligibilityLabel({ eligible: true }), "ELIGIBLE");
+  assert.equal(plannerEligibilityLabel({ eligible: false, reason: "x" }), "BLOCKED");
+});
+
+test("validation Baseline Security CERTIFIED does not imply Planner eligibility", () => {
+  const html = renderCertificationWorkerDetail(certWorker);
+  assert.match(html, /Baseline Security/);
+  assert.match(html, /VALIDATION certificate status/);
+  assert.match(html, /CERTIFIED/);
+  assert.match(html, /Production eligibility — Planner/);
+  assert.match(html, /BLOCKED/);
+  assert.match(html, /missing_role_certificate/);
+  assert.doesNotMatch(html, />ELIGIBLE</);
+  assert.match(html, /Role certificates/);
+  assert.match(html, /PRODUCTION role certificate/);
+  assert.match(html, /Live role certification not available in v1/);
+  assert.doesNotMatch(html, /data-cert-role-start|data-cert-certify-role/);
+  assert.match(html, /measured_by_ollama: false/);
+  assert.match(html, /CONFIG_BOUND/);
+});
+
+test("certification history keeps runs, VALIDATION certificates and PRODUCTION certificates separate", () => {
+  const html = renderCertificationHistory({
+    runs: [{ run_id: "run-inc", state: "INCOMPLETE", has_certificate: false }],
+    validation_certificates: [{ certificate_id: "v1", outcome: "PASS", issued_at: "t" }],
+    production_certificates: [{ certificate_id: "p1", outcome: "PASS", issued_at: "t" }],
+  });
+  assert.match(html, /Certification runs/);
+  assert.match(html, /RUN run-inc/);
+  assert.match(html, /A run is not a certificate/);
+  assert.match(html, /has_certificate false/);
+  assert.match(html, /VALIDATION certificates/);
+  assert.match(html, /PRODUCTION certificates/);
+  assert.match(html, /CERTIFICATE v1/);
+  assert.match(html, /CERTIFICATE p1/);
+  assert.match(html, /Historical evidence is not proof of current production eligibility/);
+  const incomplete = renderCertificationRun({
+    run_id: "run-inc",
+    state: "INCOMPLETE",
+    kind: "baseline_security",
+    environment: "VALIDATION",
+    has_certificate: false,
+    certificate_id: null,
+  });
+  assert.match(incomplete, /INCOMPLETE/);
+  assert.match(incomplete, /has_certificate false/);
+  assert.match(incomplete, /A run is not a certificate/);
+  const passNoCert = renderCertificationRun({
+    run_id: "run-pass",
+    state: "PASS",
+    has_certificate: false,
+    certificate_id: null,
+  });
+  assert.match(passNoCert, /has_certificate false/);
+  assert.doesNotMatch(passNoCert, /has_certificate true/);
+});
+
+test("preflight is explicit, does not auto-start, and start is gated by ready_for_certification", async () => {
+  const blocked = renderCertificationWorkerDetail(certWorker);
+  assert.match(blocked, /data-cert-preflight="cw1"/);
+  assert.match(blocked, /data-cert-start="cw1"/);
+  assert.match(blocked, /data-cert-start="cw1" disabled/);
+  assert.equal(certificationStartEnabled(certWorker), false);
+  const ready = renderCertificationWorkerDetail({ ...certWorker, ready_for_certification: true });
+  assert.doesNotMatch(ready, /data-cert-start="cw1" disabled/);
+  assert.equal(certificationStartEnabled({ ready_for_certification: true }), true);
+  const checksReady = renderCertificationWorkerDetail({
+    ...certWorker,
+    last_preflight: { run_id: "pre-2", state: "READY", ready: true, checks: [{ name: "digest_matches", ok: true, detail: "ok" }] },
+    ready_for_certification: false,
+  });
+  assert.match(checksReady, /data-cert-start="cw1" disabled/);
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const preflightBlock = appSource.slice(appSource.indexOf("if (preflightButton)"), appSource.indexOf("if (startButton)"));
+  assert.match(preflightBlock, /api\.certificationPreflight\(workerId\)/);
+  assert.doesNotMatch(preflightBlock, /startBaselineCertification/);
+  const loadStart = appSource.indexOf("async function loadCertification()");
+  const loadEnd = appSource.indexOf("async function loadCertificationWorker");
+  assert.doesNotMatch(appSource.slice(loadStart, loadEnd), /startBaselineCertification|certificationPreflight/);
+  assert.equal((appSource.match(/startBaselineCertification/g) || []).length, 1);
+  assert.match(appSource, /api\.startBaselineCertification\(workerId\)/);
+});
+
+test("certification polling continues for QUEUED/RUNNING and stops for terminal states", () => {
+  assert.equal(shouldContinueCertificationPoll({ state: "QUEUED" }), true);
+  assert.equal(shouldContinueCertificationPoll({ state: "RUNNING" }), true);
+  assert.equal(isCertificationActive("QUEUED"), true);
+  assert.equal(isCertificationActive("RUNNING"), true);
+  for (const state of ["PASS", "FAIL", "HARD_DISQUALIFIED", "INCOMPLETE"]) {
+    assert.equal(isCertificationTerminal(state), true);
+    assert.equal(shouldContinueCertificationPoll({ state }), false);
+  }
+  assert.equal(certificationPollDelay(false), 2000);
+  assert.equal(certificationPollDelay(true), 15000);
+});
+
+test("stale certification worker and run responses cannot overwrite a newer selection", () => {
+  const certState = {};
+  const first = selectCertificationWorkerId(certState, "a");
+  selectCertificationWorkerId(certState, "b");
+  assert.equal(acceptCertificationWorker(certState, "a", certWorker, first), false);
+  assert.equal(certState.selectedCertificationWorker, null);
+  beginCertificationRun(certState, { run_id: "new", state: "QUEUED" });
+  assert.equal(applyCertificationPoll(certState, { run_id: "old", state: "PASS", has_certificate: true }), false);
+  assert.equal(certState.certificationActiveRun.run_id, "new");
+  assert.equal(certState.certificationActiveRun.state, "QUEUED");
+  assert.equal(applyCertificationPoll(certState, { run_id: "new", state: "RUNNING" }), true);
+  assert.equal(certState.certificationActiveRun.state, "RUNNING");
+});
+
+test("certification evidence is explicit, run-bound, fail-closed and escaped", () => {
+  const certState = {};
+  beginCertificationRun(certState, { run_id: "r1", state: "PASS", evidence_ref: "ev" });
+  beginCertificationEvidenceRequest(certState, "r1");
+  assert.equal(certState.certificationEvidence, null);
+  assert.equal(bindCertificationEvidence({ run_id: "r2", document: { ok: true } }, "r1"), null);
+  assert.equal(acceptCertificationEvidence(certState, { run_id: "r2", document: { ok: true } }, "r1"), false);
+  assert.equal(acceptCertificationEvidence(certState, { run_id: "r1", environment: "VALIDATION", evidence_ref: "ev", document: { a: 1 } }, "r1"), true);
+  assert.equal(certState.certificationEvidence.run_id, "r1");
+  rejectCertificationEvidence(certState, "r1", "missing_durable_security_evidence");
+  assert.equal(certState.certificationEvidence, null);
+  assert.match(renderCertificationEvidence(null, "missing_durable_security_evidence"), /missing_durable_security_evidence/);
+  const attack = '<img src=x onerror="alert(1)">';
+  assert.doesNotMatch(renderCertificationEvidence({
+    run_id: attack,
+    environment: attack,
+    evidence_ref: attack,
+    document: { note: attack },
+  }), /<img/);
+  const runHtml = renderCertificationRun({ run_id: "r1", state: "PASS", evidence_ref: "ev", has_certificate: true });
+  assert.match(runHtml, /data-cert-evidence="r1"/);
+});
+
+test("certification app wiring uses dedicated state, no fetch, and no mutation retry", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const adminSource = await readFile(new URL("../static/views-admin.js", import.meta.url), "utf8");
+  assert.doesNotMatch(appSource, /fetch\(/);
+  assert.doesNotMatch(adminSource, /fetch\(/);
+  assert.doesNotMatch(appSource, /localStorage|sessionStorage|indexedDB/i);
+  assert.doesNotMatch(adminSource, /localStorage|sessionStorage|indexedDB/i);
+  assert.match(appSource, /certificationBusy/);
+  const actionFn = appSource.slice(
+    appSource.indexOf("async function certificationAction"),
+    appSource.indexOf("async function selectedDetail"),
+  );
+  assert.doesNotMatch(actionFn, /privacyBusy/);
+  assert.equal((actionFn.match(/await work\(\)/g) || []).length, 1);
+  assert.match(appSource, /api\.certificationWorkers\(\)/);
+  assert.match(appSource, /api\.certificationWorker\(workerId\)/);
+  assert.match(appSource, /api\.certificationRun\(runId\)/);
+  assert.match(appSource, /api\.certificationEvidence\(runId\)/);
+  const loadWorker = appSource.slice(
+    appSource.indexOf("async function loadCertificationWorker"),
+    appSource.indexOf("function scheduleCertificationPoll"),
+  );
+  assert.doesNotMatch(loadWorker, /certificationEvidence/);
+  assert.match(appSource, /ready_for_certification !== true/);
 });

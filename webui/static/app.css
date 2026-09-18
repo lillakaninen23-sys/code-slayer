@@ -1457,6 +1457,113 @@ button:disabled {
     border-color: rgba(var(--ice-rgb), 0.12);
 }
 
+.cert-stack .models-layout {
+    margin-top: 16px;
+}
+
+.cert-item {
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    border-radius: 12px;
+    padding: 15px;
+    margin-top: 12px;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+    color: inherit;
+}
+
+.cert-item.selected {
+    border-color: rgba(var(--accent-rgb), 0.55);
+    box-shadow: inset 2px 0 0 rgba(var(--accent-rgb), 0.8);
+}
+
+.cert-panel {
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 12px;
+}
+
+.cert-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.cert-check,
+.cert-history-row,
+.cert-role-row {
+    display: grid;
+    gap: 4px;
+    margin-top: 8px;
+    font-size: 13px;
+}
+
+.cert-history-group {
+    margin-top: 16px;
+}
+
+.badge.cert-ready,
+.badge.cert-pass,
+.badge.cert-certified,
+.badge.cert-eligible {
+    color: #7ee0c3;
+    border-color: rgba(126, 224, 195, 0.38);
+    background: rgba(126, 224, 195, 0.08);
+}
+
+.badge.cert-queued,
+.badge.cert-running,
+.badge.cert-validation {
+    color: #9ad7ff;
+    border-color: rgba(154, 215, 255, 0.35);
+    background: rgba(154, 215, 255, 0.08);
+}
+
+.badge.cert-incomplete,
+.badge.cert-not-certified,
+.badge.cert-unknown,
+.badge.cert-runtime-unknown {
+    color: var(--muted);
+    border-color: rgba(var(--ice-rgb), 0.12);
+}
+
+.badge.cert-fail,
+.badge.cert-failed,
+.badge.cert-hard,
+.badge.cert-blocked {
+    color: #ff8aa0;
+    border-color: rgba(255, 138, 160, 0.4);
+    background: rgba(255, 138, 160, 0.08);
+}
+
+.badge.cert-runtime-verified {
+    color: #b7f0a8;
+    border-color: rgba(183, 240, 168, 0.38);
+    background: rgba(183, 240, 168, 0.08);
+}
+
+.badge.cert-runtime-mismatch {
+    color: #ffb36b;
+    border-color: rgba(255, 179, 107, 0.4);
+    background: rgba(255, 179, 107, 0.08);
+}
+
+.badge.cert-runtime-unreachable {
+    color: #ff8aa0;
+    border-color: rgba(255, 138, 160, 0.4);
+    background: rgba(255, 138, 160, 0.08);
+}
+
+.badge.cert-production {
+    color: #c9b6ff;
+    border-color: rgba(201, 182, 255, 0.35);
+    background: rgba(201, 182, 255, 0.08);
+}
+
 @media (max-width: 700px) {
     .runtime-field {
         grid-template-columns: 1fr;
