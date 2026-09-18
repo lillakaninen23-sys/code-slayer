@@ -31,13 +31,26 @@ future target** unless listed as implemented above. Nothing here
 deprecates the existing `codeslayer` Python entry point. `./cslr`
 is a checkout wrapper around the same CLI.
 
-Implemented in the service-web-admin-v1 slice:
+Implemented in the service-web-admin-v1 baseline plus the reconciled
+Engineering Control Room frontend:
 
 - `./cslr install-service` — managed venv, user systemd unit,
   enable+start, persistent XDG config, loopback bind 127.0.0.1:8765
 - `./cslr status|start|stop|restart`
-- WebUI System / Runtime / Tailscale administration
+- one Control Room with Dashboard, Projects, Tasks, Models, Intelligence,
+  Planning, Privacy & Security, Audit, and Settings navigation
+- Runtime configuration and explicit live attestation under Models
+- Certification Center v1 under Privacy & Security
+- System/deployment and Tailscale Serve administration under Settings
 - fail-closed `Check for update` / optional fast-forward apply
+- read-only Dashboard control-plane summaries for deployment, runtime
+  configuration, certification projection, and remote access
+
+Dashboard summaries are deliberately observation-only. They use separate GET
+snapshots and do not live-attest a model, approve identity, start/preflight
+certification, restart/apply an update, or mutate Tailscale. Runtime,
+certification, deployment, and remote-access authority remain in their
+dedicated backend projections and explicit controls.
 
 Still specification-only: doctor, storage, LAN discovery, model
 catalog download, backup/restore, and the rest of §1.

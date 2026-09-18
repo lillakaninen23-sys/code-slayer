@@ -29,6 +29,13 @@ From this checkout, first-time install:
 ```
 
 systemd --user starts CSLR on boot and binds `http://127.0.0.1:8765`.
+The current Engineering Control Room preserves the existing Projects, Tasks,
+Models, Intelligence, Planning, Privacy & Security, Audit, and Settings views.
+Runtime configuration lives under Models; Certification Center lives under
+Privacy & Security; System/deployment and Tailscale Serve live under Settings.
+The Dashboard adds read-only summaries from the same backend GET projections
+without live-attesting runtime, starting certification, or mutating admin state.
+
 Ordinary administration (Ollama origins, runtime identity, Certification
 Center, Tailscale Serve, updates) is in the WebUI. The terminal is for
 install and emergency `./cslr status|start|stop|restart` only. Persistent

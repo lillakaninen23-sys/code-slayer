@@ -211,6 +211,54 @@ Normal Certification Center startup reads workers/runtime identity from
 persistent config. `CODESLAYER_CERT_*` and `--runtime-factory` are emergency
 wiring, not the ordinary path.
 
+### Current Engineering Control Room frontend
+
+The reconciled frontend is a single Control Room, not a separate admin SPA.
+Its top-level navigation is Dashboard, Projects, Tasks, Models, Intelligence,
+Planning, Privacy & Security, Audit, and Settings.
+
+Administration is intentionally placed inside that existing information
+architecture:
+
+- **Models** keeps the worker/model registry and adds Runtime configuration,
+  explicit live attestation, Ollama server testing, worker registration, and
+  identity approval.
+- **Privacy & Security** keeps permission request/grant UX and adds
+  Certification Center v1. Baseline Security runs and validation certificates
+  remain distinct from production role certificates and Planner eligibility.
+- **Settings** contains System & deployment plus Remote access — Tailscale
+  Serve. Process-start source and current checkout state are displayed
+  separately; the browser displays the backend `deployment_status` /
+  `deployment_complete` verdict rather than deriving one.
+- **Dashboard** contains read-only control-plane summaries from
+  `GET /api/system`, `GET /api/runtime`, `GET /api/certification/workers`, and
+  `GET /api/tailscale`. These use a separate frontend snapshot namespace so
+  Dashboard polling cannot replace Runtime live-attestation evidence,
+  Certification Center selection/run state, or Settings mutation state.
+
+Dashboard summary GETs are partial-failure tolerant: one failed projection is
+shown as unavailable without reusing its previous value as current evidence.
+Request-generation guards prevent older responses from overwriting a newer
+summary or a disconnect invalidation. Dashboard performs no admin mutation,
+live runtime probe, certification action, identity approval, update/restart, or
+Tailscale reconciliation.
+
+Frontend authority rules:
+
+- `GET /api/runtime` is configuration-bound and never becomes
+  `LIVE_ATTESTED` merely because Dashboard/Models loaded it.
+- certification status/eligibility labels are rendered from backend
+  projections; the browser does not infer a certificate or Planner
+  eligibility from checks/history.
+- update-apply and restart responses are operation responses, not current
+  deployment proof. Current deployment comes from a later `GET /api/system`.
+  A lost restart/apply response is `UNKNOWN` from the browser's perspective
+  until current state is refreshed; the mutation is not automatically retried.
+- Tailscale intent, live Serve state, accepted Host, and `remote_access` are
+  separate evidence. `remote_access=VERIFIED` is only the backend's
+  network/Serve/Host-path verdict, not proof that a particular browser Origin
+  request succeeded.
+
 ### System / runtime administration
 
 The browser is a control surface over fixed server-owned operations. It
@@ -320,13 +368,55 @@ absent. Missing execution state is explicitly surfaced.
 
 ## Validation
 
+Frontend/admin reconciliation is accepted from current source plus explicit
+evidence. A model/assistant self-report is not a test result, and pre-existing
+repository failures are not silently relabelled as reconciliation regressions.
+
+Focused reconciliation gates:
+
 ```bash
-python3 -m pytest -q
-.venv/bin/ruff check .
+BASE="/mnt/AI/cslr-pytest-webui-$(date +%Y%m%d-%H%M%S)-$$"
+
+env -u PYTHONPATH .venv/bin/python -m pytest   tests/unit/test_service_admin.py   tests/unit/test_certification_center.py   tests/unit/test_runtime_identity_separation.py   -q --basetemp="$BASE"
+
+env -u PYTHONPATH .venv/bin/ruff check .
 git diff --check
-# In the sidecar:
+
+cd webui
 npm test
 ```
+
+A full `pytest -q` run is still required as a diagnostic before merge/deploy.
+If the repository baseline is not green, classify every failure against the
+pre-reconciliation baseline and block on any **new** failure in the changed
+surface. Do not claim the full suite passed when it did not.
+
+`mypy .` is currently a diagnostic, not a reconciliation acceptance gate,
+until the repository-wide type-check baseline itself is clean. New type errors
+in changed code still block their owning change; unrelated pre-existing type
+errors do not become evidence that a documentation/frontend-only change
+regressed runtime behavior.
+
+Before merge/deploy, run a browser smoke against the actual served checkout.
+At minimum verify all nine navigation views load, then:
+
+1. Dashboard renders the four read-only summaries and exposes no admin action.
+2. Models GET-load does not live-attest; explicit attestation/test/approval
+   controls remain explicit.
+3. Privacy & Security still renders permission UX and Certification Center;
+   changing worker selection cannot bind an old run/evidence response.
+4. Settings distinguishes process vs checkout deployment evidence; update
+   check is explicit; apply/restart require inline confirmation; a lost
+   response is not presented as success and is not retried.
+5. Tailscale intent, Serve status, Host acceptance, and `remote_access` remain
+   distinct; no arbitrary topology/public-ingress control is exposed.
+6. Disconnect/reconnect invalidates current admin/Dashboard evidence rather
+   than continuing to display it as current.
+7. No browser console error, failed same-origin asset load, or unexpected API
+   mutation occurs while merely navigating/read-loading views.
+
+Only after that browser smoke should the reconciliation branch be considered
+ready for merge/deployment review.
 
 Tests use temporary Git repositories/control databases and deterministic fake worker
 responses. They execute the real runner, gate, human-resolution recording, trust,

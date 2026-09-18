@@ -213,12 +213,24 @@ possible model promotion
 
 ## WebUI
 
-**Status: not started.**
+**Status: IN PROGRESS — current Engineering Control Room foundation implemented; broader future WebUI remains open.**
 
-The local control room described in the vision's [Future WebUI](CODE_SLAYER_VISION.md#5-future-webui) section — Projects, Tasks, Workers, Models, Diff, Tests, Checkpoints, Audit, and more, all reading and driving the *same* backend APIs as the CLI.
+The current single Control Room has Dashboard, Projects, Tasks, Models,
+Intelligence, Planning, Privacy & Security, Audit, and Settings views, all
+reading/driving the same backend API rather than a second admin authority.
+Implemented administration includes Runtime configuration/attestation,
+Certification Center v1, System/deployment, Tailscale Serve, update
+check/apply, and read-only Dashboard control-plane summaries.
+
+This does **not** mean the whole Future WebUI vision is complete. Dedicated
+Diff, Tests, Checkpoints and later capability-specific surfaces remain future
+work unless another accepted slice implements them. The Dashboard summaries
+also grant no new authority: they are GET-only projections and do not infer
+runtime attestation, certificates, Planner eligibility, deployment success, or
+remote browser-origin success.
 
 **Depends on:** Core Agent, at minimum, for there to be state worth showing; it grows incrementally alongside every stage above and below this line rather than being "finished" at any point.
-**Delivers:** visibility and control that doesn't require reading raw audit rows or `codeslayer` CLI output to understand what's happening.
+**Delivers:** current visibility/control for the implemented backend surfaces without requiring raw audit rows or routine administration through the `codeslayer` CLI; future views continue to grow with later stages.
 
 ---
 
