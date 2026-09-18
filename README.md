@@ -20,6 +20,23 @@ Existing package/service names (`codeslayer`, `code_slayer`) are unchanged
 by the CSLR brand — see [`AGENTS.md`](AGENTS.md) for the rules every future
 change to this project must follow.
 
+## Local service
+
+From this checkout, first-time install:
+
+```bash
+./cslr install-service
+```
+
+systemd --user starts CSLR on boot and binds `http://127.0.0.1:8765`.
+Ordinary administration (Ollama origins, runtime identity, Certification
+Center, Tailscale Serve, updates) is in the WebUI. The terminal is for
+install and emergency `./cslr status|start|stop|restart` only. Persistent
+config is `~/.config/codeslayer/config.toml`, not this repository.
+Remote access is optional Tailscale Serve of localhost — never a
+`0.0.0.0` bind. See [`docs/WEBUI_API.md`](docs/WEBUI_API.md) and
+[`docs/OPERATIONS_UX.md`](docs/OPERATIONS_UX.md).
+
 ## Status: Phase 7 / Local Worker Runtime — VERIFIED / ACCEPTED
 
 Phase 1 implements *only* the foundation a later agent loop will stand on:

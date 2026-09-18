@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Operator entrypoint for this CSLR checkout.
+# Prefers the managed venv created by `install-service`; otherwise runs
+# this checkout in-place. Does not require the caller to export
+# PYTHONPATH or CODESLAYER_CERT_*.
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+managed_python() {
+  if [ -n "${CODESLAYER_STATE_ROOT:-}" ] \
+      && [ -x "${CODESLAYER_STATE_ROOT}/service/venv/bin/python" ]; then
+    printf '%s\n' "${CODESLAYER_STATE_ROOT}/service/venv/bin/python"
+    return 0
+  fi
+  local data="${XDG_DATA_HOME:-${HOME}/.local/share}"
+  if [ -x "${data}/codeslayer/service/venv/bin/python" ]; then
+    printf '%s\n' "${data}/codeslayer/service/venv/bin/python"
+    return 0
+  fi
+  return 1
+}
+
+if PY="$(managed_python)"; then
+  exec "$PY" -m code_slayer.cli.main "$@"
+fi
+
+export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 -m code_slayer.cli.main "$@"
+fi
+echo "cslr: python3 is required for first-time install" >&2
+exit 1

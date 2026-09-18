@@ -32,12 +32,14 @@ class CertificationJobExecutor:
         targets: tuple[BaselineCertificationTarget, ...] = (),
         role_targets: tuple[RoleEvaluationTarget, ...] = (),
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        bindings_factory=None,
     ) -> None:
         self._repo_id = repo_id
         self._worktree_id = worktree_id
         self._state_root = state_root
         self._targets = targets
         self._role_targets = role_targets
+        self._bindings_factory = bindings_factory
         self._poll_interval = poll_interval_seconds
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="certification-job")
         self._wakeup = threading.Event()
@@ -47,12 +49,18 @@ class CertificationJobExecutor:
         self._dispatcher_thread: threading.Thread | None = None
 
     def _service(self) -> CertificationService:
+        targets = self._targets
+        role_targets = self._role_targets
+        if self._bindings_factory is not None:
+            bindings = self._bindings_factory()
+            targets = bindings.baseline_certification_targets
+            role_targets = bindings.role_evaluation_targets
         return CertificationService(
             self._repo_id,
             self._worktree_id,
             state_root=self._state_root,
-            targets=self._targets,
-            role_targets=self._role_targets,
+            targets=targets,
+            role_targets=role_targets,
         )
 
     def start(self) -> None:

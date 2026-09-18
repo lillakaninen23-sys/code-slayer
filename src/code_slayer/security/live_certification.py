@@ -202,6 +202,11 @@ def _deny(
     )
 
 
+def canonical_model_digest(value: str) -> str:
+    """Normalize a model digest for comparison. Not an identity itself."""
+    return _canonical_digest(value)
+
+
 def _canonical_digest(value: str) -> str:
     text = value.strip().lower()
     if text.startswith("sha256:"):
@@ -249,13 +254,13 @@ def _strict_json_object(raw: bytes) -> dict:
     return parsed
 
 
-def _probe_get(url: str, expectation: LiveOllamaRuntimeExpectation) -> dict:
+def _probe_get(url: str, limits) -> dict:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     request = urllib.request.Request(url, method="GET")
     try:
-        with opener.open(request, timeout=expectation.timeout) as response:
+        with opener.open(request, timeout=limits.timeout) as response:
             status = response.status
-            raw = response.read(expectation.probe_max_response_bytes + 1)
+            raw = response.read(limits.probe_max_response_bytes + 1)
     except urllib.error.HTTPError as exc:
         if 300 <= exc.code < 400:
             raise ValueError("runtime_probe_redirect") from exc
@@ -268,9 +273,72 @@ def _probe_get(url: str, expectation: LiveOllamaRuntimeExpectation) -> dict:
         raise ValueError("runtime_probe_unavailable") from exc
     if status != 200:
         raise ValueError("runtime_probe_unavailable")
-    if len(raw) > expectation.probe_max_response_bytes:
+    if len(raw) > limits.probe_max_response_bytes:
         raise ValueError("runtime_probe_response_too_large")
     return _strict_json_object(raw)
+
+
+@dataclass(frozen=True)
+class OllamaModelInfo:
+    """One live-attested Ollama tag entry. Digest is as returned by
+    `/api/tags`; callers compare with `_canonical_digest`."""
+
+    name: str
+    digest: str
+
+
+@dataclass(frozen=True)
+class OllamaInventory:
+    """Live inventory of one origin. Not an approved runtime identity."""
+
+    origin: str
+    runtime_version: str
+    models: tuple[OllamaModelInfo, ...]
+
+
+def probe_ollama_inventory(
+    origin: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    probe_max_response_bytes: int = _DEFAULT_PROBE_MAX_RESPONSE_BYTES,
+) -> OllamaInventory:
+    """GET `/api/version` and `/api/tags` at an origin-only Ollama URL.
+
+    Does not infer, does not approve a digest, and does not construct a
+    RuntimeProfileIdentity. Used by operator discovery before an identity
+    is approved.
+    """
+    _validate_ollama_origin(origin)
+    root = origin.strip().rstrip("/")
+    limits = _ProbeLimits(
+        timeout=timeout, probe_max_response_bytes=probe_max_response_bytes,
+    )
+    version_doc = _probe_get(f"{root}/api/version", limits)
+    version = version_doc.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("runtime_probe_malformed_json")
+    tags_doc = _probe_get(f"{root}/api/tags", limits)
+    models_raw = tags_doc.get("models")
+    if not isinstance(models_raw, list):
+        raise ValueError("runtime_probe_malformed_json")
+    models: list[OllamaModelInfo] = []
+    for item in models_raw:
+        if not isinstance(item, dict):
+            raise ValueError("runtime_probe_malformed_json")
+        name = item.get("name")
+        digest = item.get("digest")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("runtime_probe_malformed_json")
+        if not isinstance(digest, str) or not digest.strip():
+            raise ValueError("runtime_probe_malformed_json")
+        models.append(OllamaModelInfo(name=name, digest=digest))
+    return OllamaInventory(origin=root, runtime_version=version, models=tuple(models))
+
+
+@dataclass(frozen=True)
+class _ProbeLimits:
+    timeout: float
+    probe_max_response_bytes: int
 
 
 def verify_ollama_runtime(

@@ -32,6 +32,17 @@ def isolated_state_root(tmp_path, monkeypatch):
     return state_root
 
 
+@pytest.fixture(autouse=True)
+def isolated_config_home(tmp_path, monkeypatch):
+    """Force config/systemd paths into the test tmp dir. No test may write
+    `~/.config/codeslayer` or a real user systemd unit."""
+    xdg = tmp_path / "_xdg_config"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("CODESLAYER_CONFIG", raising=False)
+    return xdg
+
+
 def _run_git(args: list[str], cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 

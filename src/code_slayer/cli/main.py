@@ -1,10 +1,12 @@
-"""Code Slayer CLI: repository identity inspection and local application API.
+"""Code Slayer CLI: inspect, serve, and local service administration.
 
-Identity is established through the existing backend when needed. The HTTP
-server is explicitly launched; no background service is installed.
+Ordinary administration happens in the WebUI after `install-service`.
+These commands exist for first-time install and emergency recovery.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import click
 
@@ -38,11 +40,94 @@ def inspect(path: str) -> None:
     click.echo(f"git_dir:         {info.git_dir}")
 
 
+def _echo_process_error(exc) -> None:
+    raise click.ClickException(f"{exc.code}: {exc}") from exc
+
+
+@cli.command("install-service")
+@click.option(
+    "--checkout",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=str),
+    help="CSLR checkout to install (default: this source tree).",
+)
+def install_service_cmd(checkout: str | None) -> None:
+    """Create the managed venv, write the user systemd unit, enable and start.
+
+    Does not require exported CODESLAYER_CERT_* variables. Existing
+    state.db, evidence, and certificates are left in place.
+    """
+    from code_slayer.admin.process import ProcessError
+    from code_slayer.admin.service import default_checkout, install_service
+
+    root = Path(checkout).resolve() if checkout else default_checkout()
+    try:
+        result = install_service(checkout=root)
+    except ProcessError as exc:
+        _echo_process_error(exc)
+    click.echo("installed")
+    for key in ("checkout", "venv", "config_path", "unit_path", "version"):
+        click.echo(f"{key}: {result[key]}")
+    click.echo("local_url: http://127.0.0.1:8765")
+    click.echo("Ordinary administration is in the WebUI. Terminal is for recovery.")
+
+
+@cli.command("status")
+def status_cmd() -> None:
+    """Print systemd --user codeslayer.service status."""
+    from code_slayer.admin.service import service_status
+
+    info = service_status()
+    click.echo(f"unit:    {info.unit}")
+    click.echo(f"state:   {info.state}")
+    click.echo(f"running: {info.active}")
+    click.echo(f"source:  {info.source}")
+
+
+@cli.command("start")
+def start_cmd() -> None:
+    """Start codeslayer.service (systemd --user)."""
+    from code_slayer.admin.process import ProcessError
+    from code_slayer.admin.service import start_service
+
+    try:
+        start_service()
+    except ProcessError as exc:
+        _echo_process_error(exc)
+    click.echo("started")
+
+
+@cli.command("stop")
+def stop_cmd() -> None:
+    """Stop codeslayer.service (systemd --user)."""
+    from code_slayer.admin.process import ProcessError
+    from code_slayer.admin.service import stop_service
+
+    try:
+        stop_service()
+    except ProcessError as exc:
+        _echo_process_error(exc)
+    click.echo("stopped")
+
+
+@cli.command("restart")
+def restart_cmd() -> None:
+    """Restart codeslayer.service (systemd --user)."""
+    from code_slayer.admin.process import ProcessError
+    from code_slayer.admin.service import restart_service
+
+    try:
+        restart_service()
+    except ProcessError as exc:
+        _echo_process_error(exc)
+    click.echo("restarted")
+
+
 @cli.command()
 @click.option("--repo", default=".", type=click.Path(exists=True, file_okay=False))
 @click.option("--webui-dir", type=click.Path(exists=True, file_okay=False))
-@click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", default=8765, type=click.IntRange(1, 65535), show_default=True)
+@click.option("--host", default=None)
+@click.option("--port", default=None, type=click.IntRange(1, 65535))
 @click.option(
     "--trusted-host", multiple=True, help="Explicit additional HTTP Host allowlist entry."
 )
@@ -50,14 +135,35 @@ def inspect(path: str) -> None:
     "--runtime-factory", help="Trusted installed module:function returning RuntimeBindings."
 )
 def serve(repo, webui_dir, host, port, trusted_host, runtime_factory):
-    """Serve the local application API and optionally the existing WebUI sidecar."""
+    """Serve the local application API and the WebUI sidecar.
+
+    Persistent config (XDG `~/.config/codeslayer/config.toml`) is the
+    normal source of workers, Ollama origins, and bind address. A
+    runtime-factory is optional emergency wiring, not required for
+    Certification Center or runtime identity.
+    """
     from importlib import import_module
 
     from waitress import serve as wsgi_serve
 
     from code_slayer.api import create_app
     from code_slayer.api.service import RuntimeBindings
+    from code_slayer.config.schema import LOOPBACK_HOSTS
+    from code_slayer.config.store import load_config
 
+    cfg = load_config()
+    checkout = Path(repo).resolve()
+    if repo == "." and cfg.server.checkout:
+        checkout = Path(cfg.server.checkout)
+    bind_host = host or cfg.server.host
+    bind_port = port if port is not None else cfg.server.port
+    if bind_host not in LOOPBACK_HOSTS:
+        raise click.ClickException("server host must be a loopback address")
+    resolved_webui = webui_dir or cfg.server.webui_dir
+    if resolved_webui is None:
+        candidate = checkout / "webui"
+        if (candidate / "index.html").is_file() and (candidate / "static").is_dir():
+            resolved_webui = str(candidate)
     bindings = None
     if runtime_factory:
         module, separator, name = runtime_factory.partition(":")
@@ -67,13 +173,14 @@ def serve(repo, webui_dir, host, port, trusted_host, runtime_factory):
         if not isinstance(bindings, RuntimeBindings):
             raise click.ClickException("runtime-factory must return RuntimeBindings")
     app = create_app(
-        repo,
-        webui_dir=webui_dir,
+        checkout,
+        webui_dir=resolved_webui,
         bindings=bindings,
         trusted_hosts=("127.0.0.1", "localhost", "[::1]", *trusted_host),
+        load_persistent_config=True,
     )
-    click.echo(f"Code Slayer API: http://{host}:{port}")
-    wsgi_serve(app, host=host, port=port, threads=4, max_request_body_size=65536)
+    click.echo(f"Code Slayer API: http://{bind_host}:{bind_port}")
+    wsgi_serve(app, host=bind_host, port=bind_port, threads=4, max_request_body_size=65536)
 
 
 @cli.command("permission-request-demo")

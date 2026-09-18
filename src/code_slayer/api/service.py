@@ -4,9 +4,10 @@ Factories are trusted host configuration, never HTTP inputs. Each request owns
 its connections and adapters; no SQLite connection crosses a server thread.
 """
 
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from code_slayer.api.reads import ReadModels
@@ -85,10 +86,18 @@ class RuntimeBindings:
 
 
 class ApplicationService:
-    def __init__(self, repo_path, *, state_root=None, bindings=None):
+    def __init__(
+        self, repo_path, *, state_root=None, bindings=None,
+        config_path=None, load_persistent_config=False,
+    ):
         self.repo_path = Path(repo_path).resolve()
         self.state_root = state_root
-        self.bindings = bindings or RuntimeBindings()
+        self._config_path = config_path
+        self._load_persistent_config = load_persistent_config
+        self._explicit_bindings = bindings or RuntimeBindings()
+        self._started_at = time.monotonic()
+        self._started_wall = time.time()
+        self.bindings = self._compose_bindings()
         # Initialize through the real application service, including existing
         # migrations, and idempotently register every runtime-declared
         # worker (never a trust/qualification grant — see
@@ -133,8 +142,50 @@ class ApplicationService:
             targets=self.bindings.baseline_certification_targets,
             role_targets=self.bindings.role_evaluation_targets,
             poll_interval_seconds=self.bindings.certification_poll_interval_seconds,
+            bindings_factory=(
+                self._compose_bindings if self._load_persistent_config else None
+            ),
         )
         self._certification_executor.start()
+
+    def _compose_bindings(self) -> RuntimeBindings:
+        explicit = self._explicit_bindings
+        if not self._load_persistent_config:
+            return explicit
+        from code_slayer.config.bindings import runtime_bindings_from_config
+        from code_slayer.config.store import load_config
+
+        from_cfg = runtime_bindings_from_config(load_config(path=self._config_path))
+        return replace(
+            from_cfg,
+            analyst_factory=explicit.analyst_factory,
+            adapter_factory=explicit.adapter_factory,
+            planner_factory=explicit.planner_factory,
+            planning_max_workers=explicit.planning_max_workers,
+            planning_poll_interval_seconds=explicit.planning_poll_interval_seconds,
+            lifecycle_poll_interval_seconds=explicit.lifecycle_poll_interval_seconds,
+            certification_poll_interval_seconds=explicit.certification_poll_interval_seconds,
+        )
+
+    def refresh_persistent_workers(self) -> None:
+        self.bindings = self._compose_bindings()
+        with self.runner() as runner:
+            for registration in self.bindings.worker_registrations:
+                runner.register_worker(
+                    worker_id=registration.worker_id, kind=registration.kind,
+                    network_class=registration.network_class,
+                )
+
+    def persistent_config(self):
+        from code_slayer.config.store import load_config
+
+        return load_config(path=self._config_path)
+
+    def save_persistent_config(self, config) -> None:
+        from code_slayer.config.store import save_config
+
+        save_config(config, path=self._config_path)
+        self.refresh_persistent_workers()
 
     def close(self) -> None:
         """Stop this instance's background dispatchers, if started.
@@ -425,12 +476,13 @@ class ApplicationService:
 
     @contextmanager
     def certification(self):
+        bindings = self._compose_bindings()
         service = CertificationService(
             self.identity.repo_id,
             self.identity.worktree_id,
             state_root=self.state_root,
-            targets=self.bindings.baseline_certification_targets,
-            role_targets=self.bindings.role_evaluation_targets,
+            targets=bindings.baseline_certification_targets,
+            role_targets=bindings.role_evaluation_targets,
         )
         try:
             yield service
@@ -506,3 +558,8 @@ class ApplicationService:
             except KeyError:
                 raise APIError("not_found", "Worker is not registered.", 404) from None
             return service.history(worker_id)
+
+    def admin(self):
+        from code_slayer.api.admin import AdminFacade
+
+        return AdminFacade(self)

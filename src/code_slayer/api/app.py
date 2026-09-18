@@ -20,6 +20,8 @@ def create_app(
     webui_dir=None,
     bindings=None,
     trusted_hosts=("127.0.0.1", "localhost", "[::1]"),
+    config_path=None,
+    load_persistent_config=False,
 ):
     app = Flask(__name__, static_folder=None)
     app.config.update(MAX_CONTENT_LENGTH=65536, TRUSTED_HOSTS=list(trusted_hosts))
@@ -27,6 +29,8 @@ def create_app(
         repo_path,
         state_root=state_root,
         bindings=bindings,
+        config_path=config_path,
+        load_persistent_config=load_persistent_config,
     )
     app.register_blueprint(api)
 

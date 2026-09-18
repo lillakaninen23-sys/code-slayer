@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Code Slayer — Certification</title>
+  <title>Code Slayer</title>
   <link rel="stylesheet" href="/static/app.css">
   <link rel="manifest" href="/manifest.json">
 </head>
@@ -11,9 +11,12 @@
   <header class="top">
     <div class="brand">Code Slayer</div>
     <nav>
-      <a href="#/certification" class="active">Certification</a>
+      <a href="#/system" data-nav="system">System</a>
+      <a href="#/runtime" data-nav="runtime">Runtime</a>
+      <a href="#/certification" data-nav="certification">Certification</a>
+      <a href="#/tailscale" data-nav="tailscale">Tailscale</a>
     </nav>
-    <span class="badge env" id="env-badge">VALIDATION</span>
+    <span class="badge env" id="env-badge">LOCAL</span>
   </header>
   <main id="app">Loading…</main>
   <script src="/static/app.js"></script>

@@ -38,7 +38,11 @@ function statusKind(status) {
     status === "CERTIFIED" ||
     status === "ELIGIBLE" ||
     status === "PASS" ||
-    status === "VERIFIED"
+    status === "VERIFIED" ||
+    status === "running" ||
+    status === "Connected" ||
+    status === "LIVE_ATTESTED" ||
+    status === "ok"
   ) return "ok";
   if (
     status === "FAILED" ||
@@ -46,22 +50,34 @@ function statusKind(status) {
     status === "HARD_DISQUALIFIED" ||
     status === "MISMATCH" ||
     status === "UNREACHABLE" ||
-    status === "ERROR"
+    status === "ERROR" ||
+    status === "failed" ||
+    status === "inactive"
   ) return "bad";
-  if (status === "READY" || status === "RUNNING" || status === "QUEUED") return "warn";
+  if (status === "READY" || status === "RUNNING" || status === "QUEUED" || status === "OBSERVED") return "warn";
   return "muted";
 }
 
+function setNav(name) {
+  document.querySelectorAll("nav a").forEach((link) => {
+    link.classList.toggle("active", link.getAttribute("data-nav") === name);
+  });
+}
+
 function route() {
-  const hash = location.hash.replace(/^#/, "") || "/certification";
+  const hash = location.hash.replace(/^#/, "") || "/system";
   const parts = hash.split("/").filter(Boolean);
-  if (parts[0] !== "certification") {
-    app.innerHTML = `<div class="card"><p>Certification Center is the active v1 surface.</p><p><a href="#/certification">Open Certification</a></p></div>`;
-    return;
+  const section = parts[0] || "system";
+  setNav(section);
+  if (section === "system") return renderSystem();
+  if (section === "runtime") return renderRuntime();
+  if (section === "tailscale") return renderTailscale();
+  if (section === "certification") {
+    if (parts[1] === "runs" && parts[2]) return renderRun(parts[2]);
+    if (parts[1] && parts[1] !== "runs") return renderWorker(decodeURIComponent(parts[1]));
+    return renderWorkers();
   }
-  if (parts[1] === "runs" && parts[2]) return renderRun(parts[2]);
-  if (parts[1] && parts[1] !== "runs") return renderWorker(decodeURIComponent(parts[1]));
-  return renderWorkers();
+  app.innerHTML = `<div class="card"><p>Unknown view.</p><p><a href="#/system">Open System</a></p></div>`;
 }
 
 async function renderWorkers() {
@@ -288,6 +304,302 @@ async function renderRun(runId) {
     setTimeout(() => {
       if (location.hash === "#/certification/runs/" + runId) renderRun(runId);
     }, 1000);
+  }
+}
+
+function sourceBadge(item) {
+  const source = item && typeof item === "object" ? item.source : "";
+  const value = item && typeof item === "object" && "value" in item ? item.value : item;
+  return `${value == null || value === "" ? "<span class='muted'>—</span>" : "<code>" + escapeHtml(value) + "</code>"} ${source ? badge(source, statusKind(source)) : ""}`;
+}
+
+async function renderSystem() {
+  app.innerHTML = "<p class='muted'>Loading system…</p>";
+  const data = await api("/api/system");
+  const service = data.service || {};
+  const network = data.network || {};
+  const health = data.health || {};
+  const env = document.getElementById("env-badge");
+  if (env) env.textContent = service.running ? "RUNNING" : (service.state || "LOCAL");
+  app.innerHTML = `
+    <h1>System</h1>
+    <div class="card">
+      <div class="row">
+        ${badge(service.state || "UNVERIFIED", statusKind(service.state))}
+        ${badge(service.running ? "running" : "stopped", service.running ? "ok" : "bad")}
+        ${badge(health.status || "unknown", statusKind(health.status))}
+      </div>
+      <p>Version: <code>${escapeHtml(service.version)}</code></p>
+      <p>Running commit: <code>${escapeHtml(service.running_commit || "")}</code> ${badge(service.running_commit_source || "UNVERIFIED", statusKind(service.running_commit_source))}</p>
+      <p>Uptime: <code>${escapeHtml(service.uptime_seconds)}</code> seconds (${escapeHtml(service.source || "")})</p>
+      <p>Health schema: <code>${escapeHtml(health.schema_version)}</code> ${badge(health.source || "", statusKind(health.source))}</p>
+      <p>Local URL: <a href="${escapeHtml(network.local_url || "")}">${escapeHtml(network.local_url || "")}</a></p>
+      <p class="muted">Bind: <code>${escapeHtml(network.bind_host)}</code>:<code>${escapeHtml(network.bind_port)}</code> — loopback only. Remote access is Tailscale Serve, never 0.0.0.0.</p>
+      <div class="form-actions">
+        <button id="restart">Restart service</button>
+        <button class="secondary" id="update-check">Check for update</button>
+        <button class="secondary" id="update-apply">Apply update</button>
+      </div>
+      <div id="system-result"></div>
+    </div>`;
+  document.getElementById("restart").onclick = async () => {
+    const box = document.getElementById("system-result");
+    box.innerHTML = "<p class='muted'>Restart requested…</p>";
+    try {
+      await api("/api/system/restart", { method: "POST", body: "{}" });
+      box.innerHTML = "<p>Restart requested. Reload this page in a few seconds and confirm the running commit.</p>";
+    } catch (err) {
+      box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+    }
+  };
+  document.getElementById("update-check").onclick = () => runUpdate("check");
+  document.getElementById("update-apply").onclick = () => {
+    if (!confirm("Apply a fast-forward update? Dirty or divergent trees are refused. git merge is not a completed deployment until the service restarts on the new commit.")) return;
+    runUpdate("apply");
+  };
+}
+
+async function runUpdate(kind) {
+  const box = document.getElementById("system-result");
+  box.innerHTML = "<p class='muted'>Working…</p>";
+  try {
+    const path = kind === "apply" ? "/api/system/update/apply" : "/api/system/update/check";
+    const result = await api(path, { method: "POST", body: "{}" });
+    box.innerHTML = `
+      <div class="card">
+        <div class="row">${badge(result.status, statusKind(result.status))} ${badge(result.detail || "", "muted")}</div>
+        <p>Current: <code>${escapeHtml(result.current_commit || "")}</code></p>
+        <p>Origin: <code>${escapeHtml(result.origin_commit || "")}</code></p>
+        <p>Branch: <code>${escapeHtml(result.branch || "")}</code></p>
+        <p>Dirty: <code>${escapeHtml(result.dirty)}</code> Divergent: <code>${escapeHtml(result.divergent)}</code></p>
+        ${result.deployment_note ? `<p class="note">${escapeHtml(result.deployment_note)}</p>` : ""}
+        ${result.restart_error ? `<p class="check bad">Restart: ${escapeHtml(result.restart_error)}</p>` : ""}
+      </div>`;
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function renderRuntime() {
+  app.innerHTML = "<p class='muted'>Loading runtime…</p>";
+  const data = await api("/api/runtime");
+  const servers = (data.ollama_servers || []).map((server) => `
+    <tr>
+      <td><code>${escapeHtml(server.id)}</code></td>
+      <td><code>${escapeHtml(server.origin)}</code></td>
+      <td>${badge(server.origin_source || "CONFIG_BOUND", "muted")}</td>
+      <td><button class="secondary" data-test="${escapeHtml(server.id)}">Test connection</button></td>
+    </tr>`).join("") || "<tr><td colspan='4' class='muted'>No Ollama servers yet.</td></tr>";
+  const workers = (data.workers || []).map((worker) => {
+    const digest = worker.approved_model_digest || {};
+    const version = worker.approved_runtime_version || {};
+    return `<article class="card">
+      <div class="row">
+        <strong>${escapeHtml(worker.worker_id)}</strong>
+        ${badge(worker.identity_approved ? "identity approved" : "identity not approved", worker.identity_approved ? "ok" : "warn")}
+      </div>
+      <p>Model tag: ${sourceBadge(worker.model_tag)}</p>
+      <p>Approved digest: ${sourceBadge(digest)}</p>
+      <p>Approved runtime: ${sourceBadge(version)}</p>
+      <p>Context: ${sourceBadge(worker.effective_context_tokens)} ${worker.effective_context_tokens && worker.effective_context_tokens.measured_by_ollama === false ? "<span class='muted'>not Ollama-measured</span>" : ""}</p>
+      <p>Temperature: ${sourceBadge(worker.temperature)}</p>
+      <p>Normalizer: ${sourceBadge(worker.normalizer_id)} ${sourceBadge(worker.normalizer_version)}</p>
+      <p class="muted">Server: <code>${escapeHtml(worker.ollama_server_id)}</code> · ${escapeHtml(worker.kind)} · ${escapeHtml(worker.network_class)}</p>
+      <div class="form-actions">
+        <button class="secondary" data-approve="${escapeHtml(worker.worker_id)}">${worker.identity_approved ? "Re-attest / approve if unchanged" : "Approve live identity"}</button>
+        <button class="secondary" data-replace="${escapeHtml(worker.worker_id)}">Approve new identity</button>
+      </div>
+    </article>`;
+  }).join("") || "<p class='muted'>No workers registered in persistent config.</p>";
+  app.innerHTML = `
+    <h1>Runtime</h1>
+    <p class="muted">Persistent config is the operator-facing identity store. The browser never sends a digest, fingerprint, outcome, or adapter. Approving a new identity does not transfer old certificates.</p>
+    <div class="card">
+      <h2>Ollama servers</h2>
+      <table><thead><tr><th>Id</th><th>Origin</th><th>Source</th><th></th></tr></thead><tbody>${servers}</tbody></table>
+      <label>Server id</label>
+      <input id="ollama-id" autocomplete="off">
+      <label>Origin (http(s) host:port only)</label>
+      <input id="ollama-origin" placeholder="http://127.0.0.1:11434" autocomplete="off">
+      <div class="form-actions">
+        <button id="add-server">Add and test origin</button>
+        <button class="secondary" id="attest">Attest live runtimes</button>
+      </div>
+      <div id="server-result"></div>
+    </div>
+    <div class="card">
+      <h2>Register worker</h2>
+      <label>Worker id</label>
+      <input id="worker-id" autocomplete="off">
+      <label>Ollama server id</label>
+      <input id="worker-server" autocomplete="off">
+      <label>Model tag</label>
+      <input id="worker-tag" autocomplete="off">
+      <label>Effective context tokens (config-bound, not Ollama-measured)</label>
+      <input id="worker-context" type="number" min="1" value="16384">
+      <label>Temperature</label>
+      <input id="worker-temp" type="number" min="0" max="2" step="0.1" value="0">
+      <label>Normalizer id (optional)</label>
+      <input id="worker-normalizer" placeholder="leave empty unless required" autocomplete="off">
+      <label>Normalizer version (optional)</label>
+      <input id="worker-normalizer-version" type="number" min="1">
+      <p class="note">Do not paste a digest here. Approve live identity after the origin is reachable.</p>
+      <div class="form-actions"><button id="register-worker">Register worker</button></div>
+      <div id="worker-result"></div>
+    </div>
+    <h2>Workers</h2>
+    ${workers}
+    <div id="runtime-result"></div>`;
+  document.querySelectorAll("[data-test]").forEach((button) => {
+    button.onclick = () => testServer(button.getAttribute("data-test"));
+  });
+  document.querySelectorAll("[data-approve]").forEach((button) => {
+    button.onclick = () => approveWorker(button.getAttribute("data-approve"), false);
+  });
+  document.querySelectorAll("[data-replace]").forEach((button) => {
+    button.onclick = () => {
+      if (!confirm("Approve a NEW live identity? Existing certificates stay bound to the old fingerprint and are not transferred.")) return;
+      approveWorker(button.getAttribute("data-replace"), true);
+    };
+  });
+  document.getElementById("add-server").onclick = addServer;
+  document.getElementById("attest").onclick = attestAll;
+  document.getElementById("register-worker").onclick = registerWorker;
+}
+
+async function addServer() {
+  const box = document.getElementById("server-result");
+  const id = document.getElementById("ollama-id").value.trim();
+  const origin = document.getElementById("ollama-origin").value.trim();
+  box.innerHTML = "<p class='muted'>Connecting…</p>";
+  try {
+    await api("/api/runtime/ollama-servers", {
+      method: "POST",
+      body: JSON.stringify({ id, origin }),
+    });
+    route();
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function testServer(serverId) {
+  const box = document.getElementById("server-result");
+  box.innerHTML = "<p class='muted'>Probing…</p>";
+  try {
+    const result = await api("/api/runtime/ollama-servers/" + encodeURIComponent(serverId) + "/test", {
+      method: "POST",
+      body: "{}",
+    });
+    const models = (result.models || []).map((item) =>
+      `<tr><td><code>${escapeHtml(item.name)}</code></td><td><code>${escapeHtml(item.digest)}</code></td><td>${badge("LIVE_ATTESTED", "ok")}</td></tr>`
+    ).join("") || "<tr><td colspan='3' class='muted'>No models reported.</td></tr>";
+    box.innerHTML = `
+      <p>Runtime ${badge(result.status, statusKind(result.status))} version <code>${escapeHtml(result.runtime_version)}</code></p>
+      <p class="note">Digests below are live observations. They are not approved until you use Approve live identity. This page never posts a digest.</p>
+      <table><thead><tr><th>Tag</th><th>Digest (observed)</th><th></th></tr></thead><tbody>${models}</tbody></table>`;
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function attestAll() {
+  const box = document.getElementById("runtime-result");
+  box.innerHTML = "<p class='muted'>Attesting…</p>";
+  try {
+    const data = await api("/api/runtime/attest", { method: "POST", body: "{}" });
+    const rows = (data.workers || []).map((worker) => {
+      const att = worker.attestation || {};
+      return `<tr>
+        <td><code>${escapeHtml(worker.worker_id)}</code></td>
+        <td>${badge(att.status || "UNVERIFIED", statusKind(att.status))}</td>
+        <td class="muted">${escapeHtml(att.reason || "")}</td>
+        <td><code>${escapeHtml(att.observed_digest || "")}</code></td>
+      </tr>`;
+    }).join("");
+    box.innerHTML = `<div class="card"><h2>Live attestation</h2><table><tbody>${rows}</tbody></table></div>`;
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function registerWorker() {
+  const box = document.getElementById("worker-result");
+  const payload = {
+    worker_id: document.getElementById("worker-id").value.trim(),
+    ollama_server_id: document.getElementById("worker-server").value.trim(),
+    model_tag: document.getElementById("worker-tag").value.trim(),
+  };
+  const context = document.getElementById("worker-context").value;
+  const temp = document.getElementById("worker-temp").value;
+  const normalizer = document.getElementById("worker-normalizer").value.trim();
+  const normalizerVersion = document.getElementById("worker-normalizer-version").value;
+  if (context) payload.effective_context_tokens = Number(context);
+  if (temp !== "") payload.temperature = Number(temp);
+  if (normalizer) payload.normalizer_id = normalizer;
+  if (normalizerVersion) payload.normalizer_version = Number(normalizerVersion);
+  box.innerHTML = "<p class='muted'>Saving…</p>";
+  try {
+    await api("/api/runtime/workers", { method: "POST", body: JSON.stringify(payload) });
+    route();
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function approveWorker(workerId, replace) {
+  const box = document.getElementById("runtime-result");
+  box.innerHTML = "<p class='muted'>Approving from live attestation…</p>";
+  const path = replace
+    ? "/api/runtime/workers/" + encodeURIComponent(workerId) + "/approve-new-identity"
+    : "/api/runtime/workers/" + encodeURIComponent(workerId) + "/approve";
+  try {
+    const result = await api(path, { method: "POST", body: "{}" });
+    box.innerHTML = `
+      <div class="card">
+        ${badge(result.status, statusKind(result.status))}
+        <p>Reason: <code>${escapeHtml(result.reason || "")}</code></p>
+        <p>Configured digest: <code>${escapeHtml(result.configured_digest || "")}</code></p>
+        <p>Observed digest: <code>${escapeHtml(result.observed_digest || "")}</code></p>
+        <p>Certificates transferred: <code>${escapeHtml(result.certificates_transferred)}</code></p>
+      </div>`;
+    if (result.status === "VERIFIED") route();
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function renderTailscale() {
+  app.innerHTML = "<p class='muted'>Loading Tailscale…</p>";
+  const data = await api("/api/tailscale");
+  app.innerHTML = `
+    <h1>Tailscale</h1>
+    <div class="card">
+      <div class="row">${badge(data.state || "UNVERIFIED", statusKind(data.state))} ${badge(data.source || "", "muted")}</div>
+      <p>Serve backend: <code>${escapeHtml(data.backend)}</code></p>
+      <p>URL: ${data.url ? `<a href="${escapeHtml(data.url)}">${escapeHtml(data.url)}</a>` : "<span class='muted'>none</span>"}</p>
+      <p class="muted">${escapeHtml(data.detail || "")}. Funnel is never used. Serve is tailnet-only of the loopback WebUI.</p>
+      <div class="form-actions">
+        <button id="ts-enable">Enable Serve</button>
+        <button class="secondary" id="ts-disable">Disable Serve</button>
+      </div>
+      <div id="ts-result"></div>
+    </div>`;
+  document.getElementById("ts-enable").onclick = () => setTailscale(true);
+  document.getElementById("ts-disable").onclick = () => setTailscale(false);
+}
+
+async function setTailscale(enabled) {
+  const box = document.getElementById("ts-result");
+  box.innerHTML = "<p class='muted'>Working…</p>";
+  try {
+    await api(enabled ? "/api/tailscale/enable" : "/api/tailscale/disable", {
+      method: "POST",
+      body: "{}",
+    });
+    route();
+  } catch (err) {
+    box.innerHTML = `<p class="check bad">${escapeHtml(err.message)}</p>`;
   }
 }
 

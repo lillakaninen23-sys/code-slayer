@@ -9,26 +9,40 @@ are separate modules under `src/code_slayer/api/`.
 
 ## Run locally
 
-Inside the backend checkout, with its virtual environment active:
+After a first-time install from the backend checkout:
+
+```bash
+./cslr install-service
+```
+
+systemd --user starts Code Slayer on boot and binds **127.0.0.1:8765**.
+Ordinary administration is in the WebUI. The terminal is for first-time
+install and emergency recovery (`./cslr status|start|stop|restart`).
+
+For a foreground process from a checkout (no systemd):
 
 ```bash
 python3 -m pip install -e '.[dev]'
-codeslayer serve --repo . --webui-dir ../path-to-codeslayer-webui-sidecar
+./cslr serve
 ```
 
-Pass the actual sidecar checkout directory. Open `http://127.0.0.1:8765`.
-`--webui-dir` is optional for API-only use. `--port` selects another port when an
-old prototype server is already using 8765. Development edits are served directly;
-no asset copying or frontend build is required. Both assets and `/api` use one
-origin. Committed source contains no machine-specific paths. No Sites hosting or
-remote deployment is involved in this local backend integration.
+`--webui-dir` defaults to this checkout's `webui/`. Open `http://127.0.0.1:8765`.
+Development edits are served directly; no asset copying or frontend build is
+required. Both assets and `/api` use one origin. Committed source contains no
+machine-specific paths.
 
-The CLI defaults to **127.0.0.1:8765**, no CORS, no debugger and no authentication.
-Requests require a trusted Host; cross-origin browser requests are rejected.
-Mutations require JSON and reject unknown fields. Body size is capped at 64 KiB.
-For explicit LAN use, set `--host` and `--trusted-host` to the intended bind address
-and host name. This exposes unauthenticated application actions to reachable peers;
-use only an appropriately protected environment. Wildcard CORS is not supported.
+Persistent machine-local configuration lives at
+`~/.config/codeslayer/config.toml` (override: `$CODESLAYER_CONFIG`). It is
+not in Git. Workers, Ollama origins, approved runtime identity, bind address,
+and Tailscale Serve intent are stored there. Fingerprints are derived from
+approved fields at runtime and are never an independent stored authority.
+
+The server binds **loopback only**. `0.0.0.0` is rejected. Remote access is
+optional Tailscale Serve of localhost:8765 (never Funnel). The CLI defaults
+to no CORS, no debugger and no authentication. Requests require a trusted
+Host; cross-origin browser requests are rejected. Mutations require JSON and
+reject unknown fields. Body size is capped at 64 KiB. Wildcard CORS is not
+supported.
 
 The configured repository selects normal external state through `store.location`.
 The existing `CODESLAYER_STATE_ROOT` environment setting can isolate development
@@ -165,8 +179,10 @@ never production `{state_root}/repos/{repo_id}/worktrees/{worktree_id}/state.db`
 Production eligibility is still computed only by
 `evaluate_production_eligibility` against production state.
 
-Expected runtime identity is server-owned (`RuntimeBindings.baseline_certification_targets`),
-never HTTP input. Host wiring example: `runtime_qwen_coder:create_runtime`.
+Expected runtime identity is server-owned persistent config
+(`~/.config/codeslayer/config.toml` → `RuntimeBindings.baseline_certification_targets`),
+never HTTP input. `--runtime-factory` / `runtime_qwen_coder:create_runtime`
+remain emergency wiring only.
 
 | Method / path | Returns |
 | --- | --- |
@@ -182,6 +198,46 @@ Live Planner/Coder/Reviewer/Repairer/Security certification is not available
 in v1 (`future_actions[].available: false`). PASS, FAIL, and HARD_DISQUALIFIED
 all record a validation certificate; INCOMPLETE does not. None of these
 routes grant trust, permissions, or production eligibility.
+
+Normal Certification Center startup reads workers/runtime identity from
+persistent config. `CODESLAYER_CERT_*` and `--runtime-factory` are emergency
+wiring, not the ordinary path.
+
+### System / runtime administration
+
+The browser is a control surface over fixed server-owned operations. It
+never runs arbitrary shell, never supplies `outcome` / `evidence_ref` /
+`adapter` / digest / fingerprint / hard-disqualifier lists, and never
+performs LAN discovery.
+
+Ollama add/test connects only to an **operator-entered** http(s) origin
+(connect, not `network.discovery.local`). Tailscale uses the local
+`tailscale` CLI (Serve, never Funnel). Update check fetches the already
+configured `origin` remote of the installed checkout.
+
+Approving a live identity writes the live-attested digest and runtime
+version server-side. A digest mismatch without
+`approve-new-identity` does not overwrite the approved identity.
+Approving a new identity does **not** transfer old certificates
+(`certificates_transferred` is always `false`; eligibility remains an
+exact fingerprint match).
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/system` | Service running/stopped, version, running commit (`VERIFIED`/`UNVERIFIED`), uptime, health, local URL, bind host/port |
+| `POST /api/system/restart` | `{ }` only. systemd --user restart of `codeslayer.service` |
+| `POST /api/system/update/check` | `{ }` only. Fail-closed git check: expected remotes only, dirty/divergent reported, never a deployment |
+| `POST /api/system/update/apply` | `{ }` only. Fast-forward only. Refuses dirty/divergent/unexpected remotes. `deployment_complete` is false until `GET /api/system` shows the new `running_commit` after restart. `git merge` is not a completed deployment |
+| `GET /api/runtime` | Config-bound Ollama servers and workers. **Does not probe live.** Provenance labels are `CONFIG_BOUND` / `UNVERIFIED` |
+| `POST /api/runtime/attest` | `{ }` only. Live-attests configured workers (`VERIFIED`/`MISMATCH`/`UNREACHABLE`/`OBSERVED`/`UNVERIFIED`) |
+| `POST /api/runtime/ollama-servers` | `{id, origin}` only. Tests the origin then saves it. Invalid origin: 400. Unreachable: 409, not saved |
+| `POST /api/runtime/ollama-servers/{id}/test` | `{ }` only. Live inventory (`LIVE_ATTESTED`) — observation, not identity approval |
+| `POST /api/runtime/workers` | `{worker_id, ollama_server_id, model_tag}` plus optional kind/network_class/context/temperature/normalizer. **Rejects digest/fingerprint/outcome/adapter/evidence_ref.** Preserves any already-approved identity |
+| `POST /api/runtime/workers/{id}/approve` | `{ }` only. Approves the live-attested digest/version. Mismatch against an existing approved identity returns `MISMATCH` and does not overwrite |
+| `POST /api/runtime/workers/{id}/approve-new-identity` | `{ }` only. Replaces the approved identity from live attestation. Does not transfer certificates |
+| `GET /api/tailscale` | Local Tailscale CLI status plus configured Serve backend |
+| `POST /api/tailscale/enable` | `{ }` only. `tailscale serve --bg http://127.0.0.1:PORT`. Rejects non-loopback backends. Never Funnel |
+| `POST /api/tailscale/disable` | `{ }` only. `tailscale serve reset` |
 
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
@@ -224,7 +280,9 @@ and the `/api/permissions*` routes (Governance Foundation slice G2,
 `/api/certification*` routes (Certification Center v1) are the
 additions since WebUI Foundation 1 — deterministic, read-only
 repository evidence, planning, permission consent/revocation, and a
-control surface over isolated Baseline Security certification. Never a
+control surface over isolated Baseline Security certification — together
+with `/api/system*`, `/api/runtime*`, and `/api/tailscale*` (local
+service administration). Never a
 filesystem/DB path from the client, never a new authority: a repository
 fact still cannot become trusted `ResolutionEvidence` except through the
 existing, unmodified application-owned authority path, a `READY` plan
@@ -236,6 +294,9 @@ body — and `/api/certification*` never accepts an outcome, evidence
 reference, adapter, digest, fingerprint, or hard-disqualifier list.
 Certificates from this surface are written only to isolated validation
 state; they do not grant trust, permissions, or production eligibility.
+`/api/runtime*` never accepts a client-supplied digest or fingerprint;
+`/api/system*` and `/api/tailscale*` map only to fixed argv tuples,
+never a shell string.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens

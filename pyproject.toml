@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 codeslayer = "code_slayer.cli.main:cli"
+cslr = "code_slayer.cli.main:cli"
 
 [project.optional-dependencies]
 dev = [
