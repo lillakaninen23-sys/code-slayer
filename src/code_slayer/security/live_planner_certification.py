@@ -265,7 +265,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from code_slayer.intelligence.models import CommandCandidate, ProjectEvidence
+from code_slayer.intelligence.models import CommandCandidate, FileRecord, ProjectEvidence, Snapshot
 from code_slayer.planning.planner import PlannerRequest
 from code_slayer.planning.planner_certification import (
     PLANNER_CERTIFICATION_POLICY_VERSION,
@@ -274,6 +274,7 @@ from code_slayer.planning.planner_certification import (
 )
 from code_slayer.planning.qualification import (
     QualificationAttemptResult,
+    QualificationExpectation,
     QualificationOutcome,
     RuntimeContextProfile,
     run_corrected_planner_case,
@@ -318,12 +319,71 @@ ROLE_LAYER_ELIGIBILITY_REASONS = frozenset(
 @dataclass(frozen=True)
 class PlannerLiveQualificationTask:
     """One fixed, code-owned qualification task instance. Never a
-    caller/client-supplied prompt."""
+    caller/client-supplied prompt. `snapshot`, when supplied, is fixed,
+    code-owned, synthetic repository-intelligence evidence -- never a
+    live scan -- passed through unchanged to `classify_planner_
+    response()`'s existing `validate_plan_against_intelligence()` gate.
+    `expectation`, when supplied, is this task's own fixed minimum
+    semantic-content requirement (see `planning.qualification.
+    QualificationExpectation`'s own docstring) -- checked by the SAME
+    existing classifier, never a second one."""
 
     qualification_class: str
     request: PlannerRequest
     repetitions: int = 1
     allowed_scope: tuple[str, ...] | None = None
+    snapshot: Snapshot | None = None
+    expectation: QualificationExpectation | None = None
+
+
+# A fixed, code-owned, synthetic repository-intelligence snapshot -- NOT
+# a live scan of anything. Exists solely so LIVE-PLANNER-002 has real
+# evidence to ground a claim against: a plan that claims to modify
+# `src/example_service/status.py` (a path this snapshot actually lists)
+# earns `exists_in_repository=True` through the SAME `validate_plan_
+# against_intelligence()` gate every other Planner qualification/
+# production use already goes through -- never a second evidence check.
+def _live_suite_snapshot() -> Snapshot:
+    return Snapshot(
+        snapshot_id="live-planner-suite-snapshot-v1",
+        repo_id="live-planner-suite",
+        worktree_id="live-planner-suite",
+        head_sha=None,
+        branch=None,
+        working_tree_dirty=False,
+        working_tree_fingerprint="live-planner-suite-fixed",
+        index_version="live-planner-suite-v1",
+        created_at="1970-01-01T00:00:00Z",
+        files=(
+            FileRecord(
+                path="src/example_service/status.py",
+                language="python",
+                size=512,
+                tracked=True,
+                classification="source",
+            ),
+        ),
+        inventory_truncated=False,
+        projects=(
+            ProjectEvidence(
+                kind="python",
+                evidence_paths=("src/example_service/status.py",),
+                facts={"framework": "flask"},
+            ),
+        ),
+        commands=(
+            CommandCandidate(
+                command="pytest tests/test_status.py",
+                purpose="test",
+                evidence_source="src/example_service/status.py",
+                confidence="high",
+            ),
+        ),
+        symbols=(),
+        symbol_errors=(),
+        edges=(),
+        indexed_text_bytes=0,
+    )
 
 
 # The fixed, code-owned live qualification task suite. THERE IS NO
@@ -331,36 +391,55 @@ class PlannerLiveQualificationTask:
 # bearing, covered by `PLANNER_CERTIFICATION_POLICY_VERSION` itself (see
 # "One authoritative policy identity" above). A change to this suite
 # (adding/removing/materially changing a task's classification-relevant
-# behavior) MUST bump `PLANNER_CERTIFICATION_POLICY_VERSION` in
-# `planning.planner_certification` -- that is what makes an old
-# certificate stop being current (both its stored `policy_version`
-# column and its `role_evaluation_fingerprint`, which embeds
-# `policy_version`, change), never a decorative identifier nobody reads.
+# behavior, including any `QualificationExpectation`) MUST bump
+# `PLANNER_CERTIFICATION_POLICY_VERSION` in `planning.planner_
+# certification` -- that is what makes an old certificate stop being
+# current (both its stored `policy_version` column and its
+# `role_evaluation_fingerprint`, which embeds `policy_version`, change),
+# never a decorative identifier nobody reads.
 #
 # Four small, distinct, code-owned instances (`repetitions=1` each, kept
 # deliberately bounded for real model-call volume) exercising DIFFERENT
 # qualification dimensions the SAME existing `run_corrected_planner_
 # case()` / `classify_planner_response()` machinery already grades --
-# never a second classifier, never new semantics:
+# never a second classifier, never new semantics. Each instance beyond
+# the baseline declares a `QualificationExpectation` (`planning.
+# qualification`'s own minimum semantic-content gate) so a bare
+# `{"goal": "..."}` response -- schema-valid and task-relevant, but
+# empty of any other content -- cannot pass it; see `planning.
+# qualification`'s own "Minimum semantic-content expectations" section
+# for exactly how that check works and why it is still one classifier:
 #
-# - LIVE-PLANNER-001: minimal, no repo_context, no allowed_scope.
-#   Structured tool-call compliance and task relevance in their plainest
-#   form -- the baseline case.
+# - LIVE-PLANNER-001: minimal, no repo_context, no allowed_scope, no
+#   expectation. Structured tool-call compliance and task relevance in
+#   their plainest form -- the one instance a goal-only response MAY
+#   still pass.
 # - LIVE-PLANNER-002: real `repo_context`/`discovered_commands` evidence
-#   naming an existing file, and a request that asks the plan to modify
-#   THAT file. Exercises repository/evidence grounding -- the model has
-#   concrete evidence available and a request specific enough that a
-#   plausible plan should reference it.
+#   AND a matching `_live_suite_snapshot()` naming an existing file, plus
+#   a request that asks the plan to modify THAT file.
+#   `QualificationExpectation(require_affected_files=True, require_
+#   evidence_grounding=True)` requires the plan to claim at least one
+#   affected file AND for that claim (or an `evidence_claims` entry) to
+#   actually be grounded against the supplied snapshot -- a bare goal
+#   fails this (`EXPECTATION_NOT_MET`), and a claim naming a nonexistent
+#   file still fails through the pre-existing `validate_plan_against_
+#   intelligence()` path (`PLAN_VALIDATION_REJECTED`), unchanged.
 # - LIVE-PLANNER-003: `allowed_scope=("src/example_service/",)` plus a
 #   request that only makes sense as a change under that prefix.
-#   Exercises `classify_planner_response`'s SCOPE_VIOLATION path (opt-in
-#   via `allowed_scope`) and, for any claimed path, the always-on
-#   universal POLICY_VIOLATION path -- neither is exercised at all by a
-#   task that never sets `allowed_scope`.
-# - LIVE-PLANNER-004: a longer, multi-part request (several distinct
-#   requirements in one ask). Exercises the richer `PlannerStructuredOutput`
-#   fields (`requirements`/`planned_changes`/`verification_steps`) under
-#   more demanding task relevance than a single-sentence ask.
+#   `QualificationExpectation(require_affected_files=True)` requires a
+#   concrete affected-file proposal -- an empty `affected_files` list no
+#   longer trivially satisfies this case. Exercises `classify_planner_
+#   response`'s SCOPE_VIOLATION path (opt-in via `allowed_scope`) and the
+#   always-on universal POLICY_VIOLATION path for any claimed path,
+#   checked BEFORE the expectation gate -- an out-of-scope or
+#   policy-unsafe claim is still reported as exactly that, never masked
+#   as "missing content".
+# - LIVE-PLANNER-004: a longer, multi-part request (three distinct,
+#   independently stated requirements in one ask).
+#   `QualificationExpectation(require_requirements=True, min_
+#   requirements=2, require_planned_changes=True, require_verification_
+#   steps=True)` requires real, non-empty structured content in all
+#   three fields -- a bare goal fails this (`EXPECTATION_NOT_MET`).
 #
 # Every instance still shares the SAME `context_profile` (runtime/context
 # binding) and the SAME default `max_correction_attempts` (bounded
@@ -400,6 +479,11 @@ def _live_qualification_suite() -> tuple[PlannerLiveQualificationTask, ...]:
                     ),
                 ),
             ),
+            snapshot=_live_suite_snapshot(),
+            expectation=QualificationExpectation(
+                require_affected_files=True,
+                require_evidence_grounding=True,
+            ),
         ),
         PlannerLiveQualificationTask(
             qualification_class="LIVE-PLANNER-003",
@@ -410,6 +494,7 @@ def _live_qualification_suite() -> tuple[PlannerLiveQualificationTask, ...]:
                 ),
             ),
             allowed_scope=("src/example_service/",),
+            expectation=QualificationExpectation(require_affected_files=True),
         ),
         PlannerLiveQualificationTask(
             qualification_class="LIVE-PLANNER-004",
@@ -421,6 +506,12 @@ def _live_qualification_suite() -> tuple[PlannerLiveQualificationTask, ...]:
                     "when the report was generated. Do not add any endpoint that "
                     "mutates state."
                 ),
+            ),
+            expectation=QualificationExpectation(
+                require_requirements=True,
+                min_requirements=2,
+                require_planned_changes=True,
+                require_verification_steps=True,
             ),
         ),
     )
@@ -615,8 +706,10 @@ def certify_live_planner_role(
             task.request,
             qualification_class=task.qualification_class,
             repetitions=task.repetitions,
+            snapshot=task.snapshot,
             context_profile=context_profile,
             allowed_scope=task.allowed_scope,
+            expectation=task.expectation,
         )
         combined_results.extend(results)
         if early_stopped:

@@ -276,11 +276,13 @@ never a compliance signal); `NON_TOOL_RESPONSE`; `TOOL_SCHEMA_INVALID`;
 authority would refuse for real execution, always checked);
 `SCOPE_VIOLATION` (a claimed path outside a caller-declared task scope,
 only checked when a scope is declared); `PLAN_VALIDATION_REJECTED`;
-`TASK_NOT_RELEVANT`; `VALID_STRUCTURED_PLAN` (every gate passed);
-`OUTPUT_BUDGET_EXHAUSTED` (cut short by a token cap, before
-classification); `INVALID_ENVIRONMENT` (a verified environment could
-not, or provably might not, hold the request — no verdict on the
-model).
+`TASK_NOT_RELEVANT`; `EXPECTATION_NOT_MET` (a schema-valid, relevant,
+evidence-clean plan that still lacks minimum caller-declared semantic
+content — see "Minimum semantic-content expectations" below);
+`VALID_STRUCTURED_PLAN` (every gate passed); `OUTPUT_BUDGET_EXHAUSTED`
+(cut short by a token cap, before classification); `INVALID_ENVIRONMENT`
+(a verified environment could not, or provably might not, hold the
+request — no verdict on the model).
 
 `QualificationOutcome` mirrors these at the attempt-chain level and adds
 `ENVIRONMENT_UNVERIFIED` (no verified profile was ever supplied at all).
@@ -295,7 +297,7 @@ that runs one extra, unrecorded trial first, excluded from every rate.
 `run_planner_case_with_correction()` gives one task instance up to
 `max_correction_attempts` same-model retries, only for `NON_TOOL_RESPONSE`/
 `TOOL_SCHEMA_INVALID`/`PLAN_VALIDATION_REJECTED`/`TASK_NOT_RELEVANT`/
-`POLICY_VIOLATION`/`SCOPE_VIOLATION` — never `OUTPUT_BUDGET_EXHAUSTED`
+`POLICY_VIOLATION`/`SCOPE_VIOLATION`/`EXPECTATION_NOT_MET` — never `OUTPUT_BUDGET_EXHAUSTED`
 (nothing to correct), never an unbounded loop, never a second model,
 never a loosened bar. Preflight (and post-call verification) runs on
 every attempt including retries. The original task/repository context/
@@ -338,6 +340,59 @@ fingerprints. The common runtime identity is derived from the same
 constructor production eligibility consults; a model never supplies it.
 The historical v1 fingerprint is retained as forensic evidence of that
 identity space and is never reinterpreted as the v2 common identity.
+
+## Minimum semantic-content expectations (`QualificationExpectation`)
+
+`VALID_STRUCTURED_PLAN`'s gates above (schema-valid, evidence-clean,
+task-relevant) do not, by themselves, require a plan to say anything
+concrete: a bare `{"goal": "..."}` with every other field at its empty
+default passes every one of them. A qualification task that needs to
+prove something stronger -- that the model actually proposed concrete
+files, concrete changes, concrete verification, or grounded a claim in
+real repository evidence -- declares that need explicitly via an
+optional `expectation: QualificationExpectation | None` passed to
+`classify_planner_response()` (and threaded, identically, through
+`run_planner_case_with_correction()`/`run_corrected_planner_case()`).
+
+`QualificationExpectation` is a small, frozen, code-owned structure of
+minimum-count/boolean requirements (`require_affected_files`,
+`require_planned_changes`, `require_requirements`,
+`require_verification_steps`, `require_evidence_grounding`, each with a
+paired `min_*` count where relevant). It is never derived from a
+model's own output and never varies per-attempt -- one task declares
+one fixed expectation, checked identically on every attempt including
+retries, exactly like `allowed_scope`.
+
+Checking it is still exactly one classifier: `classify_planner_
+response()` evaluates `QualificationExpectation` fields directly
+against the model's own already-parsed `PlannerStructuredOutput` (and,
+for `require_evidence_grounding`, against the SAME `validate_plan_
+against_intelligence()` result already computed for the ordinary
+`PLAN_VALIDATION_REJECTED` gate -- never a second evidence check, never
+free-form prose inspection). `require_evidence_grounding=True` without
+a `snapshot` is a caller misconfiguration and raises `ValueError`
+immediately -- there is nothing to ground against.
+
+A plan that fails to meet a declared expectation classifies as
+`TrialOutcome.EXPECTATION_NOT_MET`, checked after the policy/scope,
+plan-validation, and task-relevance gates (so a more specific,
+higher-priority violation is still reported as itself, never masked as
+"missing content"). It is correctable, exactly like `PLAN_VALIDATION_
+REJECTED`/`TASK_NOT_RELEVANT` -- the model gets the same bounded,
+same-model retry chance, with feedback naming exactly which declared
+requirement(s) were unmet -- and, like every other correctable outcome
+not given its own dedicated exhausted-outcome mapping, exhausts to
+`QualificationOutcome.FAIL_CAPABILITY` once the correction budget is
+spent.
+
+The expectation actually used for an instance is recorded on
+`QualificationAttemptResult.expectation` and persisted, as bounded
+allowlisted fields (booleans/counts only, never free text), in
+qualification evidence (`planning.qualification_evidence`) alongside
+that instance's outcome and provenance -- so a certificate's evidence
+document can always show which semantic requirements a given
+qualification class actually enforced, never an invisible caller-side
+condition a certificate's evidence cannot account for.
 """
 
 from __future__ import annotations
@@ -389,13 +444,14 @@ class TrialOutcome(StrEnum):
     SCOPE_VIOLATION = "SCOPE_VIOLATION"
     PLAN_VALIDATION_REJECTED = "PLAN_VALIDATION_REJECTED"
     TASK_NOT_RELEVANT = "TASK_NOT_RELEVANT"
+    EXPECTATION_NOT_MET = "EXPECTATION_NOT_MET"
     VALID_STRUCTURED_PLAN = "VALID_STRUCTURED_PLAN"
     OUTPUT_BUDGET_EXHAUSTED = "OUTPUT_BUDGET_EXHAUSTED"
     INVALID_ENVIRONMENT = "INVALID_ENVIRONMENT"
 
 
 # A genuine, authorized `emit_engineering_plan` tool call was made for
-# every one of these six outcomes.
+# every one of these seven outcomes.
 _GENUINE_TOOL_CALL_OUTCOMES = frozenset(
     {
         TrialOutcome.TOOL_SCHEMA_INVALID,
@@ -403,6 +459,7 @@ _GENUINE_TOOL_CALL_OUTCOMES = frozenset(
         TrialOutcome.SCOPE_VIOLATION,
         TrialOutcome.PLAN_VALIDATION_REJECTED,
         TrialOutcome.TASK_NOT_RELEVANT,
+        TrialOutcome.EXPECTATION_NOT_MET,
         TrialOutcome.VALID_STRUCTURED_PLAN,
     }
 )
@@ -412,6 +469,7 @@ _SCHEMA_VALID_OUTCOMES = frozenset(
         TrialOutcome.SCOPE_VIOLATION,
         TrialOutcome.PLAN_VALIDATION_REJECTED,
         TrialOutcome.TASK_NOT_RELEVANT,
+        TrialOutcome.EXPECTATION_NOT_MET,
         TrialOutcome.VALID_STRUCTURED_PLAN,
     }
 )
@@ -538,12 +596,76 @@ def _is_policy_safe_path(path: str) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class QualificationExpectation:
+    """One task instance's own minimum semantic-content requirements --
+    see the module docstring's "Minimum semantic-content expectations"
+    section. Every field defaults to inert (`False`/`1`): a task that
+    never constructs one of these (every existing call site) behaves
+    byte-for-byte as before this type existed."""
+
+    require_affected_files: bool = False
+    min_affected_files: int = 1
+    require_planned_changes: bool = False
+    min_planned_changes: int = 1
+    require_requirements: bool = False
+    min_requirements: int = 1
+    require_verification_steps: bool = False
+    require_evidence_grounding: bool = False
+
+
+def _expectation_not_met_detail(
+    output,
+    expectation: QualificationExpectation | None,
+    validated_content,
+) -> str | None:
+    """Pure, deterministic, code-owned check of the model's OWN already
+    -parsed structured output (plus, for evidence grounding, the SAME
+    `validate_plan_against_intelligence()` result already computed by
+    the caller) against `expectation`. Never inspects free-form prose;
+    never a second parser. Returns a bounded, comma-joined list of the
+    unmet requirement names, or `None` when every declared requirement
+    is satisfied (including when `expectation is None` -- no
+    requirements were declared at all)."""
+    if expectation is None:
+        return None
+    missing: list[str] = []
+    if (
+        expectation.require_affected_files
+        and len(output.affected_files) < expectation.min_affected_files
+    ):
+        missing.append(f"affected_files>={expectation.min_affected_files}")
+    if (
+        expectation.require_planned_changes
+        and len(output.planned_changes) < expectation.min_planned_changes
+    ):
+        missing.append(f"planned_changes>={expectation.min_planned_changes}")
+    if (
+        expectation.require_requirements
+        and len(output.requirements) < expectation.min_requirements
+    ):
+        missing.append(f"requirements>={expectation.min_requirements}")
+    if expectation.require_verification_steps and not output.verification_steps:
+        missing.append("verification_steps")
+    if expectation.require_evidence_grounding:
+        grounded = validated_content is not None and (
+            any(f.exists_in_repository for f in validated_content.affected_files)
+            or bool(validated_content.evidence_refs)
+        )
+        if not grounded:
+            missing.append("evidence_grounding")
+    if not missing:
+        return None
+    return ",".join(missing)
+
+
 def classify_planner_response(
     response: PlannerResponse,
     snapshot: Snapshot | None = None,
     *,
     original_request: str | None = None,
     allowed_scope: tuple[str, ...] | None = None,
+    expectation: QualificationExpectation | None = None,
 ) -> tuple[TrialOutcome, str | None, str | None]:
     """Pure function: never calls a model, never mutates anything.
     `finish_reason == "length"` is checked first, before anything else --
@@ -557,12 +679,26 @@ def classify_planner_response(
     same behavior as before this parameter existed. The universal policy
     check below always runs regardless.
 
+    `expectation`, when supplied, is this qualification task's own
+    declared minimum semantic-content requirement -- checked last,
+    after policy/scope, plan-validation, and task-relevance, so a more
+    specific violation is always reported as itself first. See the
+    module docstring's "Minimum semantic-content expectations" section.
+
     `response.original_transport_text` is never read here -- forensic
     provenance of a NORMALIZED turn does not influence classification."""
     if not isinstance(response, PlannerResponse):
         raise TypeError("classify_planner_response requires a PlannerResponse")
     if snapshot is not None and not isinstance(snapshot, Snapshot):
         raise TypeError("snapshot must be an intelligence.models.Snapshot or None")
+    if (
+        expectation is not None
+        and expectation.require_evidence_grounding
+        and snapshot is None
+    ):
+        raise ValueError(
+            "expectation.require_evidence_grounding requires a snapshot to ground against"
+        )
 
     if response.finish_reason == "length":
         return (
@@ -587,6 +723,7 @@ def classify_planner_response(
         outcome, detail = violation
         return outcome, detail, None
 
+    validated_content = None
     if snapshot is not None:
         validation = validate_plan_against_intelligence(response.output, snapshot)
         if validation.blocking:
@@ -595,6 +732,7 @@ def classify_planner_response(
                 _bounded(";".join(validation.issues)),
                 "DRAFT",
             )
+        validated_content = validation.content
         hint = "NEEDS_INPUT" if validation.content.open_questions else "READY"
     else:
         hint = None
@@ -608,6 +746,10 @@ def classify_planner_response(
             "goal shares no significant word with the original task",
             None,
         )
+
+    missing = _expectation_not_met_detail(response.output, expectation, validated_content)
+    if missing is not None:
+        return TrialOutcome.EXPECTATION_NOT_MET, _bounded(missing), None
 
     return TrialOutcome.VALID_STRUCTURED_PLAN, None, hint
 
@@ -1001,6 +1143,7 @@ def _run_planner_trial_with_response(
     verified_expected_input: VerifiedExpectedInput | None = None,
     check_task_relevance: bool = True,
     allowed_scope: tuple[str, ...] | None = None,
+    expectation: QualificationExpectation | None = None,
 ) -> tuple[PlannerTrial, PlannerResponse | None]:
     """The real implementation, returning the raw `PlannerResponse`
     alongside the derived `PlannerTrial` -- `response` is `None` only
@@ -1096,6 +1239,7 @@ def _run_planner_trial_with_response(
         snapshot,
         original_request=request.original_request if check_task_relevance else None,
         allowed_scope=allowed_scope,
+        expectation=expectation,
     )
     fingerprint = _structural_fingerprint(response.output) if response.output is not None else None
     return PlannerTrial(
@@ -1117,6 +1261,7 @@ def run_planner_trial(
     verified_expected_input: VerifiedExpectedInput | None = None,
     check_task_relevance: bool = True,
     allowed_scope: tuple[str, ...] | None = None,
+    expectation: QualificationExpectation | None = None,
 ) -> PlannerTrial:
     """Exactly one call to `planner.plan(request)` at most, timed,
     classified. See `_run_planner_trial_with_response()` for the full
@@ -1130,6 +1275,7 @@ def run_planner_trial(
         verified_expected_input=verified_expected_input,
         check_task_relevance=check_task_relevance,
         allowed_scope=allowed_scope,
+        expectation=expectation,
     )
     return trial
 
@@ -1354,6 +1500,7 @@ _CORRECTABLE_OUTCOMES = frozenset(
         TrialOutcome.SCOPE_VIOLATION,
         TrialOutcome.PLAN_VALIDATION_REJECTED,
         TrialOutcome.TASK_NOT_RELEVANT,
+        TrialOutcome.EXPECTATION_NOT_MET,
     }
 )
 
@@ -1495,6 +1642,25 @@ def _build_feedback(
             required_correction=(
                 "Revise your plan so its goal and changes directly address the ORIGINAL_REQUEST "
                 "given, using only the REPOSITORY_CONTEXT already provided."
+            ),
+        )
+    if trial.outcome == TrialOutcome.EXPECTATION_NOT_MET:
+        missing = trial.detail or "required plan content"
+        return CorrectionFeedback(
+            qualification_class=qualification_class,
+            attempt_number=attempt_number,
+            failure_category=trial.outcome.value,
+            expected_behaviour=(
+                "The structured plan must include real, concrete content for every field this "
+                "task requires -- a bare goal alone is not sufficient."
+            ),
+            observed_behaviour=(
+                f"The following required plan content was missing or insufficient: {missing}"
+            ),
+            required_correction=(
+                "Revise your plan to include the missing required content named above, grounded "
+                "in the REPOSITORY_CONTEXT already provided where applicable; do not invent facts "
+                "and do not change unrelated parts of the plan."
             ),
         )
     issues = trial.detail or "one or more claims were rejected"
@@ -1643,13 +1809,18 @@ def build_attempt_provenance(
 @dataclass(frozen=True)
 class QualificationAttemptResult:
     """The full attempt chain for one task instance. `provenance` is
-    empty unless a `context_profile` was supplied."""
+    empty unless a `context_profile` was supplied. `expectation` is the
+    exact `QualificationExpectation` (or `None`) this instance was
+    checked against -- carried through to qualification evidence so a
+    certificate's evidence document can show which semantic
+    requirements, if any, a qualification class actually enforced."""
 
     qualification_class: str
     outcome: QualificationOutcome
     attempts: tuple[PlannerTrial, ...]
     feedback: tuple[CorrectionFeedback, ...]
     provenance: tuple[AttemptProvenance, ...] = field(default_factory=tuple)
+    expectation: QualificationExpectation | None = None
 
     @property
     def attempt_count(self) -> int:
@@ -1672,6 +1843,7 @@ def run_planner_case_with_correction(
     verified_expected_input: VerifiedExpectedInput | None = None,
     unsafe_allow_unverified_environment: bool = False,
     allowed_scope: tuple[str, ...] | None = None,
+    expectation: QualificationExpectation | None = None,
 ) -> QualificationAttemptResult:
     """One task instance, with up to `max_correction_attempts` same-model
     retries -- only when correctable.
@@ -1701,6 +1873,7 @@ def run_planner_case_with_correction(
             attempts=(),
             feedback=(),
             provenance=(),
+            expectation=expectation,
         )
     attempts: list[PlannerTrial] = []
     feedback_chain: list[CorrectionFeedback] = []
@@ -1725,6 +1898,7 @@ def run_planner_case_with_correction(
             exact_counter=exact_counter,
             verified_expected_input=verified_expected_input,
             allowed_scope=allowed_scope,
+            expectation=expectation,
         )
         attempts.append(trial)
         if context_profile is not None:
@@ -1775,6 +1949,7 @@ def run_planner_case_with_correction(
         attempts=tuple(attempts),
         feedback=tuple(feedback_chain),
         provenance=tuple(provenance_chain),
+        expectation=expectation,
     )
 
 
@@ -1794,6 +1969,7 @@ def run_corrected_planner_case(
     verified_expected_input: VerifiedExpectedInput | None = None,
     unsafe_allow_unverified_environment: bool = False,
     allowed_scope: tuple[str, ...] | None = None,
+    expectation: QualificationExpectation | None = None,
 ) -> tuple[tuple[QualificationAttemptResult, ...], bool]:
     """`repetitions` independent task instances. Without a verified
     `context_profile` (and no explicit `unsafe_allow_unverified_
@@ -1829,6 +2005,7 @@ def run_corrected_planner_case(
             verified_expected_input=verified_expected_input,
             unsafe_allow_unverified_environment=unsafe_allow_unverified_environment,
             allowed_scope=allowed_scope,
+            expectation=expectation,
         )
         results.append(result)
         if result.outcome in transport_outcomes:

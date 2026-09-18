@@ -58,6 +58,13 @@ class _Script:
 
 
 def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
+    return _plan_body_full({"goal": goal})
+
+
+def _plan_body_full(arguments: dict) -> bytes:
+    """Like `_plan_body()` but with arbitrary `emit_engineering_plan`
+    arguments -- used to build genuinely compliant plans that satisfy a
+    task's own `QualificationExpectation`, never free-form prose."""
     return json.dumps(
         {
             "choices": [
@@ -69,7 +76,7 @@ def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
                                 "type": "function",
                                 "function": {
                                     "name": "emit_engineering_plan",
-                                    "arguments": json.dumps({"goal": goal}),
+                                    "arguments": json.dumps(arguments),
                                 },
                             },
                         ],
@@ -78,6 +85,94 @@ def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
             ],
         },
     ).encode()
+
+
+def _task2_compliant_body() -> bytes:
+    """Satisfies LIVE-PLANNER-002's `require_affected_files=True,
+    require_evidence_grounding=True`: claims to modify the one file the
+    fixed suite snapshot actually lists, and grounds that claim two
+    ways (an affected-file claim against an existing path, and a
+    matching `evidence_claims` entry) -- either alone would satisfy
+    `require_evidence_grounding`."""
+    return _plan_body_full(
+        {
+            "goal": "Add a current-uptime field to the status endpoint response",
+            "affected_files": [
+                {
+                    "path": "src/example_service/status.py",
+                    "action": "modify",
+                    "reason": "add an uptime_seconds field to the response",
+                },
+            ],
+            "evidence_claims": [
+                {"kind": "file_exists", "key": "src/example_service/status.py"},
+            ],
+        },
+    )
+
+
+def _task3_compliant_body() -> bytes:
+    """Satisfies LIVE-PLANNER-003's `require_affected_files=True` with a
+    proposal genuinely inside the declared `allowed_scope`."""
+    return _plan_body_full(
+        {
+            "goal": "Add a read-only endpoint listing configured feature flags",
+            "affected_files": [
+                {
+                    "path": "src/example_service/feature_flags.py",
+                    "action": "create",
+                    "reason": "new read-only endpoint listing configured feature flags",
+                },
+            ],
+        },
+    )
+
+
+def _task4_compliant_body() -> bytes:
+    """Satisfies LIVE-PLANNER-004's `require_requirements=True,
+    min_requirements=2, require_planned_changes=True, require_
+    verification_steps=True` with genuinely multi-part structured
+    content, mirroring the task's own three independently stated asks."""
+    return _plan_body_full(
+        {
+            "goal": "Add a read-only reporting endpoint for processed counts and queue depth",
+            "requirements": [
+                "Return the count of items processed in the last 24 hours",
+                "Return the current queue depth",
+                "Include a timestamp of when the report was generated",
+            ],
+            "planned_changes": [
+                {
+                    "description": (
+                        "Add a new read-only reporting endpoint aggregating processed "
+                        "count, queue depth, and generation timestamp"
+                    ),
+                },
+            ],
+            "verification_steps": [
+                "Call the new endpoint and confirm the response includes the processed "
+                "count, queue depth, and a generation timestamp",
+            ],
+        },
+    )
+
+
+# Selects a genuinely compliant response for whichever live-suite task
+# actually sent this request, by a distinctive substring of that task's
+# own fixed `original_request` -- never response-side awareness of
+# "which task number this is," exactly mirroring how a real model only
+# ever sees the rendered prompt, never a task index. Falls back to
+# `script.default_completion` (goal-only) for LIVE-PLANNER-001, which
+# declares no `QualificationExpectation` and so a bare goal still passes.
+def _default_completion_for(raw: bytes, fallback: bytes) -> bytes:
+    text = raw.decode("utf-8", errors="ignore")
+    if "current uptime in seconds" in text:
+        return _task2_compliant_body()
+    if "configured feature flags" in text:
+        return _task3_compliant_body()
+    if "queue depth" in text:
+        return _task4_compliant_body()
+    return fallback
 
 
 def _text_body(text: str = "I cannot help with that.") -> bytes:
@@ -151,7 +246,7 @@ def _make_handler(script: _Script) -> type:
             if script.completions:
                 body = script.completions.pop(0)
             else:
-                body = script.default_completion
+                body = _default_completion_for(raw, script.default_completion)
             self._write(script.completion_status, body)
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
@@ -939,3 +1034,124 @@ def test_certificate_under_an_older_policy_version_is_not_current_under_the_cano
     assert len(rows) == 2
     current = next(r for r in rows if r.policy_version == PLANNER_CERTIFICATION_POLICY_VERSION)
     assert current.outcome == "PASS"
+
+
+# -- Review round 2, issue 4: the live suite must actually require -----------
+# -- more than a bare goal -----------------------------------------------
+
+
+def test_goal_only_response_cannot_pass_the_full_live_planner_suite(
+    production_conn, blobs_dir, runtime_server,
+):
+    """The exact regression this fix responds to: a worker could
+    previously obtain a PASS Planner role certificate by emitting four
+    schema-valid, task-relevant `goal`-only plans with no other
+    structured content. Feeding the SAME goal-only structured response
+    to every attempt of every task must never certify PASS now that
+    LIVE-PLANNER-002/003/004 each declare a `QualificationExpectation`."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+    # Enough copies to cover every attempt of every task, including
+    # every task's full correction budget being exhausted.
+    script.completions = [_plan_body() for _ in range(20)]
+    before = _counts(production_conn)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    assert result.outcome != RoleQualificationOutcome.PASS
+    assert result.outcome == RoleQualificationOutcome.FAIL
+    rows = RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER")
+    assert len(rows) == 1
+    assert rows[0].outcome == "FAIL"
+    assert all(r.outcome != "PASS" for r in rows)
+    # LIVE-PLANNER-001 passes first try on a bare goal (no expectation
+    # declared); LIVE-PLANNER-002/003/004 each exhaust their full
+    # 3-attempt correction budget on the same unchanging goal-only reply.
+    assert script.completion_posts == 1 + 3 * 3
+    after = _counts(production_conn)
+    assert after["planner"] == before["planner"] + 1
+    assert after["baseline"] == before["baseline"]
+    assert after["trust"] == before["trust"] == 0
+    assert after["grants"] == before["grants"] == 0
+
+
+def test_each_live_suite_task_beyond_the_baseline_requires_its_own_real_content(
+    production_conn, blobs_dir, runtime_server,
+):
+    """Positive proof, per dimension: with the genuinely compliant,
+    task-specific plans the fake runtime now returns by default (see
+    `_task2_compliant_body()`/`_task3_compliant_body()`/
+    `_task4_compliant_body()`), every instance -- including the three
+    that now declare a `QualificationExpectation` -- passes on the
+    FIRST attempt, never needing correction."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    assert result.outcome == RoleQualificationOutcome.PASS
+    assert script.completion_posts == 4
+    document = read_planner_qualification_evidence(
+        production_conn,
+        blobs_dir,
+        result.evidence_ref,
+        expected_runtime_identity_fingerprint=result.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.role_evaluation_fingerprint,
+    )
+    instances = {i["qualification_class"]: i for i in document["instances"]}
+    assert set(instances) == {
+        "LIVE-PLANNER-001",
+        "LIVE-PLANNER-002",
+        "LIVE-PLANNER-003",
+        "LIVE-PLANNER-004",
+    }
+    for qualification_class, instance in instances.items():
+        assert instance["outcome"] == "PASS_FIRST_TRY", qualification_class
+        assert instance["attempt_count"] == 1, qualification_class
+
+
+def test_qualification_evidence_records_which_expectation_each_instance_used(
+    production_conn, blobs_dir, runtime_server,
+):
+    """The declared expectation is never an invisible caller-side
+    condition -- a certificate's evidence document must show exactly
+    which semantic requirements each qualification class enforced."""
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    result = _certify(production_conn, blobs_dir, root)
+
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        production_conn,
+        blobs_dir,
+        result.evidence_ref,
+        expected_runtime_identity_fingerprint=result.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.role_evaluation_fingerprint,
+    )
+    instances = {i["qualification_class"]: i for i in document["instances"]}
+    assert instances["LIVE-PLANNER-001"]["expectation"] is None
+    assert instances["LIVE-PLANNER-002"]["expectation"] == {
+        "require_affected_files": True,
+        "min_affected_files": 1,
+        "require_planned_changes": False,
+        "min_planned_changes": 1,
+        "require_requirements": False,
+        "min_requirements": 1,
+        "require_verification_steps": False,
+        "require_evidence_grounding": True,
+    }
+    assert instances["LIVE-PLANNER-003"]["expectation"]["require_affected_files"] is True
+    assert instances["LIVE-PLANNER-003"]["expectation"]["require_evidence_grounding"] is False
+    assert instances["LIVE-PLANNER-004"]["expectation"] == {
+        "require_affected_files": False,
+        "min_affected_files": 1,
+        "require_planned_changes": True,
+        "min_planned_changes": 1,
+        "require_requirements": True,
+        "min_requirements": 2,
+        "require_verification_steps": True,
+        "require_evidence_grounding": False,
+    }

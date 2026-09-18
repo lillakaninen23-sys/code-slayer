@@ -49,7 +49,9 @@ Persisted (canonical JSON, content-addressed, internal, non-exportable):
 - effective context tokens, temperature, output-token budget,
   tool-choice enforcement
 - per-instance qualification class, instance outcome, attempt count,
-  correction usage, and each attempt's bounded `AttemptProvenance`
+  correction usage, each attempt's bounded `AttemptProvenance`, and the
+  bounded `QualificationExpectation` (booleans/counts only) that
+  instance was checked against, if any
 - NATIVE vs NORMALIZED transport per attempt
 - whether full-input preservation was verified for that attempt
 - request / task / repository-context / schema fingerprints
@@ -90,6 +92,7 @@ from code_slayer.audit.canonical import canonical_json
 from code_slayer.planning.qualification import (
     AttemptProvenance,
     QualificationAttemptResult,
+    QualificationExpectation,
     QualificationOutcome,
 )
 from code_slayer.store.content_store import BlobTooLargeError, ContentStore
@@ -325,6 +328,21 @@ def _provenance_to_dict(attempt: AttemptProvenance) -> dict:
     }
 
 
+def _expectation_to_dict(expectation: QualificationExpectation) -> dict:
+    """Allowlisted bounded fields only -- booleans/counts, never free
+    text -- mirrors `_provenance_to_dict()`'s own discipline."""
+    return {
+        "require_affected_files": expectation.require_affected_files,
+        "min_affected_files": expectation.min_affected_files,
+        "require_planned_changes": expectation.require_planned_changes,
+        "min_planned_changes": expectation.min_planned_changes,
+        "require_requirements": expectation.require_requirements,
+        "min_requirements": expectation.min_requirements,
+        "require_verification_steps": expectation.require_verification_steps,
+        "require_evidence_grounding": expectation.require_evidence_grounding,
+    }
+
+
 def _instance_to_dict(result: QualificationAttemptResult) -> dict:
     return {
         "qualification_class": result.qualification_class,
@@ -335,6 +353,9 @@ def _instance_to_dict(result: QualificationAttemptResult) -> dict:
         ),
         "attempt_outcomes": [attempt.outcome.value for attempt in result.attempts],
         "provenance": [_provenance_to_dict(p) for p in result.provenance],
+        "expectation": (
+            _expectation_to_dict(result.expectation) if result.expectation is not None else None
+        ),
     }
 
 

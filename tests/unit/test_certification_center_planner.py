@@ -49,6 +49,15 @@ class _Script:
 
 
 def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
+    """A single plan rich enough to satisfy EVERY live-suite task's own
+    `QualificationExpectation` at once (see `security.
+    live_planner_certification._live_qualification_suite()`) -- this
+    file tests the HTTP/service wiring, not the suite's own content
+    (covered by `test_live_planner_certification.py`), so one uniform
+    "genuinely compliant" response is used throughout rather than
+    per-task-aware fake-server logic. `goal` keeps the word "endpoint",
+    shared by every live-suite task's own request text, so task
+    relevance passes for all four unchanged."""
     return json.dumps(
         {
             "choices": [
@@ -60,7 +69,35 @@ def _plan_body(goal: str = "Add the requested read-only endpoint") -> bytes:
                                 "type": "function",
                                 "function": {
                                     "name": "emit_engineering_plan",
-                                    "arguments": json.dumps({"goal": goal}),
+                                    "arguments": json.dumps(
+                                        {
+                                            "goal": goal,
+                                            "affected_files": [
+                                                {
+                                                    "path": "src/example_service/status.py",
+                                                    "action": "modify",
+                                                    "reason": "reference the existing status "
+                                                    "endpoint",
+                                                },
+                                            ],
+                                            "evidence_claims": [
+                                                {
+                                                    "kind": "file_exists",
+                                                    "key": "src/example_service/status.py",
+                                                },
+                                            ],
+                                            "requirements": [
+                                                "first requirement",
+                                                "second requirement",
+                                            ],
+                                            "planned_changes": [
+                                                {"description": "implement the requested endpoint"},
+                                            ],
+                                            "verification_steps": [
+                                                "call the new endpoint and verify the response",
+                                            ],
+                                        },
+                                    ),
                                 },
                             },
                         ],
