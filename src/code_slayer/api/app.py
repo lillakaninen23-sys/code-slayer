@@ -6,7 +6,12 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from code_slayer.admin.hosts import LOOPBACK_TRUSTED_HOSTS, LiveTrustedHosts, exact_static_hosts
+from code_slayer.admin.hosts import (
+    LOOPBACK_TRUSTED_HOSTS,
+    LiveTrustedHosts,
+    exact_static_hosts,
+    origin_allowed,
+)
 from code_slayer.admin.tailscale import observe_self_dns_name
 from code_slayer.api.reads import ResourceNotFound
 from code_slayer.api.routes import api
@@ -49,11 +54,27 @@ def create_app(
 
     @app.before_request
     def same_origin():
-        # No permissive CORS; JSON-only mutations additionally reject cross-origin
-        # browser requests. Trusted hosts protect a loopback service from rebinding.
-        origin = request.headers.get("Origin")
-        if origin is not None and origin != request.host_url.rstrip("/"):
+        # No permissive CORS. Host is Flask TRUSTED_HOSTS (400). Origin is
+        # compared to server-owned loopback bind + observed MagicDNS, never
+        # to the HTTP backend URL. Missing Origin stays allowed for CLI.
+        host_header = request.host
+        origins = request.headers.getlist("Origin")
+        if len(origins) > 1:
             raise APIError("origin_denied", "Use the WebUI served by this backend.", 403)
+        if origins:
+            dns_name, _source = observe_self_dns_name(runner=app.config.get("TAILSCALE_RUNNER"))
+            bind_port = app.extensions["codeslayer"].persistent_config().server.port
+            if not origin_allowed(
+                origins[0],
+                host_header,
+                bind_port=bind_port,
+                observed_dns_name=dns_name,
+            ):
+                raise APIError(
+                    "origin_denied",
+                    "Use the WebUI served by this backend.",
+                    403,
+                )
         if request.headers.get("Sec-Fetch-Site") == "cross-site":
             raise APIError("origin_denied", "Cross-site requests are not supported.", 403)
 

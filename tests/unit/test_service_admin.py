@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from code_slayer.admin.hosts import exact_static_hosts
+from code_slayer.admin.hosts import exact_static_hosts, origin_allowed
 from code_slayer.admin.process import ProcessError, ProcessResult, inspect_checkout
 from code_slayer.admin.service import install_service, service_status
 from code_slayer.admin.systemd import render_user_unit
@@ -36,6 +36,7 @@ from code_slayer.config.schema import (
     CSLRConfig,
     OllamaServerConfig,
     ServerConfig,
+    TailscaleConfig,
     WorkerRuntimeConfig,
 )
 from code_slayer.config.store import load_config, save_config
@@ -1068,6 +1069,191 @@ def test_loopback_host_is_accepted(admin_app):
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/health", headers={"Host": "127.0.0.1"}).status_code == 200
     assert client.get("/api/health", headers={"Host": "localhost"}).status_code == 200
+
+
+def test_origin_allowed_helper_rejects_untrusted_and_mismatched_origins():
+    dns = "adrian-kanon.tail64e440.ts.net"
+    assert origin_allowed(
+        "http://127.0.0.1:8765", "127.0.0.1:8765",
+        bind_port=8765, observed_dns_name=dns,
+    )
+    assert origin_allowed(
+        "http://localhost:8765", "localhost:8765",
+        bind_port=8765, observed_dns_name=None,
+    )
+    assert origin_allowed(
+        "http://localhost", "localhost",
+        bind_port=8765, observed_dns_name=None,
+    )
+    assert origin_allowed(
+        "http://localhost:80", "localhost",
+        bind_port=8765, observed_dns_name=None,
+    )
+    assert origin_allowed(
+        f"https://{dns}", dns,
+        bind_port=8765, observed_dns_name=dns,
+    )
+    assert origin_allowed(
+        f"https://{dns}:443", f"{dns}:443",
+        bind_port=8765, observed_dns_name=dns + ".",
+    )
+    assert origin_allowed(
+        "http://[::1]:8765", "[::1]:8765",
+        bind_port=8765, observed_dns_name=None,
+    )
+    denied = (
+        ("http://node.ts.net", dns),
+        (f"https://{dns}", "127.0.0.1:8765"),
+        ("https://evil.invalid", dns),
+        (f"https://evil.{dns}", dns),
+        (f"https://{dns}.evil.invalid", dns),
+        (f"http://{dns}", dns),
+        (f"https://user@{dns}", dns),
+        ("null", dns),
+        (f"https://{dns}/", dns),
+        (f"https://{dns}?q=1", dns),
+        (f"https://{dns},https://evil.invalid", dns),
+        ("http://127.0.0.1:9999", "127.0.0.1:9999"),
+        ("http://127.0.0.1", "127.0.0.1:8765"),
+        ("http://localhost:8765", "127.0.0.1:8765"),
+        ("https://127.0.0.1:8765", "127.0.0.1:8765"),
+        (f"https://{dns}:8443", f"{dns}:8443"),
+        (f"https://{dns}", "localhost"),
+    )
+    for origin, host in denied:
+        assert origin_allowed(
+            origin, host, bind_port=8765, observed_dns_name=dns,
+        ) is False, origin
+    assert origin_allowed(
+        f"https://{dns}", dns, bind_port=8765, observed_dns_name=None,
+    ) is False
+    assert origin_allowed(
+        f"https://{dns}", dns, bind_port=8765, observed_dns_name="other.ts.net",
+    ) is False
+
+
+def test_browser_origin_policy_loopback_and_tailscale(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    https = f"https://{dns}"
+    application, client, config = _opened(
+        git_repo_with_commit,
+        tmp_path,
+        _tailscale_runner(_connected(dns + "."), _matching_serve(dns)),
+    )
+    try:
+        loopback = {"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765"}
+        assert client.get("/api/health", headers=loopback).status_code == 200
+        localhost = {"Host": "localhost:8765", "Origin": "http://localhost:8765"}
+        assert client.get("/api/health", headers=localhost).status_code == 200
+        assert client.get(
+            "/api/health", headers={"Host": "localhost", "Origin": "http://localhost"},
+        ).status_code == 200
+        ts = {"Host": dns, "Origin": https}
+        health = client.get("/api/health", headers=ts)
+        assert health.status_code == 200
+        assert "error" not in health.get_json()
+        assert client.get(
+            "/api/health", headers={"Host": dns, "Origin": f"http://{dns}"},
+        ).status_code == 403
+        assert client.get(
+            "/api/health", headers={"Host": dns, "Origin": "https://evil.invalid"},
+        ).status_code == 403
+        assert client.get(
+            "/api/health",
+            headers={"Host": dns, "Origin": f"https://evil.{dns}"},
+        ).status_code == 403
+        assert client.get("/api/health", headers={"Host": "evil.invalid"}).status_code == 400
+        assert client.get(
+            "/api/health",
+            headers={
+                "Host": dns,
+                "Origin": "https://evil.invalid",
+                "X-Forwarded-Proto": "https",
+            },
+        ).status_code == 403
+        assert client.get(
+            "/api/health",
+            headers={
+                "Host": "localhost",
+                "Origin": https,
+                "X-Forwarded-Host": dns,
+                "X-Forwarded-Proto": "https",
+            },
+        ).status_code == 403
+        assert client.get(
+            "/api/health",
+            headers={**ts, "Sec-Fetch-Site": "cross-site"},
+        ).status_code == 403
+        assert client.get("/api/health", headers={"Host": dns}).status_code == 200
+        enable = client.post("/api/tailscale/enable", json={}, headers=ts)
+        assert enable.status_code == 200
+        view = enable.get_json()
+        assert "error" not in view
+        assert view["enabled"] is True
+        assert view["alignment"] == "VERIFIED"
+        again = client.post("/api/tailscale/enable", json={}, headers=ts)
+        assert again.status_code == 200
+        assert again.get_json()["enabled"] is True
+        assert load_config(path=config).tailscale.enabled is True
+        assert client.get(
+            "/api/health",
+            headers={"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:80"},
+        ).status_code == 403
+        assert client.get(
+            "/api/health",
+            headers={"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765/"},
+        ).status_code == 403
+        assert client.get(
+            "/api/health", headers={"Host": dns, "Origin": "null"},
+        ).status_code == 403
+        assert client.get(
+            "/api/health",
+            headers={"Host": dns, "Origin": f"https://user:pass@{dns}"},
+        ).status_code == 403
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_config_bound_tailscale_enabled_does_not_widen_origin(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    save_config(
+        CSLRConfig(tailscale=TailscaleConfig(enabled=True)),
+        path=tmp_path / "config.toml",
+    )
+    application, client, _config = _opened(
+        git_repo_with_commit,
+        tmp_path,
+        _tailscale_runner({"BackendState": "Stopped", "Self": {}}, {}),
+        name="config.toml",
+    )
+    try:
+        assert client.get(
+            "/api/health",
+            headers={"Host": dns, "Origin": f"https://{dns}"},
+        ).status_code == 400
+        assert client.get(
+            "/api/health",
+            headers={"Host": "localhost", "Origin": f"https://{dns}"},
+        ).status_code == 403
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_origin_policy_does_not_use_backend_url_or_proxy_headers():
+    from code_slayer.admin import hosts as hosts_mod
+    from code_slayer.api import app as app_mod
+
+    src = Path(app_mod.__file__).read_text()
+    hosts_text = Path(hosts_mod.__file__).read_text()
+    assert "request.host_url" not in src
+    assert "ProxyFix" not in src
+    assert "X-Forwarded-" not in src
+    assert "X-Forwarded-" not in hosts_text
+    assert "origin_allowed(" in src
 
 
 def test_exact_tailscale_dns_host_accepted_and_config_drift_is_mismatch(
