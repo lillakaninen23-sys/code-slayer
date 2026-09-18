@@ -576,6 +576,7 @@ class ApplicationService:
                 raise APIError("not_found", "Certification run not found.", 404) from None
 
     def get_certification_evidence(self, run_id):
+        from code_slayer.planning.qualification_evidence import QualificationEvidenceError
         from code_slayer.security.evidence import SecurityEvaluationEvidenceError
 
         with self.certification() as service:
@@ -585,8 +586,36 @@ class ApplicationService:
                 raise APIError("not_found", "Certification run not found.", 404) from None
             except CertificationBlocked as exc:
                 raise APIError(exc.code, "Evidence is not available for this run.", 409) from None
-            except SecurityEvaluationEvidenceError as exc:
+            except (SecurityEvaluationEvidenceError, QualificationEvidenceError) as exc:
                 raise APIError(exc.reason, "Evidence verification failed.", 409) from None
+
+    def certification_planner_preflight(self, worker_id):
+        with self.certification() as service:
+            try:
+                return service.run_planner_preflight(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            except CertificationConflict as exc:
+                raise APIError(
+                    exc.code, "A certification run is already in progress.", 409,
+                ) from None
+
+    def start_planner_certification(self, worker_id):
+        with self.certification() as service:
+            try:
+                result = service.start_planner_certification(worker_id)
+            except KeyError:
+                raise APIError("not_found", "Worker is not registered.", 404) from None
+            except CertificationConflict as exc:
+                raise APIError(
+                    exc.code, "A certification run is already in progress.", 409,
+                ) from None
+            except CertificationBlocked as exc:
+                raise APIError(
+                    exc.code, "Preflight must succeed before certification.", 409,
+                ) from None
+        self._certification_executor.notify()
+        return result
 
     def get_certification_history(self, worker_id):
         with self.certification() as service:

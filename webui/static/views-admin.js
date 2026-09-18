@@ -316,6 +316,18 @@ export function certificationPromoteEnabled(worker, options = {}) {
   return worker?.promotion_available === true;
 }
 
+export function certificationPlannerStartEnabled(worker, options = {}) {
+  if (options.busy === true) return false;
+  if (isCertificationActive(options.activePlannerRun?.state)) return false;
+  return worker?.planner_ready_for_certification === true;
+}
+
+export function certificationPlannerPreflightEnabled(options = {}) {
+  if (options.busy === true) return false;
+  if (isCertificationActive(options.activePlannerRun?.state)) return false;
+  return true;
+}
+
 export function certificationWorkerSelectEnabled(options = {}) {
   return options.busy !== true;
 }
@@ -328,6 +340,7 @@ export function bindCertificationEvidence(evidence, runId) {
 export function clearCertificationTransient(certState) {
   certState.selectedCertificationWorker = null;
   certState.certificationActiveRun = null;
+  certState.certificationActivePlannerRun = null;
   certState.certificationHistory = null;
   certState.certificationEvidence = null;
   certState.certificationEvidenceError = null;
@@ -409,6 +422,40 @@ export function applyCertificationPoll(certState, run) {
   return true;
 }
 
+// -- Planner certification run state -- kept in its own state slice so
+// a Baseline Security run and a Planner run for the same worker can
+// never be confused with each other, per H.2's "visually and
+// semantically separate" requirement.
+
+export function beginCertificationPlannerPreflight(certState) {
+  certState.certificationActivePlannerRun = null;
+}
+
+export function acceptCertificationPlannerPreflight(certState, workerId, version) {
+  return certificationSelectionMatches(certState, workerId, version);
+}
+
+export function beginCertificationPlannerRun(certState, run) {
+  certState.certificationActivePlannerRun = run && run.run_id ? run : null;
+}
+
+export function acceptCertificationPlannerStart(certState, workerId, version, run) {
+  if (!certificationSelectionMatches(certState, workerId, version)) return false;
+  if (!run || !run.run_id) {
+    certState.certificationActivePlannerRun = null;
+    return false;
+  }
+  certState.certificationActivePlannerRun = run;
+  return true;
+}
+
+export function applyCertificationPlannerPoll(certState, run) {
+  const expected = certState.certificationActivePlannerRun?.run_id;
+  if (!expected || !run || run.run_id !== expected) return false;
+  certState.certificationActivePlannerRun = run;
+  return true;
+}
+
 export function beginCertificationEvidenceRequest(certState, runId) {
   certState.certificationEvidence = null;
   certState.certificationEvidenceError = null;
@@ -450,11 +497,11 @@ export function renderCertificationRoles(roles, futureActions) {
       return `<div class="cert-role-row" data-cert-role="${escapeHTML(role)}"><div class="model-card-top"><div class="model-title">${escapeHTML(role)}</div>${certificationStateBadge(record.status)}</div><div class="model-meta">PRODUCTION role certificate</div><div class="model-meta">outcome ${escapeHTML(record.outcome)}</div><div class="model-meta">certificate_id ${escapeHTML(record.certificate_id)}</div></div>`;
     })
     .join("");
-  const unavailable = (futureActions || []).every((item) => item && item.available === false);
-  const note = unavailable || (futureActions || []).length
-    ? '<p class="muted-text">Live role certification not available in v1.</p>'
+  const others = (futureActions || []).filter((item) => item && item.role !== "PLANNER");
+  const otherNote = others.length && others.every((item) => item.available === false)
+    ? '<p class="muted-text">Live role certification not available in v1 for this role.</p>'
     : "";
-  return `<div class="cert-panel"><div class="section-label">Role certificates</div><p class="muted-text">Role certificates are PRODUCTION state. They are not Baseline Security VALIDATION certificates.</p>${rows || '<p class="muted-text">No role certificate states returned.</p>'}${note}</div>`;
+  return `<div class="cert-panel"><div class="section-label">Role certificates</div><p class="muted-text">Role certificates are PRODUCTION state. They are not Baseline Security VALIDATION certificates.</p>${rows || '<p class="muted-text">No role certificate states returned.</p>'}${otherNote}</div>`;
 }
 
 function renderCertificationChecks(checks) {
@@ -482,7 +529,7 @@ export function renderCertificationHistory(history) {
   const validation = Array.isArray(history.validation_certificates) ? history.validation_certificates : [];
   const production = Array.isArray(history.production_certificates) ? history.production_certificates : [];
   const runRows = runs
-    .map((run) => `<div class="cert-history-row" data-cert-history-run="${escapeHTML(run.run_id)}"><div class="model-card-top"><div class="model-title">RUN ${escapeHTML(run.run_id)}</div>${certificationStateBadge(run.state)}</div><div class="model-meta">A run is not a certificate.</div><div class="model-meta">has_certificate ${escapeHTML(run.has_certificate)}</div>${run.evidence_ref ? `<button type="button" class="ghost small" data-cert-evidence="${escapeHTML(run.run_id)}">View evidence</button>` : ""}</div>`)
+    .map((run) => `<div class="cert-history-row" data-cert-history-run="${escapeHTML(run.run_id)}"><div class="model-card-top"><div class="model-title">RUN ${escapeHTML(run.run_id)}</div>${certificationStateBadge(run.state)}</div><div class="model-meta">kind ${escapeHTML(run.kind)}</div><div class="model-meta">A run is not a certificate.</div><div class="model-meta">has_certificate ${escapeHTML(run.has_certificate)}</div>${run.evidence_ref ? `<button type="button" class="ghost small" data-cert-evidence="${escapeHTML(run.run_id)}">View evidence</button>` : ""}</div>`)
     .join("");
   const certRows = (items, environment) => items
     .map((item) => `<div class="cert-history-row"><div class="model-card-top"><div class="model-title">CERTIFICATE ${escapeHTML(item.certificate_id)}</div>${certificationStateBadge(environment)}</div>${certificationStateBadge(item.outcome)}<div class="model-meta">issued_at ${escapeHTML(item.issued_at)}</div><div class="model-meta">Historical evidence is not proof of current production eligibility.</div></div>`)
@@ -549,10 +596,12 @@ export function renderCertificationWorkerDetail(worker, options = {}) {
   const startEnabled = certificationStartEnabled(worker, options);
   const preflightEnabled = certificationPreflightEnabled(options);
   const promoteEnabled = certificationPromoteEnabled(worker, options);
+  const plannerPreflightEnabled = certificationPlannerPreflightEnabled(options);
+  const plannerStartEnabled = certificationPlannerStartEnabled(worker, options);
   const correlation = (options.registryIds || []).includes(worker.worker_id)
     ? '<p class="muted-text">Also listed in the model registry (display correlation only; not evidence).</p>'
     : "";
-  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p><div class="section-label">Production Baseline Security</div><p class="muted-text">Promotion re-verifies the current VALIDATION PASS certificate against the live runtime and durable evidence, then durably records a SEPARATE PRODUCTION certificate. It never grants trust, permission, or a role certificate.</p><div class="model-meta" data-cert-promotion-available>promotion_available ${escapeHTML(worker.promotion_available)}</div><div class="model-meta" data-cert-promotion-reason>reason ${escapeHTML(worker.promotion_reason)}</div><div class="cert-actions"><button type="button" class="small" data-cert-promote="${escapeHTML(worker.worker_id)}" ${promoteEnabled ? "" : "disabled"}>Promote Baseline Security to PRODUCTION</button></div><p class="muted-text">This button reflects the backend's own promotion_available projection only. The browser never decides promotability itself.</p></div>`;
+  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p><div class="section-label">Production Baseline Security</div><p class="muted-text">Promotion re-verifies the current VALIDATION PASS certificate against the live runtime and durable evidence, then durably records a SEPARATE PRODUCTION certificate. It never grants trust, permission, or a role certificate.</p><div class="model-meta" data-cert-promotion-available>promotion_available ${escapeHTML(worker.promotion_available)}</div><div class="model-meta" data-cert-promotion-reason>reason ${escapeHTML(worker.promotion_reason)}</div><div class="cert-actions"><button type="button" class="small" data-cert-promote="${escapeHTML(worker.worker_id)}" ${promoteEnabled ? "" : "disabled"}>Promote Baseline Security to PRODUCTION</button></div><p class="muted-text">This button reflects the backend's own promotion_available projection only. The browser never decides promotability itself.</p><div class="section-label">Planner role certification</div><p class="muted-text">A separate durable job/run track from Baseline Security. A PASS records a PRODUCTION Planner role certificate directly -- there is no promote step here. This is also separate from the "Role certificates" panel above, which shows the resulting certificate, not the run.</p>${renderCertificationPreflight(worker.planner_last_preflight)}<div class="model-meta">planner_ready_for_certification ${escapeHTML(worker.planner_ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-planner-preflight="${escapeHTML(worker.worker_id)}" ${plannerPreflightEnabled ? "" : "disabled"}>Run Planner preflight</button><button type="button" class="small" data-cert-planner-start="${escapeHTML(worker.worker_id)}" ${plannerStartEnabled ? "" : "disabled"}>Start Planner certification</button></div><p class="muted-text">Closing this browser does not cancel a durable Planner run.</p></div>`;
 }
 
 

@@ -67,12 +67,27 @@ class CertificationRunsRepo:
         ).fetchone()
         return _row(row) if row is not None else None
 
-    def list_for_worker(self, worker_id: str, *, limit: int = 100) -> list[CertificationRunRow]:
-        rows = self._conn.execute(
-            "SELECT * FROM certification_runs WHERE worker_id = ? "
-            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            (worker_id, limit),
-        ).fetchall()
+    def list_for_worker(
+        self, worker_id: str, *, limit: int = 100, kind: str | None = None,
+    ) -> list[CertificationRunRow]:
+        """Every run for `worker_id`, most recent first. `kind=None`
+        (the default, unchanged from before this parameter existed)
+        returns every kind mixed together -- what `history()` wants.
+        A caller that needs "the latest run of exactly this kind"
+        (e.g. one certification track's own last-preflight display)
+        passes `kind` explicitly."""
+        if kind is None:
+            rows = self._conn.execute(
+                "SELECT * FROM certification_runs WHERE worker_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (worker_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM certification_runs WHERE worker_id = ? AND kind = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (worker_id, kind, limit),
+            ).fetchall()
         return [_row(row) for row in rows]
 
     def active_for_worker(self, worker_id: str, *, kind: str) -> CertificationRunRow | None:

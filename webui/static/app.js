@@ -62,6 +62,13 @@ import {
   certificationStartEnabled,
   certificationPreflightEnabled,
   certificationPromoteEnabled,
+  certificationPlannerStartEnabled,
+  certificationPlannerPreflightEnabled,
+  beginCertificationPlannerPreflight,
+  acceptCertificationPlannerPreflight,
+  beginCertificationPlannerRun,
+  acceptCertificationPlannerStart,
+  applyCertificationPlannerPoll,
   renderCertificationWorkers,
   renderCertificationWorkerDetail,
   renderCertificationRun,
@@ -121,6 +128,7 @@ const state = {
   selectedCertificationWorker: null,
   certificationBusy: false,
   certificationActiveRun: null,
+  certificationActivePlannerRun: null,
   certificationHistory: null,
   certificationEvidence: null,
   certificationEvidenceError: null,
@@ -148,6 +156,7 @@ const state = {
 let timer;
 let activeJobTimer;
 let certificationTimer;
+let certificationPlannerTimer;
 let selectionVersion = 0;
 
 function view(name) {
@@ -683,6 +692,18 @@ function certificationControls() {
       activeRun: state.certificationActiveRun,
     });
   });
+  document.querySelectorAll("[data-cert-planner-preflight]").forEach((el) => {
+    el.disabled = !certificationPlannerPreflightEnabled({
+      busy: state.certificationBusy,
+      activePlannerRun: state.certificationActivePlannerRun,
+    });
+  });
+  document.querySelectorAll("[data-cert-planner-start]").forEach((el) => {
+    el.disabled = !certificationPlannerStartEnabled(state.selectedCertificationWorker, {
+      busy: state.certificationBusy,
+      activePlannerRun: state.certificationActivePlannerRun,
+    });
+  });
   document.querySelectorAll("[data-cert-evidence]").forEach((el) => {
     el.disabled = busy;
   });
@@ -691,9 +712,10 @@ function renderCertificationView() {
   const workers = $("cert-workers");
   const detail = $("cert-detail");
   const run = $("cert-run");
+  const plannerRun = $("cert-planner-run");
   const evidence = $("cert-evidence");
   const badgeEl = $("cert-badge");
-  if (!workers || !detail || !run || !evidence) return;
+  if (!workers || !detail || !run || !plannerRun || !evidence) return;
   if (!state.connected || state.certificationUnavailable) {
     const message = !state.connected
       ? '<p class="notice error">Backend disconnected. Certification state is unavailable until the connection returns.</p>'
@@ -701,6 +723,7 @@ function renderCertificationView() {
     workers.innerHTML = message;
     detail.innerHTML = message;
     run.innerHTML = "";
+    plannerRun.innerHTML = "";
     evidence.innerHTML = "";
     if (badgeEl) {
       badgeEl.textContent = "UNAVAILABLE";
@@ -719,12 +742,14 @@ function renderCertificationView() {
   detail.innerHTML = renderCertificationWorkerDetail(state.selectedCertificationWorker, {
     busy: state.certificationBusy,
     activeRun: state.certificationActiveRun,
+    activePlannerRun: state.certificationActivePlannerRun,
     registryIds: state.workers.map((worker) => worker.worker_id),
   });
   if (state.selectedCertificationWorker) {
     detail.innerHTML += renderCertificationHistory(state.certificationHistory);
   }
   run.innerHTML = renderCertificationRun(state.certificationActiveRun);
+  plannerRun.innerHTML = renderCertificationRun(state.certificationActivePlannerRun);
   evidence.innerHTML = renderCertificationEvidence(
     state.certificationEvidence,
     state.certificationEvidenceError,
@@ -815,6 +840,31 @@ async function pollCertificationRun() {
     notice(error.message, true);
   }
   scheduleCertificationPoll();
+}
+function scheduleCertificationPlannerPoll() {
+  clearTimeout(certificationPlannerTimer);
+  if (!shouldContinueCertificationPoll(state.certificationActivePlannerRun)) return;
+  certificationPlannerTimer = setTimeout(() => {
+    pollCertificationPlannerRun();
+  }, certificationPollDelay(document.hidden));
+}
+async function pollCertificationPlannerRun() {
+  const runId = state.certificationActivePlannerRun?.run_id;
+  const workerId = state.selectedCertificationWorkerId;
+  const version = state.certificationSelectionVersion;
+  if (!runId) return;
+  try {
+    const run = await api.certificationRun(runId);
+    if (!applyCertificationPlannerPoll(state, run)) return;
+    renderCertificationView();
+    if (isCertificationTerminal(run.state)) {
+      if (workerId) await refreshCertificationProjection(workerId, version);
+      return;
+    }
+  } catch (error) {
+    notice(error.message, true);
+  }
+  scheduleCertificationPlannerPoll();
 }
 async function certificationAction(work, success) {
   if (state.certificationBusy) return;
@@ -1290,6 +1340,8 @@ $("cert-stack").addEventListener("click", (event) => {
   const preflightButton = event.target.closest("[data-cert-preflight]");
   const startButton = event.target.closest("[data-cert-start]");
   const promoteButton = event.target.closest("[data-cert-promote]");
+  const plannerPreflightButton = event.target.closest("[data-cert-planner-preflight]");
+  const plannerStartButton = event.target.closest("[data-cert-planner-start]");
   const evidenceButton = event.target.closest("[data-cert-evidence]");
   if (workerButton) {
     if (state.certificationBusy) return;
@@ -1361,6 +1413,56 @@ $("cert-stack").addEventListener("click", (event) => {
       if (!acceptCertificationPromotion(state, workerId, version)) return;
       await refreshCertificationProjection(workerId, version);
     }, "Baseline Security certificate promoted to PRODUCTION.");
+    return;
+  }
+  if (plannerPreflightButton) {
+    const workerId = plannerPreflightButton.dataset.certPlannerPreflight;
+    const version = state.certificationSelectionVersion;
+    if (!certificationPlannerPreflightEnabled({
+      busy: state.certificationBusy,
+      activePlannerRun: state.certificationActivePlannerRun,
+    })) return;
+    certificationAction(async () => {
+      beginCertificationPlannerPreflight(state);
+      renderCertificationView();
+      try {
+        await api.certificationPlannerPreflight(workerId);
+        if (!acceptCertificationPlannerPreflight(state, workerId, version)) return;
+        await refreshCertificationProjection(workerId, version);
+      } catch (error) {
+        if (certificationSelectionMatches(state, workerId, version)) {
+          try {
+            await refreshCertificationProjection(workerId, version);
+          } catch {
+            /* refresh already fail-closed the snapshot */
+          }
+        }
+        throw error;
+      }
+    }, "Planner certification preflight recorded.");
+    return;
+  }
+  if (plannerStartButton) {
+    const workerId = plannerStartButton.dataset.certPlannerStart;
+    const version = state.certificationSelectionVersion;
+    if (!certificationPlannerStartEnabled(state.selectedCertificationWorker, {
+      busy: state.certificationBusy,
+      activePlannerRun: state.certificationActivePlannerRun,
+    })) return;
+    certificationAction(async () => {
+      beginCertificationPlannerRun(state, null);
+      try {
+        const run = await api.startPlannerCertification(workerId);
+        if (!acceptCertificationPlannerStart(state, workerId, version, run)) return;
+        renderCertificationView();
+        scheduleCertificationPlannerPoll();
+      } catch (error) {
+        if (certificationSelectionMatches(state, workerId, version)) {
+          beginCertificationPlannerRun(state, null);
+        }
+        throw error;
+      }
+    }, "Planner certification accepted. Closing this browser does not cancel the run.");
     return;
   }
   if (evidenceButton) {

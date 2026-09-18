@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, certificationPromoteEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, acceptCertificationPromotion, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, certificationPromoteEnabled, certificationPlannerStartEnabled, certificationPlannerPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, acceptCertificationPromotion, beginCertificationPlannerPreflight, acceptCertificationPlannerPreflight, beginCertificationPlannerRun, acceptCertificationPlannerStart, applyCertificationPlannerPoll, clearCertificationTransient, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -1393,6 +1393,7 @@ const certWorker = {
   ready_for_certification: false,
   promotion_available: true,
   promotion_reason: "promotable",
+  planner_ready_for_certification: false,
   future_actions: [
     { role: "planner", available: false, reason: "live_role_certification_unavailable" },
   ],
@@ -1651,6 +1652,137 @@ test("H.1: a lost promotion response is not automatically retried", async () => 
   assert.equal(calls, 1);
   await assert.rejects(api.promoteBaselineCertification("cw1"), () => true);
   assert.equal(calls, 2);
+});
+
+test("H.2: certification GETs stay GET; planner preflight and start POST exact empty bodies", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.certificationPlannerPreflight("w/1", { outcome: "pass" });
+  await api.startPlannerCertification("w/1", { score: 1.0 });
+  assert.deepEqual(calls, [
+    ["/api/certification/workers/w%2F1/planner/preflight", "POST", {}],
+    ["/api/certification/workers/w%2F1/planner/runs", "POST", {}],
+  ]);
+});
+
+test("H.2: a lost planner certification response is not automatically retried", async () => {
+  let calls = 0;
+  const api = createAPI(async () => { calls++; throw new Error("lost response"); });
+  await assert.rejects(
+    api.startPlannerCertification("cw1"),
+    (e) => e instanceof APIError && /Refresh durable/.test(e.message),
+  );
+  assert.equal(calls, 1);
+  await assert.rejects(api.certificationPlannerPreflight("cw1"), () => true);
+  assert.equal(calls, 2);
+});
+
+test("H.2: Planner certification action is a separate track from Baseline Security and the role certificate panel", () => {
+  const ready = { ...certWorker, planner_ready_for_certification: true };
+  const html = renderCertificationWorkerDetail(ready);
+  assert.match(html, /Planner role certification/);
+  assert.match(html, /data-cert-planner-preflight="cw1"/);
+  assert.match(html, /data-cert-planner-start="cw1"/);
+  assert.doesNotMatch(html, /data-cert-planner-start="cw1" disabled/);
+  assert.match(html, /separate durable job\/run track from Baseline Security/);
+  assert.match(html, /separate from the "Role certificates" panel/);
+  assert.match(html, /there is no promote step here/);
+
+  // Backend-authoritative, same discipline as H.1's promotion gate:
+  // never inferred from baseline_security/ready_for_certification.
+  assert.equal(certificationPlannerStartEnabled(ready), true);
+  assert.equal(certificationPlannerStartEnabled(certWorker), false);
+  assert.equal(
+    certificationPlannerStartEnabled({ ...ready, planner_ready_for_certification: false }),
+    false,
+  );
+  assert.equal(certificationPlannerStartEnabled(ready, { busy: true }), false);
+  assert.equal(
+    certificationPlannerStartEnabled(ready, { activePlannerRun: { state: "RUNNING" } }),
+    false,
+  );
+  // A concurrent/active BASELINE run must not disable the Planner
+  // action -- the two tracks are independent.
+  assert.equal(
+    certificationPlannerStartEnabled(ready, { activeRun: { state: "RUNNING" } }),
+    true,
+  );
+  assert.equal(certificationPlannerPreflightEnabled(), true);
+  assert.equal(certificationPlannerPreflightEnabled({ busy: true }), false);
+  assert.equal(
+    certificationPlannerPreflightEnabled({ activePlannerRun: { state: "QUEUED" } }),
+    false,
+  );
+
+  const notReady = renderCertificationWorkerDetail(certWorker);
+  assert.match(notReady, /data-cert-planner-start="cw1" disabled/);
+});
+
+test("H.2: Planner run wiring calls the right API functions and refreshes durable state", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const preflightBlock = appSource.slice(
+    appSource.indexOf("if (plannerPreflightButton)"),
+    appSource.indexOf("if (plannerStartButton)"),
+  );
+  assert.match(preflightBlock, /api\.certificationPlannerPreflight\(workerId\)/);
+  assert.match(preflightBlock, /acceptCertificationPlannerPreflight\(state, workerId, version\)/);
+  assert.match(preflightBlock, /refreshCertificationProjection\(workerId, version\)/);
+  const startBlock = appSource.slice(
+    appSource.indexOf("if (plannerStartButton)"),
+    appSource.indexOf("if (evidenceButton)"),
+  );
+  assert.match(startBlock, /api\.startPlannerCertification\(workerId\)/);
+  assert.match(startBlock, /acceptCertificationPlannerStart\(state, workerId, version, run\)/);
+  assert.match(startBlock, /scheduleCertificationPlannerPoll\(\)/);
+  assert.equal((appSource.match(/startPlannerCertification/g) || []).length, 1);
+  assert.equal((appSource.match(/certificationPlannerPreflight\(/g) || []).length, 1);
+});
+
+test("H.2: worker reselection cannot bind a Planner run/preflight response to the wrong worker", () => {
+  const certState = {};
+  const versionA = selectCertificationWorkerId(certState, "a");
+  selectCertificationWorkerId(certState, "b");
+  assert.equal(certificationSelectionMatches(certState, "a", versionA), false);
+  assert.equal(acceptCertificationPlannerPreflight(certState, "a", versionA), false);
+  assert.equal(acceptCertificationPlannerStart(certState, "a", versionA, {
+    run_id: "planner-run-a",
+    worker_id: "a",
+    state: "QUEUED",
+  }), false);
+  assert.notEqual(certState.certificationActivePlannerRun?.run_id, "planner-run-a");
+  assert.equal(certState.selectedCertificationWorkerId, "b");
+  const versionB = certState.certificationSelectionVersion;
+  assert.equal(acceptCertificationPlannerStart(certState, "b", versionB, {
+    run_id: "planner-run-b",
+    worker_id: "b",
+    state: "QUEUED",
+  }), true);
+  assert.equal(certState.certificationActivePlannerRun.run_id, "planner-run-b");
+});
+
+test("H.2: reselecting a worker clears the prior Planner run display without dropping the Baseline one's own guard", () => {
+  const certState = {
+    selectedCertificationWorkerId: "cw1",
+    certificationActiveRun: { run_id: "baseline-run-1", state: "RUNNING" },
+    certificationActivePlannerRun: { run_id: "planner-run-1", state: "RUNNING" },
+  };
+  selectCertificationWorkerId(certState, "cw2");
+  assert.equal(certState.certificationActiveRun, null);
+  assert.equal(certState.certificationActivePlannerRun, null);
+});
+
+test("H.2: applyCertificationPlannerPoll never binds a response to the wrong run or worker's baseline run", () => {
+  const certState = { certificationActivePlannerRun: { run_id: "planner-run-1", state: "RUNNING" } };
+  assert.equal(
+    applyCertificationPlannerPoll(certState, { run_id: "baseline-run-1", state: "PASS" }),
+    false,
+  );
+  assert.equal(certState.certificationActivePlannerRun.run_id, "planner-run-1");
+  assert.equal(
+    applyCertificationPlannerPoll(certState, { run_id: "planner-run-1", state: "PASS" }),
+    true,
+  );
+  assert.equal(certState.certificationActivePlannerRun.state, "PASS");
 });
 
 test("certification polling continues for QUEUED/RUNNING and stops for terminal states", () => {

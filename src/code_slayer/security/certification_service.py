@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from code_slayer.planning.qualification_evidence import read_planner_qualification_evidence
 from code_slayer.security.evidence import (
     read_baseline_security_evidence,
 )
@@ -29,6 +30,10 @@ from code_slayer.security.live_certification import (
     LiveOllamaRuntimeExpectation,
     certify_live_baseline_security,
     verify_ollama_runtime,
+)
+from code_slayer.security.live_planner_certification import (
+    ROLE_LAYER_ELIGIBILITY_REASONS,
+    certify_live_planner_role,
 )
 from code_slayer.store import db, location
 from code_slayer.store.baseline_security_certificates_repo import (
@@ -48,6 +53,7 @@ from code_slayer.workers.security_baseline import (
 )
 
 KIND_BASELINE = "baseline_security"
+KIND_PLANNER = "planner_role"
 ENVIRONMENT_VALIDATION = "VALIDATION"
 ENVIRONMENT_PRODUCTION = "PRODUCTION"
 
@@ -63,6 +69,18 @@ PREFLIGHT_CHECKS = (
     "isolated_certification_db",
     "isolated_evidence_directory",
     "production_state_unmodified",
+)
+
+PLANNER_PREFLIGHT_CHECKS = (
+    "worker_registration",
+    "runtime_profile",
+    "role_target_configured",
+    "ollama_reachable",
+    "ollama_version",
+    "model_name",
+    "digest_matches",
+    "runtime_fingerprint",
+    "production_baseline_security",
 )
 
 
@@ -206,6 +224,15 @@ class CertificationService:
             worker_id, kind=KIND_BASELINE,
         )
         promotion = self._promotion_availability(worker_id, target)
+        planner_ready = CertificationRunsRepo(self.validation_conn()).latest_ready(
+            worker_id, kind=KIND_PLANNER,
+        )
+        planner_active = CertificationRunsRepo(self.validation_conn()).active_for_worker(
+            worker_id, kind=KIND_PLANNER,
+        )
+        planner_available = planner_ready is not None and not (
+            planner_active is not None and planner_active.state in ("QUEUED", "RUNNING")
+        )
         return {
             "worker_id": worker.worker_id,
             "kind": worker.kind,
@@ -218,11 +245,20 @@ class CertificationService:
             "ready_for_certification": ready is not None,
             "promotion_available": promotion.available,
             "promotion_reason": promotion.reason,
+            "planner_ready_for_certification": planner_available,
             "future_actions": [
                 {
                     "role": role.value,
-                    "available": False,
-                    "reason": "live_role_certification_unavailable",
+                    "available": (
+                        planner_available if role == ProductionRole.PLANNER else False
+                    ),
+                    "reason": (
+                        "ready_for_certification"
+                        if role == ProductionRole.PLANNER and planner_available
+                        else "planner_preflight_required"
+                        if role == ProductionRole.PLANNER
+                        else "live_role_certification_unavailable"
+                    ),
                 }
                 for role in ProductionRole
             ],
@@ -283,12 +319,30 @@ class CertificationService:
                 "ready": last.state == "READY",
                 "checks": self._preflight_checks_from(last),
             }
+        planner_last = self._latest_run_row(worker_id, kind=KIND_PLANNER)
+        planner_last_preflight = None
+        if planner_last is not None:
+            planner_last_preflight = {
+                "run_id": planner_last.run_id,
+                "state": planner_last.state,
+                "ready": planner_last.state == "READY",
+                "checks": self._preflight_checks_from(planner_last),
+            }
+        planner_active = CertificationRunsRepo(self.validation_conn()).active_for_worker(
+            worker_id, kind=KIND_PLANNER,
+        )
         return {
             **summary,
             "identity": identity,
             "history": self.history(worker_id),
             "last_preflight": last_preflight,
             "ready_for_certification": summary["ready_for_certification"],
+            "planner_last_preflight": planner_last_preflight,
+            "planner_active_run": (
+                self._run_projection(planner_active)
+                if planner_active is not None and planner_active.state in ("QUEUED", "RUNNING")
+                else None
+            ),
         }
 
     def _runtime_status(self, worker_id: str, target: BaselineCertificationTarget | None) -> dict:
@@ -490,9 +544,9 @@ class CertificationService:
     def _ensure_validation_db(self) -> None:
         self.validation_conn()
 
-    def _latest_run_row(self, worker_id: str):
+    def _latest_run_row(self, worker_id: str, *, kind: str = KIND_BASELINE):
         rows = CertificationRunsRepo(self.validation_conn()).list_for_worker(
-            worker_id, limit=1,
+            worker_id, limit=1, kind=kind,
         )
         return rows[0] if rows else None
 
@@ -682,6 +736,188 @@ class CertificationService:
                 raise CertificationBlocked("preflight_required") from exc
         return self._run_projection(row)
 
+    def _planner_baseline_security_check(
+        self, worker_id: str, expectation, role_target, fingerprint: str | None,
+    ) -> dict:
+        """H.2: the `production_baseline_security` preflight check --
+        consults the EXISTING `evaluate_production_eligibility()`
+        evaluator rather than a fourth reimplementation of certificate
+        matching. See `security.live_planner_certification`'s own
+        docstring (pre-condition 5) for the exact reason vocabulary."""
+        if expectation is None or role_target is None or fingerprint is None:
+            return _check(
+                "production_baseline_security", False, "runtime_profile_not_configured",
+            )
+        try:
+            profile = runtime_profile_identity_from_config(
+                model_tag=expectation.model_tag,
+                model_digest=expectation.model_digest,
+                endpoint=expectation.openai_base_url,
+                runtime_version=expectation.runtime_version,
+                effective_context_tokens=expectation.effective_context_tokens,
+                temperature=float(expectation.temperature),
+                normalizer_id=expectation.normalizer_id,
+                normalizer_version=expectation.normalizer_version,
+            )
+            role_evaluation = role_evaluation_identity_from_config(
+                role=ProductionRole.PLANNER,
+                runtime_identity_fingerprint=fingerprint,
+                output_token_budget=role_target.output_token_budget,
+                tool_choice_enforcement=role_target.tool_choice_enforcement,
+                policy_version=role_target.policy_version,
+            )
+        except (TypeError, ValueError) as exc:
+            return _check("production_baseline_security", False, str(exc))
+        decision = evaluate_production_eligibility(
+            self.production_conn(),
+            worker_id=worker_id,
+            role=ProductionRole.PLANNER,
+            runtime_profile=profile,
+            role_evaluation=role_evaluation,
+            expected_role_policy_version=role_target.policy_version,
+        )
+        ok = decision.eligible or decision.reason in ROLE_LAYER_ELIGIBILITY_REASONS
+        return _check("production_baseline_security", ok, decision.reason)
+
+    def run_planner_preflight(self, worker_id: str) -> dict:
+        checks: list[dict] = []
+        worker = WorkersRepo(self.production_conn()).get(worker_id)
+        if worker is None:
+            raise KeyError(worker_id)
+        active = CertificationRunsRepo(self.validation_conn()).active_for_worker(
+            worker_id, kind=KIND_PLANNER,
+        )
+        if active is not None and active.state in ("QUEUED", "RUNNING"):
+            raise CertificationConflict("certification_already_in_progress", active.run_id)
+        checks.append(_check("worker_registration", True))
+        target = self.target_for(worker_id)
+        checks.append(_check(
+            "runtime_profile", target is not None,
+            "" if target is not None else "runtime_profile_not_configured",
+        ))
+        role_target = self._role_targets.get((worker_id, ProductionRole.PLANNER))
+        checks.append(_check(
+            "role_target_configured", role_target is not None,
+            "" if role_target is not None else "role_evaluation_not_configured",
+        ))
+        production_before = self._production_fingerprint()
+
+        expectation = None
+        fingerprint = None
+        if target is not None:
+            expectation = target.expectation
+            try:
+                profile = runtime_profile_identity_from_config(
+                    model_tag=expectation.model_tag,
+                    model_digest=expectation.model_digest,
+                    endpoint=expectation.openai_base_url,
+                    runtime_version=expectation.runtime_version,
+                    effective_context_tokens=expectation.effective_context_tokens,
+                    temperature=float(expectation.temperature),
+                    normalizer_id=expectation.normalizer_id,
+                    normalizer_version=expectation.normalizer_version,
+                )
+                fingerprint = profile.runtime_identity_fingerprint
+                fingerprint_ok = fingerprint == expectation.expected_runtime_identity_fingerprint
+                checks.append(_check("runtime_fingerprint", fingerprint_ok, fingerprint))
+            except (TypeError, ValueError) as exc:
+                checks.append(_check("runtime_fingerprint", False, str(exc)))
+            try:
+                version, digest = verify_ollama_runtime(expectation)
+                checks.append(_check("ollama_reachable", True))
+                checks.append(_check("ollama_version", True, version))
+                checks.append(_check("model_name", True, expectation.model_tag))
+                checks.append(_check("digest_matches", True, digest))
+            except ValueError as exc:
+                reason = str(exc) or "runtime_probe_unavailable"
+                reachable = reason not in {
+                    "runtime_probe_unavailable",
+                    "runtime_probe_redirect",
+                    "runtime_probe_response_too_large",
+                    "runtime_probe_malformed_json",
+                }
+                checks.append(_check("ollama_reachable", reachable, reason))
+                checks.append(_check(
+                    "ollama_version", reason != "runtime_version_mismatch", reason,
+                ))
+                checks.append(_check(
+                    "model_name",
+                    reason not in {"runtime_model_missing", "runtime_model_duplicate"},
+                    reason,
+                ))
+                checks.append(_check(
+                    "digest_matches", reason != "runtime_model_digest_mismatch", reason,
+                ))
+
+        checks.append(
+            self._planner_baseline_security_check(worker_id, expectation, role_target, fingerprint),
+        )
+
+        named = {item["name"]: item for item in checks}
+        ordered = [_ensure_named(named, name) for name in PLANNER_PREFLIGHT_CHECKS]
+        ready = all(item["ok"] for item in ordered)
+        self._ensure_validation_worker(worker_id)
+        state = "READY" if ready else "INCOMPLETE"
+        reason = "ready_for_certification" if ready else "preflight_blocked"
+        now = utcnow_iso()
+        with transaction(self.validation_conn()):
+            runs = CertificationRunsRepo(self.validation_conn())
+            runs.supersede_ready_in_transaction(worker_id, kind=KIND_PLANNER, now=now)
+            row = runs.create_in_transaction(
+                run_id=uuid.uuid4().hex,
+                worker_id=worker_id,
+                kind=KIND_PLANNER,
+                environment=ENVIRONMENT_VALIDATION,
+                state=state,
+                created_at=now,
+                preflight_json=json.dumps(ordered),
+                reason=reason,
+                expected_runtime_identity_fingerprint=(
+                    expectation.expected_runtime_identity_fingerprint if expectation else None
+                ),
+                model_tag=expectation.model_tag if expectation else None,
+                model_digest=expectation.model_digest if expectation else None,
+                ollama_root=expectation.normalized_ollama_root if expectation else None,
+            )
+        production_after = self._production_fingerprint()
+        if production_before != production_after:
+            raise RuntimeError("production_state_modified_by_preflight")
+        projection = self._run_projection(row)
+        projection["ready"] = ready
+        projection["checks"] = ordered
+        return projection
+
+    def start_planner_certification(self, worker_id: str) -> dict:
+        worker = WorkersRepo(self.production_conn()).get(worker_id)
+        if worker is None:
+            raise KeyError(worker_id)
+        self._ensure_validation_worker(worker_id)
+        repo = CertificationRunsRepo(self.validation_conn())
+        now = utcnow_iso()
+        with transaction(self.validation_conn()):
+            active = repo.active_for_worker(worker_id, kind=KIND_PLANNER)
+            if active is not None and active.state in ("QUEUED", "RUNNING"):
+                raise CertificationConflict("certification_already_in_progress", active.run_id)
+            ready = repo.latest_ready(worker_id, kind=KIND_PLANNER)
+            if ready is None or ready.state != "READY":
+                raise CertificationBlocked("preflight_required")
+            try:
+                checks = json.loads(ready.preflight_json)
+            except json.JSONDecodeError:
+                checks = []
+            if not checks or not all(item.get("ok") for item in checks):
+                raise CertificationBlocked("preflight_blocked")
+            try:
+                row = repo.queue_in_transaction(ready.run_id, now=now)
+            except KeyError as exc:
+                active_now = repo.active_for_worker(worker_id, kind=KIND_PLANNER)
+                if active_now is not None and active_now.state in ("QUEUED", "RUNNING"):
+                    raise CertificationConflict(
+                        "certification_already_in_progress", active_now.run_id,
+                    ) from exc
+                raise CertificationBlocked("preflight_required") from exc
+        return self._run_projection(row)
+
     def promote_to_production(self, worker_id: str) -> dict:
         """H.1: re-verify and durably carry forward one `PASS` VALIDATION
         Baseline Security certificate into PRODUCTION. See `code_slayer.
@@ -735,18 +971,33 @@ class CertificationService:
         row = CertificationRunsRepo(self.validation_conn()).get_or_none(run_id)
         if row is None:
             raise KeyError(run_id)
-        if not row.evidence_ref:
-            raise CertificationBlocked("missing_durable_security_evidence")
         expected = row.expected_runtime_identity_fingerprint
-        document = read_baseline_security_evidence(
-            self.validation_conn(),
-            self.validation_paths()["blobs"],
-            row.evidence_ref,
-            expected_runtime_identity_fingerprint=expected,
-        )
+        if row.kind == KIND_PLANNER:
+            if not row.evidence_ref:
+                raise CertificationBlocked("missing_durable_qualification_evidence")
+            # Planner evidence is written directly to PRODUCTION (H.2 has
+            # no VALIDATION/PRODUCTION split for role certificates) --
+            # only the run/preflight bookkeeping row lives in VALIDATION.
+            document = read_planner_qualification_evidence(
+                self.production_conn(),
+                self.production_paths()["blobs"],
+                row.evidence_ref,
+                expected_runtime_identity_fingerprint=expected,
+            )
+            environment = ENVIRONMENT_PRODUCTION
+        else:
+            if not row.evidence_ref:
+                raise CertificationBlocked("missing_durable_security_evidence")
+            document = read_baseline_security_evidence(
+                self.validation_conn(),
+                self.validation_paths()["blobs"],
+                row.evidence_ref,
+                expected_runtime_identity_fingerprint=expected,
+            )
+            environment = ENVIRONMENT_VALIDATION
         return {
             "run_id": run_id,
-            "environment": ENVIRONMENT_VALIDATION,
+            "environment": environment,
             "evidence_ref": row.evidence_ref,
             "document": document,
         }
@@ -765,6 +1016,9 @@ class CertificationService:
             )
 
     def execute_claimed_run(self, claimed) -> None:
+        if claimed.kind == KIND_PLANNER:
+            self._execute_claimed_planner_run(claimed)
+            return
         target = self.target_for(claimed.worker_id)
         repo = CertificationRunsRepo(self.validation_conn())
         if target is None:
@@ -800,6 +1054,54 @@ class CertificationService:
                 certificate_id=result.certificate_id,
                 evidence_ref=result.evaluation_evidence_ref,
                 hard_disqualifiers_json=hard,
+            )
+
+    def _execute_claimed_planner_run(self, claimed) -> None:
+        """H.2: unlike Baseline Security, the certificate write (and its
+        evidence) lands directly in PRODUCTION -- only this run/
+        bookkeeping row lives in VALIDATION. See `security.
+        live_planner_certification`'s own docstring for why."""
+        target = self.target_for(claimed.worker_id)
+        role_target = self._role_targets.get((claimed.worker_id, ProductionRole.PLANNER))
+        repo = CertificationRunsRepo(self.validation_conn())
+        if target is None or role_target is None:
+            with transaction(self.validation_conn()):
+                repo.finish_in_transaction(
+                    claimed.run_id,
+                    state="INCOMPLETE",
+                    expected_generation=claimed.owner_generation,
+                    now=utcnow_iso(),
+                    reason=(
+                        "runtime_profile_not_configured"
+                        if target is None
+                        else "role_evaluation_not_configured"
+                    ),
+                )
+            return
+        result = certify_live_planner_role(
+            self.production_conn(),
+            worker_id=claimed.worker_id,
+            blobs_dir=self.production_paths()["blobs"],
+            expected=target.expectation,
+            output_token_budget=role_target.output_token_budget,
+            tool_choice_enforcement=role_target.tool_choice_enforcement,
+            policy_version=role_target.policy_version,
+        )
+        if result.ok and result.outcome is not None:
+            state = result.outcome.value
+            reason = result.reason
+        else:
+            state = "INCOMPLETE"
+            reason = result.reason
+        with transaction(self.validation_conn()):
+            repo.finish_in_transaction(
+                claimed.run_id,
+                state=state,
+                expected_generation=claimed.owner_generation,
+                now=utcnow_iso(),
+                reason=reason,
+                certificate_id=result.certificate_id,
+                evidence_ref=result.evidence_ref,
             )
 
     def fail_claimed_run(self, claimed, reason: str) -> None:

@@ -195,23 +195,29 @@ remain emergency wiring only.
 | Method / path | Returns |
 | --- | --- |
 | `GET /api/certification/workers` | `{environment: "VALIDATION", workers: [...]}` compact status: runtime `VERIFIED`/`MISMATCH`/`UNREACHABLE`/`UNKNOWN` from last durable preflight (never a live probe on GET), Baseline Security from **validation** certificates (`CERTIFIED`/`FAILED`/`NOT_CERTIFIED`), role certificates from production (`CERTIFIED`/`NOT_CERTIFIED`), production eligibility from `evaluate_production_eligibility` (`ELIGIBLE`/`BLOCKED` plus the evaluator's reason) |
-| `GET /api/certification/workers/{id}` | Worker detail: identity with `CONFIG_BOUND` vs `LIVE_ATTESTED` sources (`effective_context_tokens` is config-bound and `measured_by_ollama: false`), last durable preflight, history, `ready_for_certification` |
+| `GET /api/certification/workers/{id}` | Worker detail: identity with `CONFIG_BOUND` vs `LIVE_ATTESTED` sources (`effective_context_tokens` is config-bound and `measured_by_ollama: false`), last durable preflight, history, `ready_for_certification`, and (H.2) `planner_last_preflight`/`planner_ready_for_certification` — a separate durable-run track, never merged with the Baseline Security fields above or with `roles.PLANNER` (the resulting certificate) |
 | `POST /api/certification/workers/{id}/baseline/preflight` | `{ }` only. Probes Ollama version/tags; **never infers**. Writes a durable READY or INCOMPLETE run. Failed preflight cannot be started. Digest mismatch cannot be started |
 | `POST /api/certification/workers/{id}/baseline/runs` | `{ }` only → **202** `{run_id, state: "QUEUED", ...}` and `Location`. Delegates to `certify_live_baseline_security`. One in-flight attempt; a second POST returns `409 certification_already_in_progress`. Closing the browser does not cancel the run. GET on this path does not start a run |
 | `GET /api/certification/runs/{id}` | Durable run projection. Poll after 202. Progress is derived from run state. Incomplete runs have `has_certificate: false` |
 | `GET /api/certification/runs/{id}/evidence` | Evidence reread through `read_baseline_security_evidence` from the validation ContentStore. `409` if missing/unverified |
 | `GET /api/certification/workers/{id}/history` | `{runs, validation_certificates, production_certificates}` — a run is not a certificate |
 | `POST /api/certification/workers/{id}/baseline/promote` (H.1) | `{ }` only → `{environment: "PRODUCTION", validation_certificate_id, production_certificate_id, runtime_identity_fingerprint, evidence_ref}`. Re-verifies the current live runtime, the most recent matching `PASS` VALIDATION certificate, and its durable evidence, then calls `record_baseline_certificate()` against PRODUCTION state with that same evidence. `409` (with a specific reason code, e.g. `no_validation_certificate`, `validation_certificate_not_pass`, `runtime_identity_fingerprint_mismatch`, `runtime_model_digest_mismatch`, `runtime_version_mismatch`, or an evidence-verification reason) on any fail-closed check. Grants no trust, permission, or role certificate — see `security.production_promotion` |
+| `POST /api/certification/workers/{id}/planner/preflight` (H.2) | `{ }` only. Live-probes Ollama, then consults the EXISTING `evaluate_production_eligibility()` evaluator to check for a matching, current `PASS` PRODUCTION Baseline Security certificate (a baseline-layer denial blocks; a role-layer denial, e.g. `no_role_certificate`, is the expected pre-certification state and does not). Writes a durable READY or INCOMPLETE run (kind `planner_role`) in the same isolated VALIDATION run-tracking table Baseline Security preflight uses — never a live model call |
+| `POST /api/certification/workers/{id}/planner/runs` (H.2) | `{ }` only → **202** `{run_id, state: "QUEUED", ...}` and `Location`. Delegates to `security.live_planner_certification.certify_live_planner_role()`, which runs the fixed `planner-live-qualification-v1` task suite through the EXISTING `planning.qualification.run_corrected_planner_case()`/`planning.planner_certification.certify_planner_from_qualification()` machinery — no second qualification harness. **A PASS records the `worker_role_certificates` row DIRECTLY in PRODUCTION** — unlike Baseline Security, a role certificate has no VALIDATION/PRODUCTION split and there is no separate promote step. FAIL/incomplete/transport-only-failure never mints a PASS. One in-flight attempt; a second POST returns `409 certification_already_in_progress`. Closing the browser does not cancel the run |
 
-Live Planner/Coder/Reviewer/Repairer/Security certification is not available
-in v1 (`future_actions[].available: false`). PASS, FAIL, and HARD_DISQUALIFIED
-all record a validation certificate; INCOMPLETE does not. Baseline Security
-PRODUCTION certificates exist ONLY via explicit promotion of an already-`PASS`
-VALIDATION certificate (H.1); nothing writes one implicitly. None of these
-routes grant trust, permissions, or production eligibility directly — a
-promoted PRODUCTION Baseline Security certificate is still only one of the
-independent inputs `evaluate_production_eligibility` combines with a
-separately-issued role certificate.
+Live Coder/Reviewer/Repairer/Security certification is not available in v1
+(`future_actions[].available: false` for those roles). Planner live
+certification is available (H.2) — `future_actions[role=="PLANNER"]`
+reflects the SAME `planner_ready_for_certification` field the worker
+projection already carries, never a client-side inference. PASS, FAIL, and
+HARD_DISQUALIFIED all record a validation certificate; INCOMPLETE does not.
+Baseline Security PRODUCTION certificates exist ONLY via explicit promotion
+of an already-`PASS` VALIDATION certificate (H.1); nothing writes one
+implicitly. None of these routes grant trust, permissions, or production
+eligibility directly — a promoted PRODUCTION Baseline Security certificate,
+and a PASS Planner role certificate, are each still only one of the
+independent inputs `evaluate_production_eligibility` combines with the
+other.
 
 Normal Certification Center startup reads workers/runtime identity from
 persistent config. `CODESLAYER_CERT_*` and `--runtime-factory` are emergency
@@ -354,16 +360,23 @@ authorizes no execution, no mutation, and no command,
 `/api/permissions*` can only decide on or revoke a permission
 request/grant a trusted backend subsystem already created — never mint
 one, and never accept anything beyond `{decision}` / `{}` in a mutating
-body — and `/api/certification*` never accepts an outcome, evidence
-reference, adapter, digest, fingerprint, certificate id, or
-hard-disqualifier list. Live Baseline Security certification writes only
-to isolated validation state. The one exception is the explicit H.1
-promotion action (`POST /api/certification/workers/{id}/baseline/promote`),
-which durably re-verifies and carries an already-`PASS` VALIDATION
-certificate forward into PRODUCTION state — still with an empty `{}`
-body, still never a client-supplied outcome/evidence/certificate id, and
-still never itself a grant of trust, permissions, or a role certificate
-(see `security.production_promotion`).
+body — and `/api/certification*` never accepts an outcome, score,
+pass/fail, evidence reference, adapter, digest, fingerprint, certificate
+id, role-policy identity, or test results. Live Baseline Security
+certification writes only to isolated validation state. The one
+exception is the explicit H.1 promotion action
+(`POST /api/certification/workers/{id}/baseline/promote`), which durably
+re-verifies and carries an already-`PASS` VALIDATION certificate forward
+into PRODUCTION state — still with an empty `{}` body, still never a
+client-supplied outcome/evidence/certificate id, and still never itself a
+grant of trust, permissions, or a role certificate (see `security.
+production_promotion`). H.2's Planner certification routes
+(`POST /api/certification/workers/{id}/planner/preflight` and
+`.../planner/runs`) are the same closed-set `{}`-only shape; a PASS run
+records a PRODUCTION role certificate directly (see `security.
+live_planner_certification`), still never itself a grant of trust or
+permissions, and production eligibility is still computed only by the
+unmodified `evaluate_production_eligibility()`.
 `/api/runtime*` never accepts a client-supplied digest or fingerprint;
 `/api/system*` and `/api/tailscale*` map only to fixed argv tuples,
 never a shell string.

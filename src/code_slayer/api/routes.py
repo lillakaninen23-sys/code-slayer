@@ -430,6 +430,30 @@ def certification_promote(worker_id):
     return jsonify(service().promote_baseline_certification(worker_id))
 
 
+@api.post("/certification/workers/<worker_id>/planner/preflight")
+def certification_planner_preflight(worker_id):
+    # H.2: live Planner role certification preflight. `{ }` only --
+    # never a client-supplied outcome, digest, fingerprint, or
+    # role-policy identity.
+    body({})
+    return jsonify(service().certification_planner_preflight(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/planner/runs")
+def certification_planner_start(worker_id):
+    # H.2: starts a durable Planner qualification run. A PASS records a
+    # PRODUCTION `worker_role_certificates` row directly -- there is no
+    # separate promote step for a role certificate (see `security.
+    # live_planner_certification`'s own docstring). Closing the browser
+    # does not cancel the run.
+    body({})
+    result = service().start_planner_certification(worker_id)
+    response = jsonify(result)
+    response.status_code = 202
+    response.headers["Location"] = "/api/certification/runs/" + result["run_id"]
+    return response
+
+
 @api.get("/certification/runs/<run_id>")
 def certification_run(run_id):
     return jsonify(service().get_certification_run(run_id))
