@@ -6,6 +6,8 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
+from code_slayer.admin.hosts import LOOPBACK_TRUSTED_HOSTS, LiveTrustedHosts, exact_static_hosts
+from code_slayer.admin.tailscale import observe_self_dns_name
 from code_slayer.api.reads import ResourceNotFound
 from code_slayer.api.routes import api
 from code_slayer.api.service import APIError, ApplicationService
@@ -19,12 +21,23 @@ def create_app(
     state_root=None,
     webui_dir=None,
     bindings=None,
-    trusted_hosts=("127.0.0.1", "localhost", "[::1]"),
+    trusted_hosts=LOOPBACK_TRUSTED_HOSTS,
     config_path=None,
     load_persistent_config=False,
+    tailscale_runner=None,
 ):
     app = Flask(__name__, static_folder=None)
-    app.config.update(MAX_CONTENT_LENGTH=65536, TRUSTED_HOSTS=list(trusted_hosts))
+    static = exact_static_hosts(trusted_hosts)
+
+    def _tailscale_host():
+        return observe_self_dns_name(runner=tailscale_runner)
+
+    app.config.update(
+        MAX_CONTENT_LENGTH=65536,
+        TRUSTED_HOSTS=LiveTrustedHosts(static, observer=_tailscale_host),
+        STATIC_TRUSTED_HOSTS=static,
+        TAILSCALE_RUNNER=tailscale_runner,
+    )
     app.extensions["codeslayer"] = ApplicationService(
         repo_path,
         state_root=state_root,

@@ -150,6 +150,7 @@ def serve(repo, webui_dir, host, port, trusted_host, runtime_factory):
 
     from waitress import serve as wsgi_serve
 
+    from code_slayer.admin.hosts import LOOPBACK_TRUSTED_HOSTS, exact_static_hosts
     from code_slayer.api import create_app
     from code_slayer.api.service import RuntimeBindings
     from code_slayer.config.schema import LOOPBACK_HOSTS
@@ -176,11 +177,15 @@ def serve(repo, webui_dir, host, port, trusted_host, runtime_factory):
         bindings = getattr(import_module(module), name)()
         if not isinstance(bindings, RuntimeBindings):
             raise click.ClickException("runtime-factory must return RuntimeBindings")
+    try:
+        trusted = exact_static_hosts((*LOOPBACK_TRUSTED_HOSTS, *trusted_host))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
     app = create_app(
         checkout,
         webui_dir=resolved_webui,
         bindings=bindings,
-        trusted_hosts=("127.0.0.1", "localhost", "[::1]", *trusted_host),
+        trusted_hosts=trusted,
         load_persistent_config=True,
     )
     click.echo(f"Code Slayer API: http://{bind_host}:{bind_port}")

@@ -14,10 +14,11 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from code_slayer.admin.hosts import exact_static_hosts
 from code_slayer.admin.process import ProcessError, ProcessResult, inspect_checkout
 from code_slayer.admin.service import install_service, service_status
 from code_slayer.admin.systemd import render_user_unit
-from code_slayer.admin.tailscale import enable_serve
+from code_slayer.admin.tailscale import enable_serve, intent_alignment
 from code_slayer.admin.tailscale import status as tailscale_status
 from code_slayer.admin.updates import apply_update, check_for_update
 from code_slayer.api import create_app
@@ -757,6 +758,8 @@ def test_tailscale_never_funnel_and_loopback_only():
     assert "funnel" not in captured[0]
     with pytest.raises(ProcessError, match="loopback"):
         enable_serve(runner=runner, backend_host="0.0.0.0", backend_port=8765)
+    with pytest.raises(ProcessError, match="loopback"):
+        enable_serve(runner=runner, backend_host="100.64.1.2", backend_port=8765)
 
 
 def _tailscale_runner(node_doc, serve_doc, *, serve_code=0, serve_raw=None):
@@ -822,6 +825,9 @@ def test_tailscale_correct_serve_backend_is_verified():
     assert view.remote_access == "VERIFIED"
     assert view.node_state == "Connected"
     assert view.funnel_detected is False
+    assert view.host_accepted is True
+    assert view.dns_name == "node.ts.net"
+    assert view.dns_name_source == "VERIFIED"
     assert _normalize_check(view.observed_backend) == "http://127.0.0.1:8765"
 
 
@@ -870,6 +876,179 @@ def test_tailscale_funnel_mapping_is_mismatch_not_verified():
     assert view.funnel_detected is True
     assert view.serve_status == "MISMATCH"
     assert view.remote_access != "VERIFIED"
+    assert view.remote_access == "MISMATCH"
+
+
+def _connected(dns="adrian-kanon.tail64e440.ts.net."):
+    return {"BackendState": "Running", "Self": {"DNSName": dns}}
+
+
+def _matching_serve(dns="adrian-kanon.tail64e440.ts.net"):
+    return {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {
+            f"{dns}:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8765"}},
+            },
+        },
+    }
+
+
+def test_static_trusted_hosts_reject_wildcards_and_tailscale_ips():
+    with pytest.raises(ValueError):
+        exact_static_hosts([".ts.net"])
+    with pytest.raises(ValueError):
+        exact_static_hosts(["*"])
+    with pytest.raises(ValueError):
+        exact_static_hosts(["100.64.1.2"])
+    hosts = exact_static_hosts(["127.0.0.1", "localhost", "[::1]"])
+    assert all(not item.startswith(".") for item in hosts)
+    assert "*" not in hosts
+
+
+def test_loopback_host_is_accepted(admin_app):
+    client, _app, _config, _repo = admin_app
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/health", headers={"Host": "127.0.0.1"}).status_code == 200
+    assert client.get("/api/health", headers={"Host": "localhost"}).status_code == 200
+
+
+def test_exact_tailscale_dns_host_accepted_and_config_drift_is_mismatch(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    application = create_app(
+        git_repo_with_commit,
+        config_path=tmp_path / "config.toml",
+        load_persistent_config=True,
+        tailscale_runner=_tailscale_runner(_connected(dns + "."), _matching_serve(dns)),
+    )
+    try:
+        client = application.test_client()
+        assert client.get("/api/health", headers={"Host": dns}).status_code == 200
+        assert client.get("/api/health", headers={"Host": "evil.invalid"}).status_code == 400
+        assert client.get("/api/health", headers={"Host": "100.64.1.2"}).status_code == 400
+        view = client.get("/api/tailscale", headers={"Host": "localhost"}).get_json()
+        assert view["serve"]["status"] == "VERIFIED"
+        assert view["host"]["name"] == dns
+        assert view["host"]["accepted"] is True
+        assert view["remote_access"] == "VERIFIED"
+        assert view["enabled"] is False
+        assert view["intent"]["enabled"] is False
+        assert view["intent"]["alignment"] == "MISMATCH"
+        assert view["alignment"] == "MISMATCH"
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_malformed_tailscale_dns_does_not_widen_trusted_hosts(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    samples = ("*.ts.net", ".ts.net", "100.64.1.2", "*", "node", "http://evil.example")
+    for index, raw in enumerate(samples):
+        runner = _tailscale_runner(
+            {
+                "BackendState": "Running",
+                "Self": {"DNSName": raw, "TailscaleIPs": ["100.64.1.2"]},
+            },
+            _matching_serve(dns),
+        )
+        application = create_app(
+            git_repo_with_commit,
+            config_path=tmp_path / f"config-{index}.toml",
+            load_persistent_config=True,
+            tailscale_runner=runner,
+        )
+        try:
+            client = application.test_client()
+            assert client.get("/api/health", headers={"Host": "localhost"}).status_code == 200
+            assert client.get("/api/health", headers={"Host": raw}).status_code == 400
+            assert client.get("/api/health", headers={"Host": dns}).status_code == 400
+            assert client.get("/api/health", headers={"Host": "100.64.1.2"}).status_code == 400
+            view = client.get("/api/tailscale").get_json()
+            assert view["host"]["accepted"] is False
+            assert view["remote_access"] != "VERIFIED"
+        finally:
+            application.extensions["codeslayer"].close()
+
+
+def test_serve_match_without_accepted_host_is_not_remote_verified():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            {"BackendState": "Running", "Self": {}},
+            _matching_serve("node.ts.net"),
+        ),
+    )
+    assert view.serve_status == "VERIFIED"
+    assert view.host_accepted is False
+    assert view.remote_access != "VERIFIED"
+    assert view.remote_access == "UNVERIFIED"
+
+
+def test_serve_host_mismatch_is_not_remote_verified():
+    view = tailscale_status(
+        runner=_tailscale_runner(
+            _connected("node.ts.net."),
+            _matching_serve("other.ts.net"),
+        ),
+    )
+    assert view.serve_status == "VERIFIED"
+    assert view.remote_access != "VERIFIED"
+    assert view.host_accepted is False
+
+
+def test_tailscale_host_discovery_refreshes_without_restart(
+    git_repo_with_commit, tmp_path,
+):
+    state = {"dns": None}
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ("tailscale", "status", "--json"):
+            if not state["dns"]:
+                return ProcessResult(tuple(argv), 1, "", "down")
+            return _ok(argv, json.dumps(_connected(state["dns"])))
+        if argv[:4] == ("tailscale", "serve", "status", "--json"):
+            if not state["dns"]:
+                return _ok(argv, "{}")
+            return _ok(argv, json.dumps(_matching_serve("node.ts.net")))
+        return _ok(argv)
+
+    application = create_app(
+        git_repo_with_commit,
+        config_path=tmp_path / "config.toml",
+        load_persistent_config=True,
+        tailscale_runner=runner,
+    )
+    try:
+        client = application.test_client()
+        assert client.get("/api/health", headers={"Host": "node.ts.net"}).status_code == 400
+        state["dns"] = "node.ts.net."
+        assert client.get("/api/health", headers={"Host": "node.ts.net"}).status_code == 200
+        view = client.get("/api/tailscale", headers={"Host": "localhost"}).get_json()
+        assert view["remote_access"] == "VERIFIED"
+        assert view["host"]["accepted"] is True
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_intent_alignment_distinguishes_config_and_live_serve():
+    assert intent_alignment(False, "not_configured") == "VERIFIED"
+    assert intent_alignment(True, "VERIFIED") == "VERIFIED"
+    assert intent_alignment(False, "VERIFIED") == "MISMATCH"
+    assert intent_alignment(True, "not_configured") == "MISMATCH"
+    assert intent_alignment(False, "UNVERIFIED") == "UNVERIFIED"
+
+
+def test_systemd_unit_does_not_bind_tailscale_or_wildcard_addresses():
+    unit = render_user_unit(
+        python_or_codeslayer=Path("/tmp/venv/bin/codeslayer"),
+        checkout=Path("/tmp/code-slayer"),
+        webui_dir=Path("/tmp/code-slayer/webui"),
+    )
+    assert "0.0.0.0" not in unit
+    assert "100." not in unit
+    assert "--host" not in unit
 
 
 def test_update_refuses_unexpected_remote_dirty_and_divergent(tmp_path):

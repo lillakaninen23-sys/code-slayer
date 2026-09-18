@@ -579,6 +579,8 @@ async function renderTailscale() {
   const data = await api("/api/tailscale");
   const node = data.node || {};
   const serve = data.serve || {};
+  const host = data.host || {};
+  const intent = data.intent || {};
   app.innerHTML = `
     <h1>Tailscale</h1>
     <div class="card">
@@ -586,13 +588,16 @@ async function renderTailscale() {
         ${badge("node " + (node.state || "UNVERIFIED"), statusKind(node.state))}
         ${badge(node.source || "", "muted")}
         ${badge("serve " + (serve.status || "UNVERIFIED"), statusKind(serve.status))}
+        ${badge("host " + (host.accepted ? "accepted" : "not accepted"), statusKind(host.accepted_source || host.source))}
+        ${badge("intent " + (intent.alignment || data.alignment || "UNVERIFIED"), statusKind(intent.alignment || data.alignment))}
         ${badge("remote " + (data.remote_access || "UNVERIFIED"), statusKind(data.remote_access))}
       </div>
       <p>Expected Serve backend: <code>${escapeHtml((serve.expected_backend || data.backend) || "")}</code></p>
       <p>Observed Serve backend: <code>${escapeHtml(serve.observed_backend || "")}</code> ${badge(serve.source || "", "muted")}</p>
+      <p>Tailscale DNS Host: <code>${escapeHtml(host.name || "")}</code> ${badge(host.source || "UNVERIFIED", statusKind(host.source))} accepted=${badge(String(host.accepted), statusKind(host.accepted ? "VERIFIED" : "UNVERIFIED"))}</p>
       <p>URL: ${data.url ? `<a href="${escapeHtml(data.url)}">${escapeHtml(data.url)}</a>` : "<span class='muted'>none</span>"}</p>
-      <p>Config enabled: <code>${escapeHtml(data.enabled)}</code> ${badge(data.enabled_source || "CONFIG_BOUND", "muted")}</p>
-      <p class="muted">${escapeHtml(data.detail || "")}. Funnel is never used. Node connectivity is not proof of CSLR Serve.</p>
+      <p>Config enabled: <code>${escapeHtml((intent.enabled != null ? intent.enabled : data.enabled))}</code> ${badge(intent.enabled_source || data.enabled_source || "CONFIG_BOUND", "muted")} alignment ${badge(intent.alignment || data.alignment || "UNVERIFIED", statusKind(intent.alignment || data.alignment))}</p>
+      <p class="muted">${escapeHtml(data.detail || "")}. Funnel is never used. Node connectivity and Serve mapping are not proof of a usable CSLR remote Host.</p>
       <div class="form-actions">
         <button id="ts-enable">Enable Serve</button>
         <button class="secondary" id="ts-disable">Disable Serve</button>

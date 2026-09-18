@@ -10,7 +10,7 @@ from code_slayer import __version__
 from code_slayer.admin.process import ProcessError
 from code_slayer.admin.runtime import attest_worker
 from code_slayer.admin.service import restart_service, service_status
-from code_slayer.admin.tailscale import disable_serve, enable_serve
+from code_slayer.admin.tailscale import disable_serve, enable_serve, intent_alignment
 from code_slayer.admin.tailscale import status as tailscale_status
 from code_slayer.admin.updates import apply_update, check_for_update
 from code_slayer.api.service import APIError
@@ -319,9 +319,13 @@ class AdminFacade:
 
     def tailscale_view(self) -> dict:
         cfg = self._app.persistent_config()
+        runner, static_hosts = self._tailscale_request_context()
         view = tailscale_status(
+            runner=runner,
             backend_host=cfg.server.host, backend_port=cfg.server.port,
+            static_trusted_hosts=static_hosts,
         )
+        alignment = intent_alignment(cfg.tailscale.enabled, view.serve_status)
         return {
             "node": {"state": view.node_state, "source": view.node_source},
             "serve": {
@@ -330,23 +334,54 @@ class AdminFacade:
                 "expected_backend": view.expected_backend,
                 "observed_backend": view.observed_backend,
                 "funnel_detected": view.funnel_detected,
+                "hosts": list(view.serve_hosts),
+            },
+            "host": {
+                "name": view.dns_name,
+                "source": view.dns_name_source,
+                "accepted": view.host_accepted,
+                "accepted_source": view.host_accepted_source,
+            },
+            "intent": {
+                "enabled": cfg.tailscale.enabled,
+                "enabled_source": "CONFIG_BOUND",
+                "alignment": alignment,
             },
             "remote_access": view.remote_access,
             "url": view.url,
             "backend": view.expected_backend,
             "enabled": cfg.tailscale.enabled,
             "enabled_source": "CONFIG_BOUND",
+            "alignment": alignment,
             "detail": view.detail,
             "source": view.source,
         }
 
+    @staticmethod
+    def _tailscale_request_context():
+        from code_slayer.admin.hosts import LOOPBACK_TRUSTED_HOSTS
+
+        try:
+            from flask import current_app, has_request_context
+        except ImportError:
+            return None, LOOPBACK_TRUSTED_HOSTS
+        if not has_request_context():
+            return None, LOOPBACK_TRUSTED_HOSTS
+        runner = current_app.config.get("TAILSCALE_RUNNER")
+        static = current_app.config.get("STATIC_TRUSTED_HOSTS") or LOOPBACK_TRUSTED_HOSTS
+        return runner, tuple(static)
+
     def tailscale_set(self, enabled: bool) -> dict:
         cfg = self._app.persistent_config()
+        runner, _static = self._tailscale_request_context()
         try:
             if enabled:
-                enable_serve(backend_host=cfg.server.host, backend_port=cfg.server.port)
+                enable_serve(
+                    runner=runner,
+                    backend_host=cfg.server.host, backend_port=cfg.server.port,
+                )
             else:
-                disable_serve()
+                disable_serve(runner=runner)
         except ProcessError as exc:
             raise APIError(exc.code, "Tailscale operation failed.", 409) from None
         self._app.save_persistent_config(cfg.with_tailscale_enabled(enabled))
