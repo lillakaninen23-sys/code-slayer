@@ -10,7 +10,15 @@ from code_slayer import __version__
 from code_slayer.admin.process import ProcessError
 from code_slayer.admin.runtime import attest_worker
 from code_slayer.admin.service import restart_service, service_status
-from code_slayer.admin.tailscale import disable_serve, enable_serve, intent_alignment
+from code_slayer.admin.tailscale import (
+    disable_serve,
+    enable_serve,
+    exact_desired_live_serve,
+    intent_alignment,
+    plan_disable,
+    plan_enable,
+    serve_absent_attested,
+)
 from code_slayer.admin.tailscale import status as tailscale_status
 from code_slayer.admin.updates import apply_update, check_for_update
 from code_slayer.api.service import APIError
@@ -374,28 +382,46 @@ class AdminFacade:
     def tailscale_set(self, enabled: bool) -> dict:
         cfg = self._app.persistent_config()
         runner, static_hosts = self._tailscale_request_context()
-        view = tailscale_status(
-            runner=runner,
-            backend_host=cfg.server.host,
-            backend_port=cfg.server.port,
-            static_trusted_hosts=static_hosts,
-        )
+
+        def observe():
+            return tailscale_status(
+                runner=runner,
+                backend_host=cfg.server.host,
+                backend_port=cfg.server.port,
+                static_trusted_hosts=static_hosts,
+            )
+
+        view = observe()
         try:
             if enabled:
-                if view.funnel_detected:
-                    raise ProcessError("tailscale_funnel_detected")
-                # Live Serve already proxies this loopback backend: persist
-                # intent only. Re-running `tailscale serve --bg` is not
-                # idempotent and would 409 before config could align.
-                if view.serve_status != "VERIFIED":
+                plan = plan_enable(view)
+                if plan == "adopt":
+                    pass
+                elif plan == "configure":
                     enable_serve(
                         runner=runner,
                         backend_host=cfg.server.host,
                         backend_port=cfg.server.port,
                     )
-            elif view.serve_status != "not_configured":
-                disable_serve(runner=runner)
+                    view = observe()
+                    if not exact_desired_live_serve(view):
+                        raise ProcessError("tailscale_enable_unverified")
+                else:
+                    raise ProcessError(plan)
+            else:
+                plan = plan_disable(view)
+                if plan == "clear_intent":
+                    pass
+                elif plan == "reset":
+                    disable_serve(runner=runner)
+                    view = observe()
+                    if not serve_absent_attested(view):
+                        raise ProcessError("tailscale_disable_unverified")
+                else:
+                    raise ProcessError(plan)
         except ProcessError as exc:
             raise APIError(exc.code, "Tailscale operation failed.", 409) from None
+        # Persist intent only after live evidence matches the requested end
+        # state. CONFIG_BOUND enabled is not LIVE_ATTESTED remote_access.
         self._app.save_persistent_config(cfg.with_tailscale_enabled(enabled))
         return self.tailscale_view()

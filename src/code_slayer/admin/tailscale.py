@@ -119,6 +119,102 @@ def intent_alignment(enabled: bool, serve_status: str) -> str:
     return "MISMATCH"
 
 
+def expected_serve_mapping(view: TailscaleView) -> bool:
+    """Live Serve proxies the configured loopback backend and is not Funnel.
+
+    ``serve_status == VERIFIED`` is this mapping only. It is not by itself
+    a usable remote path and must not be used as an adoption predicate.
+    """
+    return (
+        view.serve_status == "VERIFIED"
+        and view.serve_source == "LIVE_ATTESTED"
+        and not view.funnel_detected
+    )
+
+
+def exact_desired_live_serve(view: TailscaleView) -> bool:
+    """Full usable CSLR remote path. The only live state that may be adopted."""
+    return (
+        expected_serve_mapping(view)
+        and view.node_state == "Connected"
+        and view.host_accepted is True
+        and view.remote_access == "VERIFIED"
+    )
+
+
+def serve_absent_attested(view: TailscaleView) -> bool:
+    """Empty Serve mapping from a well-formed live ``serve status --json``.
+
+    Distinguishes ``not_configured`` from ERROR/UNVERIFIED/empty/malformed.
+    """
+    return (
+        view.serve_status == "not_configured"
+        and view.serve_source == "LIVE_ATTESTED"
+        and not view.funnel_detected
+    )
+
+
+def serve_ready_to_configure(view: TailscaleView) -> bool:
+    """Attested-absent Serve that can be verified after the allowlisted set.
+
+    Node must already be Connected and the MagicDNS Host already accepted.
+    Otherwise a successful ``serve --bg`` cannot satisfy
+    ``exact_desired_live_serve`` and would mutate without a persistable end
+    state.
+    """
+    return (
+        serve_absent_attested(view)
+        and view.node_state == "Connected"
+        and view.host_accepted is True
+    )
+
+
+def plan_enable(view: TailscaleView) -> str:
+    """Fail-closed enable plan: ``adopt``, ``configure``, or a reject code."""
+    if view.funnel_detected:
+        return "tailscale_funnel_detected"
+    if view.serve_status == "ERROR":
+        return "tailscale_serve_error"
+    if view.serve_status == "UNVERIFIED":
+        return "tailscale_serve_unverified"
+    if exact_desired_live_serve(view):
+        return "adopt"
+    if serve_ready_to_configure(view):
+        return "configure"
+    if view.serve_status == "MISMATCH":
+        return "tailscale_serve_mismatch"
+    if view.serve_status == "VERIFIED":
+        if view.node_state != "Connected":
+            return "tailscale_node_not_connected"
+        if not view.host_accepted:
+            return "tailscale_host_not_accepted"
+        return "tailscale_remote_unverified"
+    if view.serve_status == "not_configured":
+        if view.node_state != "Connected":
+            return "tailscale_node_not_connected"
+        if not view.host_accepted:
+            return "tailscale_host_not_accepted"
+        return "tailscale_serve_unverified"
+    return "tailscale_serve_unverified"
+
+
+def plan_disable(view: TailscaleView) -> str:
+    """Fail-closed disable plan: ``clear_intent``, ``reset``, or a reject code."""
+    if view.funnel_detected:
+        return "tailscale_funnel_detected"
+    if view.serve_status == "ERROR":
+        return "tailscale_serve_error"
+    if view.serve_status == "UNVERIFIED":
+        return "tailscale_serve_unverified"
+    if serve_absent_attested(view):
+        return "clear_intent"
+    if expected_serve_mapping(view):
+        return "reset"
+    if view.serve_status == "MISMATCH":
+        return "tailscale_serve_mismatch"
+    return "tailscale_serve_unverified"
+
+
 def _dns_from_status_payload(payload: dict) -> tuple[str | None, str]:
     self_doc = payload.get("Self") if isinstance(payload.get("Self"), dict) else {}
     raw = self_doc.get("DNSName") if isinstance(self_doc, dict) else None
@@ -277,6 +373,12 @@ def enable_serve(
         raise ProcessError("tailscale_backend_port_invalid")
     backend = f"http://{backend_host}:{backend_port}"
     # Serve is tailnet-only. Funnel is never used.
+    # Non-interactive (no TTY, systemd user service):
+    # `tailscale serve --bg <backend>` is serve-set. That FlagSet registers
+    # --yes, but e.yes is only read in removeWebServe when deleting more than
+    # one mount (prompt.YesNo unless --yes). A set does not prompt. Do not
+    # pass --yes: it is unused here and would imply a prompt this path does
+    # not have.
     result = run((TAILSCALE, "serve", "--bg", backend), timeout=15.0)
     if result.returncode != 0:
         raise ProcessError("tailscale_serve_failed", result.stderr.strip())
@@ -285,6 +387,9 @@ def enable_serve(
 
 def disable_serve(*, runner=None):
     run = runner or run_fixed
+    # `tailscale serve reset` FlagSet is serve-reset with nil flags.
+    # --yes is not registered (`flag provided but not defined` if passed).
+    # runServeReset writes an empty ServeConfig; it does not prompt.
     result = run((TAILSCALE, "serve", "reset"), timeout=15.0)
     if result.returncode != 0:
         raise ProcessError("tailscale_serve_reset_failed", result.stderr.strip())
