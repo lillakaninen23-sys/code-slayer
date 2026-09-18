@@ -37,6 +37,10 @@ import {
   rejectRuntimeSnapshot,
   acceptRuntimeAttest,
   acceptIdentityResult,
+  beginRuntimeObservation,
+  clearRuntimeEvidence,
+  invalidateServerTest,
+  acceptServerTest,
 } from "./views-admin.js";
 
 const api = createAPI();
@@ -319,6 +323,34 @@ async function runtimeAction(work, success) {
   } finally {
     state.runtimeBusy = false;
     renderRuntimeView();
+  }
+}
+async function mutateRuntime(work) {
+  try {
+    await work();
+  } catch (error) {
+    rejectRuntimeSnapshot(state);
+    throw error;
+  }
+}
+async function observeRuntimeAttest() {
+  beginRuntimeObservation(state);
+  try {
+    const result = await api.runtimeAttest();
+    acceptRuntimeAttest(state, result);
+  } catch (error) {
+    clearRuntimeEvidence(state);
+    throw error;
+  }
+}
+async function observeServerTest(serverId) {
+  invalidateServerTest(state, serverId);
+  try {
+    const result = await api.testOllamaServer(serverId);
+    acceptServerTest(state, result);
+  } catch (error) {
+    invalidateServerTest(state, serverId);
+    throw error;
   }
 }
 async function loadIntelligence() {
@@ -715,21 +747,18 @@ $("workers-list").addEventListener("click", async (event) => {
     }
 });
 $("runtime-attest").addEventListener("click", () => {
-  runtimeAction(async () => {
-    const result = await api.runtimeAttest();
-    acceptRuntimeAttest(state, result);
-  }, "Live runtime attestation recorded from the backend.");
+  runtimeAction(observeRuntimeAttest, "Live runtime attestation recorded from the backend.");
 });
 $("ollama-server-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const serverId = $("ollama-server-id").value.trim();
   const origin = $("ollama-server-origin").value.trim();
   if (!serverId || !origin || state.runtimeBusy) return;
-  runtimeAction(async () => {
+  runtimeAction(() => mutateRuntime(async () => {
     const snapshot = await api.addOllamaServer(serverId, origin);
     acceptRuntimeSnapshot(state, snapshot);
     $("ollama-server-form").reset();
-  }, "Ollama server saved from the backend.");
+  }), "Ollama server saved from the backend.");
 });
 $("runtime-worker-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -747,11 +776,11 @@ $("runtime-worker-form").addEventListener("submit", (event) => {
   });
   if (!payload.worker_id || !payload.ollama_server_id || !payload.model_tag)
     return;
-  runtimeAction(async () => {
+  runtimeAction(() => mutateRuntime(async () => {
     const snapshot = await api.registerRuntimeWorker(payload);
     acceptRuntimeSnapshot(state, snapshot);
     $("runtime-worker-form").reset();
-  }, "Runtime worker saved from the backend.");
+  }), "Runtime worker saved from the backend.");
 });
 $("runtime-stack").addEventListener("click", (event) => {
   const testButton = event.target.closest("[data-runtime-test-server]");
@@ -760,28 +789,16 @@ $("runtime-stack").addEventListener("click", (event) => {
   const replaceConfirm = event.target.closest("[data-runtime-replace-confirm]");
   const replaceCancel = event.target.closest("[data-runtime-replace-cancel]");
   if (testButton) {
-    const serverId = testButton.dataset.runtimeTestServer;
-    runtimeAction(async () => {
-      const result = await api.testOllamaServer(serverId);
-      state.runtimeServerTests = {
-        ...state.runtimeServerTests,
-        [serverId]: result,
-      };
-    });
+    runtimeAction(() => observeServerTest(testButton.dataset.runtimeTestServer));
     return;
   }
   if (approveButton) {
     const workerId = approveButton.dataset.runtimeApprove;
-    runtimeAction(async () => {
+    runtimeAction(() => mutateRuntime(async () => {
       const result = await api.approveRuntimeWorker(workerId);
-      try {
-        const snapshot = result.status === "MISMATCH" ? state.runtime : await api.runtime();
-        acceptIdentityResult(state, workerId, result, snapshot);
-      } catch (error) {
-        rejectRuntimeSnapshot(state);
-        throw error;
-      }
-    });
+      const snapshot = await api.runtime();
+      acceptIdentityResult(state, workerId, result, snapshot);
+    }));
     return;
   }
   if (replaceAsk) {
@@ -797,16 +814,11 @@ $("runtime-stack").addEventListener("click", (event) => {
   }
   if (replaceConfirm) {
     const workerId = replaceConfirm.dataset.runtimeReplaceConfirm;
-    runtimeAction(async () => {
+    runtimeAction(() => mutateRuntime(async () => {
       const result = await api.approveNewRuntimeIdentity(workerId);
-      try {
-        const snapshot = await api.runtime();
-        acceptIdentityResult(state, workerId, result, snapshot);
-      } catch (error) {
-        rejectRuntimeSnapshot(state);
-        throw error;
-      }
-    });
+      const snapshot = await api.runtime();
+      acceptIdentityResult(state, workerId, result, snapshot);
+    }));
   }
 });
 $("intel-refresh").addEventListener("click", async () => {

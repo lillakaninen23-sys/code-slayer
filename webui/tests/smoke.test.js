@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -1008,7 +1008,8 @@ test("identity approval is explicit and MISMATCH does not replace", async () => 
   const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
   assert.match(appSource, /api\.approveRuntimeWorker\(workerId\)/);
   assert.match(appSource, /api\.approveNewRuntimeIdentity\(workerId\)/);
-  assert.match(appSource, /result\.status === "MISMATCH"/);
+  assert.match(appSource, /const snapshot = await api\.runtime\(\)/);
+  assert.doesNotMatch(appSource, /result\.status === "MISMATCH" \? state\.runtime/);
   assert.match(appSource, /acceptIdentityResult\(state, workerId, result, snapshot\)/);
   assert.match(appSource, /api\.addOllamaServer\(serverId, origin\)/);
   assert.equal((appSource.match(/api\.addOllamaServer\(/g) || []).length, 1);
@@ -1246,4 +1247,117 @@ test("app.js fail-closes runtime evidence on GET, attest, add, register and appr
   assert.match(appSource, /const snapshot = await api\.registerRuntimeWorker/);
   assert.equal((appSource.match(/acceptRuntimeSnapshot\(state, snapshot\)/g) || []).length, 3);
   assert.match(appSource, /acceptIdentityResult\(state, workerId, result, snapshot\)/);
+});
+
+test("failed server test cannot leave a prior LIVE_ATTESTED result visible", () => {
+  const runtimeState = evidenceState();
+  acceptServerTest(runtimeState, {
+    id: "other",
+    origin: "http://127.0.0.1:8",
+    status: "LIVE_ATTESTED",
+    runtime_version: "keep",
+  });
+  assert.equal(runtimeState.runtimeServerTests.local.status, "LIVE_ATTESTED");
+  invalidateServerTest(runtimeState, "local");
+  assert.equal(runtimeState.runtimeServerTests.local, undefined);
+  assert.equal(runtimeState.runtimeServerTests.other.status, "LIVE_ATTESTED");
+  const html = renderRuntimeServers(runtimeState.runtime, { tests: runtimeState.runtimeServerTests });
+  assert.doesNotMatch(html, /SERVER TEST \(OBSERVATION\)/);
+  assert.doesNotMatch(html, /provenance-live/);
+});
+
+test("failed live attest leaves no previous live attestation visible", () => {
+  const runtimeState = evidenceState();
+  const probed = {
+    ollama_servers: runtimeConfig.ollama_servers,
+    workers: runtimeConfig.workers,
+  };
+  acceptRuntimeAttest(runtimeState, {
+    ...probed,
+    ollama_servers: [{
+      id: "local",
+      origin: "http://127.0.0.1:9",
+      origin_source: "CONFIG_BOUND",
+      live: { status: "LIVE_ATTESTED", runtime_version: "0.11.0" },
+    }],
+  });
+  const snapshot = runtimeState.runtime;
+  beginRuntimeObservation(runtimeState);
+  assert.equal(runtimeState.runtime, snapshot);
+  assert.equal(runtimeState.runtimeAttestation, null);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  const html = renderRuntimeServers(runtimeState.runtime, { attestation: runtimeState.runtimeAttestation });
+  assert.doesNotMatch(html, /LIVE ATTESTATION/);
+  assert.doesNotMatch(html, /provenance-live/);
+  assert.match(html, /CONFIG_BOUND/);
+});
+
+test("failed add/register/approve mutations invalidate the runtime snapshot", async () => {
+  const runtimeState = evidenceState();
+  rejectRuntimeSnapshot(runtimeState);
+  assert.equal(runtimeState.runtime, null);
+  assert.equal(runtimeState.runtimeUnavailable, true);
+  assert.equal(runtimeState.runtimeAttestation, null);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const mutateStart = appSource.indexOf("async function mutateRuntime");
+  const mutateEnd = appSource.indexOf("async function observeRuntimeAttest");
+  const mutateFn = appSource.slice(mutateStart, mutateEnd);
+  assert.match(mutateFn, /rejectRuntimeSnapshot\(state\)/);
+  assert.equal((mutateFn.match(/work\(\)/g) || []).length, 1);
+  assert.equal((appSource.match(/mutateRuntime\(/g) || []).length, 5);
+  assert.match(appSource, /mutateRuntime\(async \(\) => \{\n    const snapshot = await api\.addOllamaServer/);
+  assert.match(appSource, /mutateRuntime\(async \(\) => \{\n    const snapshot = await api\.registerRuntimeWorker/);
+  assert.match(appSource, /mutateRuntime\(async \(\) => \{\n      const result = await api\.approveRuntimeWorker/);
+  assert.match(appSource, /mutateRuntime\(async \(\) => \{\n      const result = await api\.approveNewRuntimeIdentity/);
+  const attestFn = appSource.slice(
+    appSource.indexOf("async function observeRuntimeAttest"),
+    appSource.indexOf("async function observeServerTest"),
+  );
+  assert.match(attestFn, /beginRuntimeObservation\(state\)/);
+  assert.match(attestFn, /clearRuntimeEvidence\(state\)/);
+  assert.doesNotMatch(attestFn, /rejectRuntimeSnapshot/);
+  const testFn = appSource.slice(appSource.indexOf("async function observeServerTest"));
+  assert.match(testFn, /invalidateServerTest\(state, serverId\)/);
+  assert.match(testFn, /acceptServerTest\(state, result\)/);
+});
+
+test("approveRuntimeWorker MISMATCH refreshes GET /runtime and will not bind old config", () => {
+  const oldSnapshot = runtimeConfig;
+  const fresh = {
+    ollama_servers: runtimeConfig.ollama_servers,
+    workers: [{
+      ...runtimeConfig.workers[0],
+      approved_model_digest: { value: "sha256:current", source: "CONFIG_BOUND" },
+    }],
+  };
+  const mismatch = {
+    status: "MISMATCH",
+    reason: "runtime_identity_mismatch",
+    configured_digest: "sha256:current",
+    observed_digest: "sha256:new",
+    replaced: false,
+  };
+  assert.equal(identityResultBindable(oldSnapshot, "w1", mismatch), false);
+  const runtimeState = evidenceState({ runtime: oldSnapshot });
+  acceptIdentityResult(runtimeState, "w1", mismatch, oldSnapshot);
+  assert.equal(runtimeState.runtimeIdentityResults.w1, undefined);
+  acceptIdentityResult(runtimeState, "w1", mismatch, fresh);
+  assert.equal(runtimeState.runtimeIdentityResults.w1, mismatch);
+  assert.equal(runtimeState.runtime, fresh);
+  assert.doesNotMatch(JSON.stringify(runtimeState.runtime.workers[0].approved_model_digest), /sha256:abc/);
+});
+
+test("runtime mutations are not retried after a lost response", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const actionFn = appSource.slice(
+    appSource.indexOf("async function runtimeAction"),
+    appSource.indexOf("async function mutateRuntime"),
+  );
+  assert.match(actionFn, /notice\(error\.message, true\)/);
+  assert.doesNotMatch(actionFn, /await work\(\);\s*await work\(\)/);
+  assert.doesNotMatch(actionFn, /for \(.*work\(\)/);
+  const apiSource = await readFile(new URL("../static/api.js", import.meta.url), "utf8");
+  assert.match(apiSource, /Refresh durable run state before trying again/);
 });

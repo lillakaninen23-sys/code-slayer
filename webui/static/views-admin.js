@@ -75,6 +75,29 @@ export function clearRuntimeEvidence(runtimeState) {
   runtimeState.runtimeReplacePending = null;
 }
 
+export function beginRuntimeObservation(runtimeState) {
+  clearRuntimeEvidence(runtimeState);
+}
+
+export function invalidateServerTest(runtimeState, serverId) {
+  const current = runtimeState.runtimeServerTests || {};
+  if (!Object.hasOwn(current, serverId)) {
+    runtimeState.runtimeServerTests = { ...current };
+    return;
+  }
+  const next = { ...current };
+  delete next[serverId];
+  runtimeState.runtimeServerTests = next;
+}
+
+export function acceptServerTest(runtimeState, result) {
+  if (!result || result.id == null) return;
+  runtimeState.runtimeServerTests = {
+    ...(runtimeState.runtimeServerTests || {}),
+    [result.id]: result,
+  };
+}
+
 export function acceptRuntimeSnapshot(runtimeState, snapshot) {
   clearRuntimeEvidence(runtimeState);
   runtimeState.runtime = snapshot;
@@ -94,11 +117,23 @@ export function acceptRuntimeAttest(runtimeState, result) {
   runtimeState.runtimeUnavailable = false;
 }
 
+export function identityResultBindable(snapshot, workerId, result) {
+  if (!snapshot || !workerId) return false;
+  const worker = (snapshot.workers || []).find((item) => item.worker_id === workerId);
+  if (!worker) return false;
+  if (!result || !Object.hasOwn(result, "configured_digest")) return true;
+  const configured = worker.approved_model_digest && typeof worker.approved_model_digest === "object"
+    ? worker.approved_model_digest.value
+    : worker.approved_model_digest;
+  return result.configured_digest === configured;
+}
+
 export function acceptIdentityResult(runtimeState, workerId, result, snapshot) {
   clearRuntimeEvidence(runtimeState);
   runtimeState.runtime = snapshot;
-  runtimeState.runtimeIdentityResults = { [workerId]: result };
   runtimeState.runtimeUnavailable = false;
+  if (!identityResultBindable(snapshot, workerId, result)) return;
+  runtimeState.runtimeIdentityResults = { [workerId]: result };
 }
 
 export function renderRuntimeServers(runtime, options = {}) {
