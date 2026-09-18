@@ -1,24 +1,12 @@
-/** Presentation-only worker display names. Never authority or configuration. */
+/** Presentation-only worker display names. Never authority, evidence, or configuration.
+ *  In-memory only: aliases last for this page lifetime and are never persisted.
+ */
 
-export const ALIAS_PREFIX = "worker-alias:";
 export const MAX_ALIAS_LENGTH = 80;
 
+const aliases = new Map();
+
 const FORBIDDEN = /digest|fingerprint|sha256|evidence|sqlite|\.db\b|token|secret/i;
-
-function storage() {
-  try {
-    const store = globalThis.localStorage;
-    if (!store || typeof store.getItem !== "function") return null;
-    return store;
-  } catch {
-    return null;
-  }
-}
-
-export function aliasStorageKey(workerId) {
-  if (typeof workerId !== "string" || !workerId) return null;
-  return `${ALIAS_PREFIX}${workerId}`;
-}
 
 function displayNameAllowed(name) {
   if (typeof name !== "string") return false;
@@ -30,23 +18,19 @@ function displayNameAllowed(name) {
 }
 
 export function workerAlias(workerId) {
-  const key = aliasStorageKey(workerId);
-  const store = storage();
-  if (!key || !store) return workerId;
-  const value = store.getItem(key);
+  if (typeof workerId !== "string" || !workerId) return workerId;
+  const value = aliases.get(workerId);
   if (!displayNameAllowed(value)) return workerId;
   return value.trim();
 }
 
 export function saveWorkerAlias(workerId, name) {
-  const key = aliasStorageKey(workerId);
-  const store = storage();
-  if (!key || !store) return;
+  if (typeof workerId !== "string" || !workerId) return;
   const cleanName = typeof name === "string" ? name.trim() : "";
   if (!cleanName) {
-    store.removeItem(key);
+    aliases.delete(workerId);
     return;
   }
   if (!displayNameAllowed(cleanName)) return;
-  store.setItem(key, cleanName);
+  aliases.set(workerId, cleanName);
 }

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
-import { workerAlias, saveWorkerAlias, ALIAS_PREFIX } from "../static/aliases.js";
+import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -551,25 +551,50 @@ function fakeStorage() {
   };
 }
 
-test("worker aliases use a narrow localStorage allowlist", () => {
-  const store = fakeStorage();
-  globalThis.localStorage = store;
-  assert.equal(ALIAS_PREFIX, "worker-alias:");
+test("worker aliases are in-memory presentation names and never persist", () => {
+  const local = fakeStorage();
+  const session = fakeStorage();
+  globalThis.localStorage = local;
+  globalThis.sessionStorage = session;
   saveWorkerAlias("local-worker", "Studio coder");
   assert.equal(workerAlias("local-worker"), "Studio coder");
-  assert.deepEqual(Object.keys(store.mem), ["worker-alias:local-worker"]);
+  assert.equal(workerAlias("other-worker"), "other-worker");
+  assert.deepEqual(Object.keys(local.mem), []);
+  assert.deepEqual(Object.keys(session.mem), []);
   saveWorkerAlias("local-worker", "sha256:abcdef");
   saveWorkerAlias("local-worker", "http://127.0.0.1:11434");
   saveWorkerAlias("local-worker", "/var/lib/codeslayer/state.db");
   saveWorkerAlias("local-worker", "digest:abc");
   saveWorkerAlias("local-worker", "evidence_ref-1");
   assert.equal(workerAlias("local-worker"), "Studio coder");
+  saveWorkerAlias("local-worker", "127.0.0.1:11434");
+  saveWorkerAlias("other-worker", "sk-proj-abcdef");
+  saveWorkerAlias("third-worker", "api-key-123");
+  assert.deepEqual(Object.keys(local.mem), []);
+  assert.deepEqual(Object.keys(session.mem), []);
   saveWorkerAlias("local-worker", "");
+  saveWorkerAlias("other-worker", "");
+  saveWorkerAlias("third-worker", "");
   assert.equal(workerAlias("local-worker"), "local-worker");
-  assert.equal(store.mem["worker-alias:local-worker"], undefined);
+  assert.equal(workerAlias("other-worker"), "other-worker");
+  assert.equal(workerAlias("third-worker"), "third-worker");
 });
 
-test("shipped modules keep same-origin transport and do not store authority in localStorage", async () => {
+test("shipped modules keep same-origin transport and never use web storage", async () => {
+  const files = [
+    "../index.html",
+    "../static/app.js",
+    "../static/api.js",
+    "../static/views.js",
+    "../static/aliases.js",
+    "../static/app.css",
+  ];
+  for (const rel of files) {
+    const source = await readFile(new URL(rel, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /localStorage/);
+    assert.doesNotMatch(source, /sessionStorage/);
+    assert.doesNotMatch(source, /indexedDB/i);
+  }
   const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
   const apiSource = await readFile(new URL("../static/api.js", import.meta.url), "utf8");
   const aliasSource = await readFile(new URL("../static/aliases.js", import.meta.url), "utf8");
@@ -578,12 +603,12 @@ test("shipped modules keep same-origin transport and do not store authority in l
   assert.match(html, /href="\/static\/app\.css"/);
   assert.match(html, /src="\/static\/app\.js"/);
   assert.match(html, /id="plan-detail"/);
-  assert.doesNotMatch(appSource, /localStorage/);
+  assert.doesNotMatch(appSource, /fetch\(/);
   assert.match(appSource, /from "\.\/aliases\.js"/);
   assert.match(apiSource, /credentials: "same-origin"/);
   assert.match(apiSource, /cache: "no-store"/);
   assert.match(apiSource, /fetcher\(`\/api\$\{path\}`/);
   assert.match(apiSource, /Refresh durable run state/);
-  assert.match(aliasSource, /worker-alias:/);
-  assert.match(aliasSource, /ALIAS_PREFIX/);
+  assert.match(aliasSource, /new Map\(/);
+  assert.doesNotMatch(aliasSource, /fetch\(/);
 });
