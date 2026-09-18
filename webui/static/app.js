@@ -33,6 +33,10 @@ import {
   renderRuntimeAttestation,
   renderRuntimeServerOptions,
   runtimeRegistrationPayload,
+  acceptRuntimeSnapshot,
+  rejectRuntimeSnapshot,
+  acceptRuntimeAttest,
+  acceptIdentityResult,
 } from "./views-admin.js";
 
 const api = createAPI();
@@ -60,6 +64,7 @@ const state = {
   permissionGrants: [],
   runtime: null,
   runtimeBusy: false,
+  runtimeUnavailable: false,
   runtimeAttestation: null,
   runtimeServerTests: {},
   runtimeIdentityResults: {},
@@ -118,6 +123,7 @@ function controls() {
   $("refresh").disabled = state.busy || state.refreshing;
 }
 function connected(value) {
+  const wasConnected = state.connected;
   state.connected = value;
   $("connection-dot").classList.toggle("offline", !value);
   $("connection-label").textContent = value
@@ -126,6 +132,12 @@ function connected(value) {
   $("backend-status").textContent = value ? "CONNECTED" : "DISCONNECTED";
   controls();
   runtimeControls();
+  if (!value) {
+    rejectRuntimeSnapshot(state);
+    renderRuntimeView();
+  } else if (!wasConnected && document.getElementById("models")?.classList.contains("active")) {
+    loadRuntime();
+  }
 }
 async function workerDetail(workerId) {
   state.workerId = workerId;
@@ -239,41 +251,29 @@ function runtimeControls() {
       el.disabled = busy;
     });
 }
-function liveByServer(attestation) {
-  const map = {};
-  for (const server of attestation?.ollama_servers || []) {
-    if (server.live) map[server.id] = server.live;
-  }
-  return map;
-}
-function attestationByWorker(attestation) {
-  const map = {};
-  for (const worker of attestation?.workers || []) {
-    if (worker.attestation) map[worker.worker_id] = worker.attestation;
-  }
-  return map;
-}
 function renderRuntimeView() {
   const servers = $("runtime-servers");
   const workers = $("runtime-workers");
   const attestation = $("runtime-attestation");
   const select = $("runtime-worker-server");
   if (!servers || !workers || !attestation) return;
-  if (!state.connected) {
-    const message =
-      '<p class="notice error">Backend disconnected. Runtime configuration is unavailable until the connection returns.</p>';
+  if (!state.connected || state.runtimeUnavailable || !state.runtime) {
+    const message = !state.connected
+      ? '<p class="notice error">Backend disconnected. Runtime configuration is unavailable until the connection returns.</p>'
+      : '<p class="notice error">Runtime configuration is unavailable. Prior live observations are not current evidence.</p>';
     servers.innerHTML = message;
     workers.innerHTML = message;
     attestation.innerHTML = message;
+    runtimeControls();
     return;
   }
   servers.innerHTML = renderRuntimeServers(state.runtime, {
     tests: state.runtimeServerTests,
-    live: liveByServer(state.runtimeAttestation),
+    attestation: state.runtimeAttestation,
     busy: state.runtimeBusy,
   });
   workers.innerHTML = renderRuntimeWorkers(state.runtime, {
-    attestations: attestationByWorker(state.runtimeAttestation),
+    attestation: state.runtimeAttestation,
     identityResults: state.runtimeIdentityResults,
     replacePending: state.runtimeReplacePending,
     registryIds: state.workers.map((worker) => worker.worker_id),
@@ -290,13 +290,17 @@ function renderRuntimeView() {
 }
 async function loadRuntime() {
   if (!state.connected) {
+    rejectRuntimeSnapshot(state);
     renderRuntimeView();
     return;
   }
   try {
-    state.runtime = await api.runtime();
+    const snapshot = await api.runtime();
+    acceptRuntimeSnapshot(state, snapshot);
     renderRuntimeView();
   } catch (error) {
+    rejectRuntimeSnapshot(state);
+    renderRuntimeView();
     $("runtime-servers").innerHTML =
       `<p class="notice error">${esc(error.message)}</p>`;
     $("runtime-workers").innerHTML =
@@ -712,7 +716,8 @@ $("workers-list").addEventListener("click", async (event) => {
 });
 $("runtime-attest").addEventListener("click", () => {
   runtimeAction(async () => {
-    state.runtimeAttestation = await api.runtimeAttest();
+    const result = await api.runtimeAttest();
+    acceptRuntimeAttest(state, result);
   }, "Live runtime attestation recorded from the backend.");
 });
 $("ollama-server-form").addEventListener("submit", (event) => {
@@ -721,8 +726,8 @@ $("ollama-server-form").addEventListener("submit", (event) => {
   const origin = $("ollama-server-origin").value.trim();
   if (!serverId || !origin || state.runtimeBusy) return;
   runtimeAction(async () => {
-    state.runtime = await api.addOllamaServer(serverId, origin);
-    state.runtimeAttestation = null;
+    const snapshot = await api.addOllamaServer(serverId, origin);
+    acceptRuntimeSnapshot(state, snapshot);
     $("ollama-server-form").reset();
   }, "Ollama server saved from the backend.");
 });
@@ -743,8 +748,8 @@ $("runtime-worker-form").addEventListener("submit", (event) => {
   if (!payload.worker_id || !payload.ollama_server_id || !payload.model_tag)
     return;
   runtimeAction(async () => {
-    state.runtime = await api.registerRuntimeWorker(payload);
-    state.runtimeAttestation = null;
+    const snapshot = await api.registerRuntimeWorker(payload);
+    acceptRuntimeSnapshot(state, snapshot);
     $("runtime-worker-form").reset();
   }, "Runtime worker saved from the backend.");
 });
@@ -769,13 +774,12 @@ $("runtime-stack").addEventListener("click", (event) => {
     const workerId = approveButton.dataset.runtimeApprove;
     runtimeAction(async () => {
       const result = await api.approveRuntimeWorker(workerId);
-      state.runtimeIdentityResults = {
-        ...state.runtimeIdentityResults,
-        [workerId]: result,
-      };
-      if (result.status !== "MISMATCH") {
-        state.runtime = await api.runtime();
-        state.runtimeAttestation = null;
+      try {
+        const snapshot = result.status === "MISMATCH" ? state.runtime : await api.runtime();
+        acceptIdentityResult(state, workerId, result, snapshot);
+      } catch (error) {
+        rejectRuntimeSnapshot(state);
+        throw error;
       }
     });
     return;
@@ -795,13 +799,13 @@ $("runtime-stack").addEventListener("click", (event) => {
     const workerId = replaceConfirm.dataset.runtimeReplaceConfirm;
     runtimeAction(async () => {
       const result = await api.approveNewRuntimeIdentity(workerId);
-      state.runtimeIdentityResults = {
-        ...state.runtimeIdentityResults,
-        [workerId]: result,
-      };
-      state.runtimeReplacePending = null;
-      state.runtime = await api.runtime();
-      state.runtimeAttestation = null;
+      try {
+        const snapshot = await api.runtime();
+        acceptIdentityResult(state, workerId, result, snapshot);
+      } catch (error) {
+        rejectRuntimeSnapshot(state);
+        throw error;
+      }
     });
   }
 });

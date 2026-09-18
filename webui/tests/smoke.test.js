@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -882,8 +882,23 @@ test("config-bound servers and live tests keep distinct provenance", () => {
   assert.doesNotMatch(html, /LIVE_ATTESTED|provenance-live|provenance-verified/);
   assert.match(html, /data-runtime-test-server="local"/);
   const live = renderRuntimeServers(runtimeConfig, {
-    live: { local: { status: "UNREACHABLE", reason: "runtime_probe_unavailable" } },
-    tests: { local: { status: "LIVE_ATTESTED", runtime_version: "0.11.0", models: [{ name: "qwen", digest: "sha256:abc" }] } },
+    attestation: {
+      ollama_servers: [{
+        id: "local",
+        origin: "http://127.0.0.1:9",
+        origin_source: "CONFIG_BOUND",
+        live: { status: "UNREACHABLE", reason: "runtime_probe_unavailable" },
+      }],
+    },
+    tests: {
+      local: {
+        id: "local",
+        origin: "http://127.0.0.1:9",
+        status: "LIVE_ATTESTED",
+        runtime_version: "0.11.0",
+        models: [{ name: "qwen", digest: "sha256:abc" }],
+      },
+    },
   });
   assert.match(live, /provenance-config/);
   assert.match(live, /provenance-live/);
@@ -904,7 +919,7 @@ test("config-bound servers and live tests keep distinct provenance", () => {
 test("runtime server and worker renderers escape untrusted values", () => {
   const attack = '<img src=x onerror="alert(1)">';
   assert.doesNotMatch(renderRuntimeServers({ ollama_servers: [{ id: attack, origin: attack, origin_source: attack }] }), /<img/);
-  assert.doesNotMatch(renderOllamaServerTest({ status: attack, runtime_version: attack, models: [{ name: attack, digest: attack }] }), /<img/);
+  assert.doesNotMatch(renderOllamaServerTest({ status: attack, origin: attack, runtime_version: attack, models: [{ name: attack, digest: attack }] }, attack), /<img/);
   assert.doesNotMatch(renderRuntimeWorkers({ workers: [{
     worker_id: attack, kind: attack, network_class: attack, ollama_server_id: attack,
     model_tag: { value: attack, source: attack },
@@ -993,7 +1008,8 @@ test("identity approval is explicit and MISMATCH does not replace", async () => 
   const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
   assert.match(appSource, /api\.approveRuntimeWorker\(workerId\)/);
   assert.match(appSource, /api\.approveNewRuntimeIdentity\(workerId\)/);
-  assert.match(appSource, /result\.status !== "MISMATCH"/);
+  assert.match(appSource, /result\.status === "MISMATCH"/);
+  assert.match(appSource, /acceptIdentityResult\(state, workerId, result, snapshot\)/);
   assert.match(appSource, /api\.addOllamaServer\(serverId, origin\)/);
   assert.equal((appSource.match(/api\.addOllamaServer\(/g) || []).length, 1);
   const approveBlock = appSource.slice(appSource.indexOf("if (approveButton)"), appSource.indexOf("if (replaceAsk)"));
@@ -1017,4 +1033,217 @@ test("Models runtime UI keeps fetch out of app and admin views", async () => {
   assert.doesNotMatch(html, /name="output_token_budget"|name="tool_choice_enforcement"|name="planner_policy_version"/);
   assert.doesNotMatch(html, /Funnel/i);
   assert.doesNotMatch(adminSource, /statusClass/);
+});
+
+function evidenceState(extra = {}) {
+  return {
+    runtime: runtimeConfig,
+    runtimeUnavailable: false,
+    runtimeAttestation: {
+      ollama_servers: [{
+        id: "local",
+        origin: "http://127.0.0.1:9",
+        live: { status: "LIVE_ATTESTED", runtime_version: "old" },
+      }],
+      workers: [{
+        worker_id: "w1",
+        ollama_server_id: "local",
+        model_tag: { value: "qwen" },
+        attestation: { status: "VERIFIED", reason: "approved_identity_live_attested" },
+      }],
+    },
+    runtimeServerTests: {
+      local: { id: "local", origin: "http://127.0.0.1:9", status: "LIVE_ATTESTED", runtime_version: "old" },
+    },
+    runtimeIdentityResults: { w1: { status: "MISMATCH", reason: "runtime_identity_mismatch" } },
+    runtimeReplacePending: "w1",
+    ...extra,
+  };
+}
+
+test("a new runtime snapshot invalidates prior transient evidence", () => {
+  const runtimeState = evidenceState();
+  const next = {
+    ollama_servers: [{ id: "local", origin: "http://127.0.0.1:1", origin_source: "CONFIG_BOUND" }],
+    workers: [],
+  };
+  acceptRuntimeSnapshot(runtimeState, next);
+  assert.equal(runtimeState.runtime, next);
+  assert.equal(runtimeState.runtimeAttestation, null);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+  assert.equal(runtimeState.runtimeReplacePending, null);
+  assert.equal(runtimeState.runtimeUnavailable, false);
+  const html = renderRuntimeServers(runtimeState.runtime, {
+    tests: runtimeState.runtimeServerTests,
+    attestation: runtimeState.runtimeAttestation,
+  });
+  assert.match(html, /http:\/\/127\.0\.0\.1:1/);
+  assert.doesNotMatch(html, /LIVE_ATTESTED|VERIFIED|MISMATCH|UNBOUND/);
+  assert.doesNotMatch(renderRuntimeWorkers(runtimeState.runtime, {
+    identityResults: runtimeState.runtimeIdentityResults,
+    replacePending: runtimeState.runtimeReplacePending,
+    attestation: runtimeState.runtimeAttestation,
+  }), /data-runtime-replace-confirm/);
+});
+
+test("live attest installs config and live state from the same response", () => {
+  const runtimeState = evidenceState();
+  const probed = {
+    ollama_servers: [{
+      id: "local",
+      origin: "http://127.0.0.1:9",
+      origin_source: "CONFIG_BOUND",
+      live: { status: "LIVE_ATTESTED", runtime_version: "0.11.0" },
+    }],
+    workers: [{
+      ...runtimeConfig.workers[0],
+      attestation: {
+        status: "VERIFIED",
+        reason: "approved_identity_live_attested",
+        configured_digest: "sha256:abc",
+        observed_digest: "sha256:abc",
+        configured_version: "0.11.0",
+        observed_version: "0.11.0",
+        fingerprint_source: "LIVE_ATTESTED",
+      },
+    }],
+  };
+  acceptRuntimeAttest(runtimeState, probed);
+  assert.equal(runtimeState.runtime, probed);
+  assert.equal(runtimeState.runtimeAttestation, probed);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+  const html = renderRuntimeServers(runtimeState.runtime, { attestation: runtimeState.runtimeAttestation });
+  assert.match(html, /LIVE_ATTESTED/);
+  assert.match(html, /http:\/\/127\.0\.0\.1:9/);
+  const workers = renderRuntimeWorkers(runtimeState.runtime, { attestation: runtimeState.runtimeAttestation });
+  assert.match(workers, /provenance-verified/);
+  assert.equal(attestationForWorker(runtimeState.runtime.workers[0], runtimeState.runtimeAttestation).status, "VERIFIED");
+});
+
+test("replacing server id local cannot retain the old server test", () => {
+  const runtimeState = evidenceState();
+  const replaced = {
+    ollama_servers: [{ id: "local", origin: "http://127.0.0.1:1", origin_source: "CONFIG_BOUND" }],
+    workers: runtimeConfig.workers,
+  };
+  acceptRuntimeSnapshot(runtimeState, replaced);
+  const html = renderRuntimeServers(replaced, {
+    tests: runtimeState.runtimeServerTests,
+    attestation: runtimeState.runtimeAttestation,
+  });
+  assert.doesNotMatch(html, /LIVE_ATTESTED/);
+  assert.doesNotMatch(html, /SERVER TEST \(OBSERVATION\)/);
+  assert.doesNotMatch(html, /http:\/\/127\.0\.0\.1:9/);
+  const leftover = renderRuntimeServers(replaced, {
+    tests: { local: { id: "local", origin: "http://127.0.0.1:9", status: "LIVE_ATTESTED", runtime_version: "old" } },
+  });
+  assert.match(leftover, /SERVER TEST \(UNBOUND\)/);
+  assert.match(leftover, /not current evidence for the configured origin/);
+  assert.doesNotMatch(leftover, /provenance-live/);
+});
+
+test("re-registering worker id w1 cannot retain old identity result", () => {
+  const runtimeState = evidenceState();
+  const reregistered = {
+    ollama_servers: runtimeConfig.ollama_servers,
+    workers: [{
+      ...runtimeConfig.workers[0],
+      model_tag: { value: "other", source: "CONFIG_BOUND" },
+    }],
+  };
+  acceptRuntimeSnapshot(runtimeState, reregistered);
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+  assert.equal(runtimeState.runtimeReplacePending, null);
+  const html = renderRuntimeWorkers(reregistered, {
+    identityResults: runtimeState.runtimeIdentityResults,
+    replacePending: runtimeState.runtimeReplacePending,
+    attestation: runtimeState.runtimeAttestation,
+  });
+  assert.doesNotMatch(html, /runtime_identity_mismatch/);
+  assert.doesNotMatch(html, /data-runtime-replace-confirm/);
+  assert.doesNotMatch(html, /LIVE ATTESTATION/);
+  assert.equal(attestationForWorker(reregistered.workers[0], evidenceState().runtimeAttestation), null);
+});
+
+test("replacePending is cleared when runtime config changes", () => {
+  const runtimeState = evidenceState({ runtimeReplacePending: "w1" });
+  clearRuntimeEvidence(runtimeState);
+  assert.equal(runtimeState.runtimeReplacePending, null);
+  acceptRuntimeSnapshot(runtimeState, runtimeConfig);
+  assert.equal(runtimeState.runtimeReplacePending, null);
+});
+
+test("failed runtime reload cannot leave old live evidence as current", () => {
+  const runtimeState = evidenceState();
+  rejectRuntimeSnapshot(runtimeState);
+  assert.equal(runtimeState.runtime, null);
+  assert.equal(runtimeState.runtimeUnavailable, true);
+  assert.equal(runtimeState.runtimeAttestation, null);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+  assert.equal(runtimeState.runtimeReplacePending, null);
+  assert.doesNotMatch(renderRuntimeServers(runtimeState.runtime, {
+    tests: runtimeState.runtimeServerTests,
+    attestation: runtimeState.runtimeAttestation,
+  }), /LIVE_ATTESTED|VERIFIED|MISMATCH/);
+});
+
+test("server-test rendering shows its own returned origin and will not bind a different origin", () => {
+  const bound = renderOllamaServerTest({
+    id: "local",
+    origin: "http://127.0.0.1:9",
+    status: "LIVE_ATTESTED",
+    runtime_version: "0.11.0",
+  }, "http://127.0.0.1:9");
+  assert.match(bound, /observed origin http:\/\/127\.0\.0\.1:9/);
+  assert.match(bound, /LIVE_ATTESTED/);
+  assert.match(bound, /SERVER TEST \(OBSERVATION\)/);
+  const unbound = renderOllamaServerTest({
+    id: "local",
+    origin: "http://127.0.0.1:9",
+    status: "LIVE_ATTESTED",
+    runtime_version: "0.11.0",
+  }, "http://127.0.0.1:1");
+  assert.match(unbound, /observed origin http:\/\/127\.0\.0\.1:9/);
+  assert.match(unbound, /configured origin http:\/\/127\.0\.0\.1:1/);
+  assert.match(unbound, /SERVER TEST \(UNBOUND\)/);
+  assert.doesNotMatch(unbound, /provenance-live/);
+  assert.doesNotMatch(unbound, /SERVER TEST \(OBSERVATION\)/);
+  const html = renderRuntimeServers({
+    ollama_servers: [{ id: "local", origin: "http://127.0.0.1:1", origin_source: "CONFIG_BOUND" }],
+  }, {
+    tests: { local: { id: "local", origin: "http://127.0.0.1:9", status: "LIVE_ATTESTED" } },
+  });
+  assert.match(html, /http:\/\/127\.0\.0\.1:1/);
+  assert.doesNotMatch(html, /class="badge provenance provenance-live"/);
+});
+
+test("identity result after approval is not mixed with prior attestation", () => {
+  const runtimeState = evidenceState();
+  const result = { status: "VERIFIED", reason: "approved_from_live_attestation", certificates_transferred: false };
+  acceptIdentityResult(runtimeState, "w1", result, runtimeConfig);
+  assert.equal(runtimeState.runtimeAttestation, null);
+  assert.deepEqual(runtimeState.runtimeServerTests, {});
+  assert.equal(runtimeState.runtimeReplacePending, null);
+  assert.equal(runtimeState.runtimeIdentityResults.w1, result);
+  const later = { ollama_servers: runtimeConfig.ollama_servers, workers: runtimeConfig.workers };
+  acceptRuntimeSnapshot(runtimeState, later);
+  assert.deepEqual(runtimeState.runtimeIdentityResults, {});
+});
+
+test("app.js fail-closes runtime evidence on GET, attest, add, register and approve", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const loadStart = appSource.indexOf("async function loadRuntime");
+  const loadEnd = appSource.indexOf("async function runtimeAction");
+  const loadFn = appSource.slice(loadStart, loadEnd);
+  assert.match(loadFn, /acceptRuntimeSnapshot\(state, snapshot\)/);
+  assert.match(loadFn, /rejectRuntimeSnapshot\(state\)/);
+  assert.doesNotMatch(loadFn, /runtimeAttest/);
+  assert.match(appSource, /acceptRuntimeAttest\(state, result\)/);
+  assert.match(appSource, /const snapshot = await api\.addOllamaServer/);
+  assert.match(appSource, /const snapshot = await api\.registerRuntimeWorker/);
+  assert.equal((appSource.match(/acceptRuntimeSnapshot\(state, snapshot\)/g) || []).length, 3);
+  assert.match(appSource, /acceptIdentityResult\(state, workerId, result, snapshot\)/);
 });
