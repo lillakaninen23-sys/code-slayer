@@ -373,14 +373,27 @@ class AdminFacade:
 
     def tailscale_set(self, enabled: bool) -> dict:
         cfg = self._app.persistent_config()
-        runner, _static = self._tailscale_request_context()
+        runner, static_hosts = self._tailscale_request_context()
+        view = tailscale_status(
+            runner=runner,
+            backend_host=cfg.server.host,
+            backend_port=cfg.server.port,
+            static_trusted_hosts=static_hosts,
+        )
         try:
             if enabled:
-                enable_serve(
-                    runner=runner,
-                    backend_host=cfg.server.host, backend_port=cfg.server.port,
-                )
-            else:
+                if view.funnel_detected:
+                    raise ProcessError("tailscale_funnel_detected")
+                # Live Serve already proxies this loopback backend: persist
+                # intent only. Re-running `tailscale serve --bg` is not
+                # idempotent and would 409 before config could align.
+                if view.serve_status != "VERIFIED":
+                    enable_serve(
+                        runner=runner,
+                        backend_host=cfg.server.host,
+                        backend_port=cfg.server.port,
+                    )
+            elif view.serve_status != "not_configured":
                 disable_serve(runner=runner)
         except ProcessError as exc:
             raise APIError(exc.code, "Tailscale operation failed.", 409) from None

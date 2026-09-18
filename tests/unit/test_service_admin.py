@@ -1040,6 +1040,137 @@ def test_intent_alignment_distinguishes_config_and_live_serve():
     assert intent_alignment(False, "UNVERIFIED") == "UNVERIFIED"
 
 
+def _recording_tailscale_runner(node_doc, serve_doc, *, serve_set_code=0):
+    captured = []
+
+    def runner(argv, **kwargs):
+        captured.append(argv)
+        if argv[:3] == ("tailscale", "status", "--json"):
+            return _ok(argv, json.dumps(node_doc))
+        if argv[:4] == ("tailscale", "serve", "status", "--json"):
+            return _ok(argv, json.dumps(serve_doc))
+        if argv[:2] == ("tailscale", "serve") and "status" not in argv:
+            return ProcessResult(tuple(argv), serve_set_code, "", "already serving")
+        return _ok(argv)
+
+    return runner, captured
+
+
+def test_enable_adopts_matching_live_serve_without_reconfiguring(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    runner, captured = _recording_tailscale_runner(
+        _connected(dns + "."), _matching_serve(dns), serve_set_code=1,
+    )
+    config = tmp_path / "config.toml"
+    application = create_app(
+        git_repo_with_commit,
+        config_path=config,
+        load_persistent_config=True,
+        tailscale_runner=runner,
+    )
+    try:
+        client = application.test_client()
+        before = client.get("/api/tailscale").get_json()
+        assert before["enabled"] is False
+        assert before["alignment"] == "MISMATCH"
+        assert before["serve"]["status"] == "VERIFIED"
+        response = client.post("/api/tailscale/enable", json={})
+        assert response.status_code == 200
+        view = response.get_json()
+        assert view["enabled"] is True
+        assert view["enabled_source"] == "CONFIG_BOUND"
+        assert view["alignment"] == "VERIFIED"
+        assert view["intent"]["enabled"] is True
+        assert view["intent"]["alignment"] == "VERIFIED"
+        assert view["serve"]["status"] == "VERIFIED"
+        assert load_config(path=config).tailscale.enabled is True
+        assert not any(
+            argv[:2] == ("tailscale", "serve") and "status" not in argv
+            for argv in captured
+        )
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_enable_configures_serve_when_not_already_mapped(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    runner, captured = _recording_tailscale_runner(_connected(dns + "."), {})
+    application = create_app(
+        git_repo_with_commit,
+        config_path=tmp_path / "config.toml",
+        load_persistent_config=True,
+        tailscale_runner=runner,
+    )
+    try:
+        client = application.test_client()
+        response = client.post("/api/tailscale/enable", json={})
+        assert response.status_code == 200
+        assert any(
+            argv[:2] == ("tailscale", "serve") and "--bg" in argv
+            for argv in captured
+        )
+        assert load_config(path=tmp_path / "config.toml").tailscale.enabled is True
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_enable_refuses_funnel_and_does_not_persist(
+    git_repo_with_commit, tmp_path,
+):
+    dns = "adrian-kanon.tail64e440.ts.net"
+    serve = dict(_matching_serve(dns))
+    serve["AllowFunnel"] = {f"{dns}:443": True}
+    runner, captured = _recording_tailscale_runner(_connected(dns + "."), serve)
+    config = tmp_path / "config.toml"
+    application = create_app(
+        git_repo_with_commit,
+        config_path=config,
+        load_persistent_config=True,
+        tailscale_runner=runner,
+    )
+    try:
+        client = application.test_client()
+        response = client.post("/api/tailscale/enable", json={})
+        assert response.status_code == 409
+        assert response.get_json()["error"]["code"] == "tailscale_funnel_detected"
+        assert load_config(path=config).tailscale.enabled is False
+        assert not any(
+            argv[:2] == ("tailscale", "serve") and "status" not in argv
+            for argv in captured
+        )
+    finally:
+        application.extensions["codeslayer"].close()
+
+
+def test_disable_skips_reset_when_serve_not_configured(
+    git_repo_with_commit, tmp_path,
+):
+    runner, captured = _recording_tailscale_runner(
+        {"BackendState": "Stopped", "Self": {}}, {},
+    )
+    config = tmp_path / "config.toml"
+    save_config(CSLRConfig().with_tailscale_enabled(True), path=config)
+    application = create_app(
+        git_repo_with_commit,
+        config_path=config,
+        load_persistent_config=True,
+        tailscale_runner=runner,
+    )
+    try:
+        client = application.test_client()
+        response = client.post("/api/tailscale/disable", json={})
+        assert response.status_code == 200
+        assert response.get_json()["enabled"] is False
+        assert load_config(path=config).tailscale.enabled is False
+        assert not any(argv[:3] == ("tailscale", "serve", "reset") for argv in captured)
+    finally:
+        application.extensions["codeslayer"].close()
+
+
 def test_systemd_unit_does_not_bind_tailscale_or_wildcard_addresses():
     unit = render_user_unit(
         python_or_codeslayer=Path("/tmp/venv/bin/codeslayer"),
