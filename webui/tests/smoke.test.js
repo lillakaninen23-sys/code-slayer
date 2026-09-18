@@ -612,3 +612,195 @@ test("shipped modules keep same-origin transport and never use web storage", asy
   assert.match(aliasSource, /new Map\(/);
   assert.doesNotMatch(aliasSource, /fetch\(/);
 });
+
+function captured(url, options) {
+  return [url, options.method, options.body === undefined ? undefined : JSON.parse(options.body)];
+}
+
+test("system API client uses exact GET/POST routes and empty mutation bodies", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.system();
+  await api.systemRestart();
+  await api.systemUpdateCheck();
+  await api.systemUpdateApply();
+  assert.deepEqual(calls, [
+    ["/api/system", "GET", undefined],
+    ["/api/system/restart", "POST", {}],
+    ["/api/system/update/check", "POST", {}],
+    ["/api/system/update/apply", "POST", {}],
+  ]);
+});
+
+test("runtime overview, attest and Ollama routes use exact paths and bodies", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.runtime();
+  await api.runtimeAttest();
+  await api.addOllamaServer("local/ollama", "http://127.0.0.1:12345");
+  await api.testOllamaServer("local/ollama");
+  assert.deepEqual(calls, [
+    ["/api/runtime", "GET", undefined],
+    ["/api/runtime/attest", "POST", {}],
+    ["/api/runtime/ollama-servers", "POST", { id: "local/ollama", origin: "http://127.0.0.1:12345" }],
+    ["/api/runtime/ollama-servers/local%2Follama/test", "POST", {}],
+  ]);
+});
+
+test("registerRuntimeWorker sends only the HTTP-route allowlist", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.registerRuntimeWorker({
+    worker_id: "w1",
+    ollama_server_id: "local",
+    model_tag: "qwen2.5-coder",
+  });
+  await api.registerRuntimeWorker({
+    worker_id: "w1",
+    ollama_server_id: "local",
+    model_tag: "qwen2.5-coder",
+    kind: "openai_compatible",
+    network_class: "local",
+    effective_context_tokens: 16384,
+    temperature: 0,
+    normalizer_id: "norm",
+    normalizer_version: 1,
+    digest: "abc",
+    model_digest: "abc",
+    approved_model_digest: "abc",
+    fingerprint: "fp",
+    runtime_identity_fingerprint: "fp",
+    outcome: "pass",
+    evidence_ref: "ev",
+    hard_disqualifiers: ["x"],
+    adapter: "fake",
+    certificates_transferred: true,
+    authority: "x",
+    trust: "y",
+    permission: "z",
+    endpoint: "http://evil.example",
+    repo_path: "/tmp",
+    db_path: "x.db",
+    output_token_budget: 128,
+    tool_choice_enforcement: true,
+    planner_policy_version: 2,
+  });
+  assert.deepEqual(calls, [
+    ["/api/runtime/workers", "POST", { worker_id: "w1", ollama_server_id: "local", model_tag: "qwen2.5-coder" }],
+    ["/api/runtime/workers", "POST", {
+      worker_id: "w1",
+      ollama_server_id: "local",
+      model_tag: "qwen2.5-coder",
+      kind: "openai_compatible",
+      network_class: "local",
+      effective_context_tokens: 16384,
+      temperature: 0,
+      normalizer_id: "norm",
+      normalizer_version: 1,
+    }],
+  ]);
+});
+
+test("runtime approval routes use encoded worker ids and exact empty bodies", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.approveRuntimeWorker("w/1");
+  await api.approveNewRuntimeIdentity("w/1");
+  assert.deepEqual(calls, [
+    ["/api/runtime/workers/w%2F1/approve", "POST", {}],
+    ["/api/runtime/workers/w%2F1/approve-new-identity", "POST", {}],
+  ]);
+});
+
+test("certification GETs stay GET; preflight and start POST exact empty bodies", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.certificationWorkers();
+  await api.certificationWorker("w/1");
+  await api.certificationRun("run/1");
+  await api.certificationEvidence("run/1");
+  await api.certificationHistory("w/1");
+  await api.certificationPreflight("w/1", { outcome: "pass", evidence_ref: "x", digest: "d", fingerprint: "f" });
+  await api.startBaselineCertification("w/1", { outcome: "pass", adapter: "fake", hard_disqualifiers: [] });
+  assert.deepEqual(calls, [
+    ["/api/certification/workers", "GET", undefined],
+    ["/api/certification/workers/w%2F1", "GET", undefined],
+    ["/api/certification/runs/run%2F1", "GET", undefined],
+    ["/api/certification/runs/run%2F1/evidence", "GET", undefined],
+    ["/api/certification/workers/w%2F1/history", "GET", undefined],
+    ["/api/certification/workers/w%2F1/baseline/preflight", "POST", {}],
+    ["/api/certification/workers/w%2F1/baseline/runs", "POST", {}],
+  ]);
+});
+
+test("tailscale GET/enable/disable are exact and Funnel is not a client operation", async () => {
+  const calls = [];
+  const api = createAPI(async (url, options) => { calls.push(captured(url, options)); return reply({}); });
+  await api.tailscale();
+  await api.tailscaleEnable();
+  await api.tailscaleDisable();
+  assert.deepEqual(calls, [
+    ["/api/tailscale", "GET", undefined],
+    ["/api/tailscale/enable", "POST", {}],
+    ["/api/tailscale/disable", "POST", {}],
+  ]);
+  for (const name of Object.keys(api)) assert.doesNotMatch(name, /funnel/i);
+  assert.equal(api.tailscaleFunnel, undefined);
+  assert.equal(api.tailscaleEnable.length, 0);
+  assert.equal(api.tailscaleDisable.length, 0);
+});
+
+test("administration mutations are not automatically retried", async () => {
+  let calls = 0;
+  const api = createAPI(async () => { calls++; throw new Error("lost response"); });
+  await assert.rejects(api.systemRestart(), (e) => e instanceof APIError && /Refresh durable/.test(e.message));
+  assert.equal(calls, 1);
+  await assert.rejects(api.tailscaleEnable(), (e) => e instanceof APIError && /Refresh durable/.test(e.message));
+  assert.equal(calls, 2);
+});
+
+test("administration transport keeps same-origin /api, credentials, cache and timeouts", async () => {
+  const delays = [];
+  const originalSet = globalThis.setTimeout;
+  const originalClear = globalThis.clearTimeout;
+  globalThis.setTimeout = (_fn, ms) => {
+    delays.push(ms);
+    return 0;
+  };
+  globalThis.clearTimeout = () => {};
+  try {
+    const calls = [];
+    const api = createAPI(async (url, options) => { calls.push([url, options]); return reply({}); });
+    await api.system();
+    await api.tailscaleEnable();
+    assert.deepEqual(delays, [10000, 120000]);
+    assert.equal(calls[0][0], "/api/system");
+    assert.equal(calls[0][1].method, "GET");
+    assert.equal(calls[0][1].credentials, "same-origin");
+    assert.equal(calls[0][1].cache, "no-store");
+    assert.equal(calls[0][1].headers.Accept, "application/json");
+    assert.equal(calls[0][1].body, undefined);
+    assert.equal(calls[1][0], "/api/tailscale/enable");
+    assert.equal(calls[1][1].method, "POST");
+    assert.equal(calls[1][1].credentials, "same-origin");
+    assert.equal(calls[1][1].cache, "no-store");
+    assert.equal(calls[1][1].body, "{}");
+  } finally {
+    globalThis.setTimeout = originalSet;
+    globalThis.clearTimeout = originalClear;
+  }
+});
+
+test("api.js never constructs client-authority request fields", async () => {
+  const apiSource = await readFile(new URL("../static/api.js", import.meta.url), "utf8");
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  for (const field of ["approved_model_digest", "runtime_identity_fingerprint", "hard_disqualifiers", "evidence_ref"]) {
+    assert.doesNotMatch(apiSource, new RegExp(field));
+  }
+  assert.doesNotMatch(apiSource, /funnel/i);
+  assert.doesNotMatch(appSource, /fetch\(/);
+  assert.match(apiSource, /credentials: "same-origin"/);
+  assert.match(apiSource, /cache: "no-store"/);
+  assert.match(apiSource, /data === undefined \? 10000 : 120000/);
+  assert.match(apiSource, /Refresh durable run state before trying again/);
+});

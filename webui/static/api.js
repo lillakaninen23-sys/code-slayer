@@ -7,6 +7,22 @@ export class APIError extends Error {
   }
 }
 
+function runtimeWorkerPayload(input) {
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const payload = {
+    worker_id: source.worker_id,
+    ollama_server_id: source.ollama_server_id,
+    model_tag: source.model_tag,
+  };
+  if (Object.hasOwn(source, "kind")) payload.kind = source.kind;
+  if (Object.hasOwn(source, "network_class")) payload.network_class = source.network_class;
+  if (Object.hasOwn(source, "effective_context_tokens")) payload.effective_context_tokens = source.effective_context_tokens;
+  if (Object.hasOwn(source, "temperature")) payload.temperature = source.temperature;
+  if (Object.hasOwn(source, "normalizer_id")) payload.normalizer_id = source.normalizer_id;
+  if (Object.hasOwn(source, "normalizer_version")) payload.normalizer_version = source.normalizer_version;
+  return payload;
+}
+
 export function createAPI(fetcher = globalThis.fetch.bind(globalThis)) {
   async function request(path, data) {
     const controller = new AbortController();
@@ -71,5 +87,26 @@ export function createAPI(fetcher = globalThis.fetch.bind(globalThis)) {
     decidePermission: (requestId, decision) => request(`/permissions/requests/${id(requestId)}/decision`, { decision }),
     permissionGrants: (offset = 0) => request(`/permissions/grants?limit=100&offset=${offset}`),
     revokePermission: (grantId) => request(`/permissions/grants/${id(grantId)}/revoke`, {}),
+    system: () => request("/system"),
+    systemRestart: () => request("/system/restart", {}),
+    systemUpdateCheck: () => request("/system/update/check", {}),
+    systemUpdateApply: () => request("/system/update/apply", {}),
+    runtime: () => request("/runtime"),
+    runtimeAttest: () => request("/runtime/attest", {}),
+    addOllamaServer: (serverId, origin) => request("/runtime/ollama-servers", { id: serverId, origin }),
+    testOllamaServer: (serverId) => request(`/runtime/ollama-servers/${id(serverId)}/test`, {}),
+    registerRuntimeWorker: (input) => request("/runtime/workers", runtimeWorkerPayload(input)),
+    approveRuntimeWorker: (workerId) => request(`/runtime/workers/${id(workerId)}/approve`, {}),
+    approveNewRuntimeIdentity: (workerId) => request(`/runtime/workers/${id(workerId)}/approve-new-identity`, {}),
+    certificationWorkers: () => request("/certification/workers"),
+    certificationWorker: (workerId) => request(`/certification/workers/${id(workerId)}`),
+    certificationPreflight: (workerId) => request(`/certification/workers/${id(workerId)}/baseline/preflight`, {}),
+    startBaselineCertification: (workerId) => request(`/certification/workers/${id(workerId)}/baseline/runs`, {}),
+    certificationRun: (runId) => request(`/certification/runs/${id(runId)}`),
+    certificationEvidence: (runId) => request(`/certification/runs/${id(runId)}/evidence`),
+    certificationHistory: (workerId) => request(`/certification/workers/${id(workerId)}/history`),
+    tailscale: () => request("/tailscale"),
+    tailscaleEnable: () => request("/tailscale/enable", {}),
+    tailscaleDisable: () => request("/tailscale/disable", {}),
   };
 }
