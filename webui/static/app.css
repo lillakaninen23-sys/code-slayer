@@ -1351,6 +1351,10 @@ button:disabled {
     margin-top: 12px;
 }
 
+.runtime-item.lifecycle-deemphasized {
+    opacity: 0.6;
+}
+
 .runtime-field {
     display: grid;
     grid-template-columns: minmax(120px, 200px) minmax(0, 1fr) auto;
@@ -1455,6 +1459,18 @@ button:disabled {
 .badge.provenance-unknown {
     color: var(--muted);
     border-color: rgba(var(--ice-rgb), 0.12);
+}
+
+.badge.lifecycle-active {
+    color: #7ee0c3;
+    border-color: rgba(126, 224, 195, 0.38);
+    background: rgba(126, 224, 195, 0.08);
+}
+
+.badge.lifecycle-archived {
+    color: #ffb36b;
+    border-color: rgba(255, 179, 107, 0.4);
+    background: rgba(255, 179, 107, 0.08);
 }
 
 .cert-stack .models-layout {

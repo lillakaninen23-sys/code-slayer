@@ -20,6 +20,20 @@ export function provenanceBadge(value) {
   return `<span class="badge provenance ${provenanceClass(value)}">${escapeHTML(value)}</span>`;
 }
 
+// H.3: administrative worker lifecycle -- a SEPARATE dimension from
+// availability_state/provenance above. Backend-authoritative only:
+// this module never decides whether archiving/reactivating is
+// available, it only renders whatever lifecycle_state/archive_available/
+// reactivate_available the backend already reported.
+export function lifecycleBadgeClass(state) {
+  return state === "ARCHIVED" ? "lifecycle-archived" : "lifecycle-active";
+}
+
+export function lifecycleBadge(state) {
+  const value = state || "ACTIVE";
+  return `<span class="badge lifecycle ${lifecycleBadgeClass(value)}">${escapeHTML(value)}</span>`;
+}
+
 export function renderSourcedValue(label, field) {
   const record = field && typeof field === "object" && !Array.isArray(field)
     ? field
@@ -199,7 +213,14 @@ export function renderRuntimeWorkers(runtime, options = {}) {
         ? '<p class="muted-text">Also listed in the model registry (display correlation only; not evidence).</p>'
         : "";
       const confirm = replacePending === id ? renderReplaceIdentityConfirm(id) : "";
-      return `<div class="runtime-item" data-runtime-worker="${escapeHTML(id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(id)}</div></div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)} · ${escapeHTML(worker.ollama_server_id)}</div><div class="model-meta">identity_approved: ${escapeHTML(worker.identity_approved)}</div>${renderSourcedValue("model_tag", worker.model_tag)}${renderSourcedValue("approved_model_digest", worker.approved_model_digest)}${renderSourcedValue("approved_runtime_version", worker.approved_runtime_version)}${renderSourcedValue("effective_context_tokens", worker.effective_context_tokens)}${renderSourcedValue("temperature", worker.temperature)}${renderSourcedValue("normalizer_id", worker.normalizer_id)}${renderSourcedValue("normalizer_version", worker.normalizer_version)}${correlation}${renderWorkerAttestation(attestationForWorker(worker, options.attestation))}${renderRuntimeIdentityResult(identityResults[id])}<div class="runtime-actions"><button type="button" class="small" data-runtime-approve="${escapeHTML(id)}" ${disabled}>Approve live identity</button><button type="button" class="ghost small" data-runtime-replace-ask="${escapeHTML(id)}" ${disabled}>Approve new identity</button></div>${confirm}</div>`;
+      const archived = worker.lifecycle_state === "ARCHIVED";
+      const itemClass = archived ? "runtime-item lifecycle-deemphasized" : "runtime-item";
+      const lifecycleAction = worker.reactivate_available
+        ? `<button type="button" class="small" data-runtime-reactivate="${escapeHTML(id)}" ${disabled}>Reactivate</button>`
+        : worker.archive_available
+          ? `<button type="button" class="ghost small" data-runtime-archive="${escapeHTML(id)}" ${disabled}>Archive</button>`
+          : "";
+      return `<div class="${itemClass}" data-runtime-worker="${escapeHTML(id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(id)}</div>${lifecycleBadge(worker.lifecycle_state)}</div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)} · ${escapeHTML(worker.ollama_server_id)}</div><div class="model-meta">identity_approved: ${escapeHTML(worker.identity_approved)}</div>${renderSourcedValue("model_tag", worker.model_tag)}${renderSourcedValue("approved_model_digest", worker.approved_model_digest)}${renderSourcedValue("approved_runtime_version", worker.approved_runtime_version)}${renderSourcedValue("effective_context_tokens", worker.effective_context_tokens)}${renderSourcedValue("temperature", worker.temperature)}${renderSourcedValue("normalizer_id", worker.normalizer_id)}${renderSourcedValue("normalizer_version", worker.normalizer_version)}${correlation}${renderWorkerAttestation(attestationForWorker(worker, options.attestation))}${renderRuntimeIdentityResult(identityResults[id])}<div class="runtime-actions"><button type="button" class="small" data-runtime-approve="${escapeHTML(id)}" ${disabled}>Approve live identity</button><button type="button" class="ghost small" data-runtime-replace-ask="${escapeHTML(id)}" ${disabled}>Approve new identity</button>${lifecycleAction}</div>${confirm}</div>`;
     })
     .join("");
 }
@@ -298,9 +319,10 @@ export function certificationStartEnabled(worker, options = {}) {
   return worker?.ready_for_certification === true;
 }
 
-export function certificationPreflightEnabled(options = {}) {
+export function certificationPreflightEnabled(worker, options = {}) {
   if (options.busy === true) return false;
   if (isCertificationActive(options.activeRun?.state)) return false;
+  if (worker?.lifecycle_state === "ARCHIVED") return false;
   return true;
 }
 
@@ -322,9 +344,10 @@ export function certificationPlannerStartEnabled(worker, options = {}) {
   return worker?.planner_ready_for_certification === true;
 }
 
-export function certificationPlannerPreflightEnabled(options = {}) {
+export function certificationPlannerPreflightEnabled(worker, options = {}) {
   if (options.busy === true) return false;
   if (isCertificationActive(options.activePlannerRun?.state)) return false;
+  if (worker?.lifecycle_state === "ARCHIVED") return false;
   return true;
 }
 
@@ -559,7 +582,7 @@ export function renderCertificationWorkerSummary(worker, selectedId, environment
     ? Object.entries(worker.roles).map(([role, status]) => `${escapeHTML(role)} ${escapeHTML(status?.status)}`).join(" · ")
     : "";
   const disabled = certificationWorkerSelectEnabled(options) ? "" : "disabled";
-  return `<button type="button" class="cert-item${selected}" data-cert-worker="${escapeHTML(worker.worker_id)}" ${disabled}><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(environment || worker.environment)}</div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="model-meta">runtime ${escapeHTML(worker.runtime?.status)} ${escapeHTML(worker.runtime?.reason)}</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">Baseline Security VALIDATION ${escapeHTML(worker.baseline_security?.status)} outcome ${escapeHTML(worker.baseline_security?.outcome)} environment ${escapeHTML(worker.baseline_security?.environment)}</div>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">roles ${roles}</div><div class="model-meta">Production eligibility — Planner</div>${certificationStateBadge(eligibility)}<div class="model-meta">${escapeHTML(worker.production_eligibility?.reason)}</div><div class="model-meta">source ${escapeHTML(worker.production_eligibility?.source)}</div><div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div></button>`;
+  return `<button type="button" class="cert-item${selected}" data-cert-worker="${escapeHTML(worker.worker_id)}" ${disabled}><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${lifecycleBadge(worker.lifecycle_state)}${certificationStateBadge(environment || worker.environment)}</div><div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="model-meta">runtime ${escapeHTML(worker.runtime?.status)} ${escapeHTML(worker.runtime?.reason)}</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">Baseline Security VALIDATION ${escapeHTML(worker.baseline_security?.status)} outcome ${escapeHTML(worker.baseline_security?.outcome)} environment ${escapeHTML(worker.baseline_security?.environment)}</div>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">roles ${roles}</div><div class="model-meta">Production eligibility — Planner</div>${certificationStateBadge(eligibility)}<div class="model-meta">${escapeHTML(worker.production_eligibility?.reason)}</div><div class="model-meta">source ${escapeHTML(worker.production_eligibility?.source)}</div><div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div></button>`;
 }
 
 export function renderCertificationWorkers(payload, selectedId, options = {}) {
@@ -594,14 +617,14 @@ export function renderCertificationWorkerDetail(worker, options = {}) {
     return '<p class="muted-text">Select a certification worker.</p>';
   }
   const startEnabled = certificationStartEnabled(worker, options);
-  const preflightEnabled = certificationPreflightEnabled(options);
+  const preflightEnabled = certificationPreflightEnabled(worker, options);
   const promoteEnabled = certificationPromoteEnabled(worker, options);
-  const plannerPreflightEnabled = certificationPlannerPreflightEnabled(options);
+  const plannerPreflightEnabled = certificationPlannerPreflightEnabled(worker, options);
   const plannerStartEnabled = certificationPlannerStartEnabled(worker, options);
   const correlation = (options.registryIds || []).includes(worker.worker_id)
     ? '<p class="muted-text">Also listed in the model registry (display correlation only; not evidence).</p>'
     : "";
-  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p><div class="section-label">Production Baseline Security</div><p class="muted-text">Promotion re-verifies the current VALIDATION PASS certificate against the live runtime and durable evidence, then durably records a SEPARATE PRODUCTION certificate. It never grants trust, permission, or a role certificate.</p><div class="model-meta" data-cert-promotion-available>promotion_available ${escapeHTML(worker.promotion_available)}</div><div class="model-meta" data-cert-promotion-reason>reason ${escapeHTML(worker.promotion_reason)}</div><div class="cert-actions"><button type="button" class="small" data-cert-promote="${escapeHTML(worker.worker_id)}" ${promoteEnabled ? "" : "disabled"}>Promote Baseline Security to PRODUCTION</button></div><p class="muted-text">This button reflects the backend's own promotion_available projection only. The browser never decides promotability itself.</p><div class="section-label">Planner role certification</div><p class="muted-text">A separate durable job/run track from Baseline Security. A PASS records a PRODUCTION Planner role certificate directly -- there is no promote step here. This is also separate from the "Role certificates" panel above, which shows the resulting certificate, not the run.</p>${renderCertificationPreflight(worker.planner_last_preflight)}<div class="model-meta">planner_ready_for_certification ${escapeHTML(worker.planner_ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-planner-preflight="${escapeHTML(worker.worker_id)}" ${plannerPreflightEnabled ? "" : "disabled"}>Run Planner preflight</button><button type="button" class="small" data-cert-planner-start="${escapeHTML(worker.worker_id)}" ${plannerStartEnabled ? "" : "disabled"}>Start Planner certification</button></div><p class="muted-text">Closing this browser does not cancel a durable Planner run.</p></div>`;
+  return `<div class="cert-panel" data-cert-detail="${escapeHTML(worker.worker_id)}"><div class="model-card-top"><div class="model-title">${escapeHTML(worker.worker_id)}</div>${lifecycleBadge(worker.lifecycle_state)}${certificationStateBadge(worker.environment)}</div>${correlation}<div class="model-meta">${escapeHTML(worker.kind)} · ${escapeHTML(worker.network_class)}</div><div class="section-label">Runtime / preflight</div>${certificationStateBadge(worker.runtime?.status)}<div class="model-meta">${escapeHTML(worker.runtime?.reason)}</div><div class="section-label">Baseline Security</div><p class="muted-text">VALIDATION certificate status. This does not write production state.</p>${certificationStateBadge(worker.baseline_security?.status)}<div class="model-meta">outcome ${escapeHTML(worker.baseline_security?.outcome)}</div><div class="model-meta">environment ${escapeHTML(worker.baseline_security?.environment)}</div>${renderCertificationIdentity(worker.identity)}${renderCertificationPreflight(worker.last_preflight)}${renderCertificationRoles(worker.roles, worker.future_actions)}${renderCertificationEligibility(worker.production_eligibility)}<div class="model-meta">ready_for_certification ${escapeHTML(worker.ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-preflight="${escapeHTML(worker.worker_id)}" ${preflightEnabled ? "" : "disabled"}>Run Baseline Security preflight</button><button type="button" class="small" data-cert-start="${escapeHTML(worker.worker_id)}" ${startEnabled ? "" : "disabled"}>Start Baseline Security certification</button></div><p class="muted-text">Preflight probes runtime and writes durable READY or INCOMPLETE state. It does not start certification. Closing this browser does not cancel a durable run.</p><div class="section-label">Production Baseline Security</div><p class="muted-text">Promotion re-verifies the current VALIDATION PASS certificate against the live runtime and durable evidence, then durably records a SEPARATE PRODUCTION certificate. It never grants trust, permission, or a role certificate.</p><div class="model-meta" data-cert-promotion-available>promotion_available ${escapeHTML(worker.promotion_available)}</div><div class="model-meta" data-cert-promotion-reason>reason ${escapeHTML(worker.promotion_reason)}</div><div class="cert-actions"><button type="button" class="small" data-cert-promote="${escapeHTML(worker.worker_id)}" ${promoteEnabled ? "" : "disabled"}>Promote Baseline Security to PRODUCTION</button></div><p class="muted-text">This button reflects the backend's own promotion_available projection only. The browser never decides promotability itself.</p><div class="section-label">Planner role certification</div><p class="muted-text">A separate durable job/run track from Baseline Security. A PASS records a PRODUCTION Planner role certificate directly -- there is no promote step here. This is also separate from the "Role certificates" panel above, which shows the resulting certificate, not the run.</p>${renderCertificationPreflight(worker.planner_last_preflight)}<div class="model-meta">planner_ready_for_certification ${escapeHTML(worker.planner_ready_for_certification)}</div><div class="cert-actions"><button type="button" class="ghost small" data-cert-planner-preflight="${escapeHTML(worker.worker_id)}" ${plannerPreflightEnabled ? "" : "disabled"}>Run Planner preflight</button><button type="button" class="small" data-cert-planner-start="${escapeHTML(worker.worker_id)}" ${plannerStartEnabled ? "" : "disabled"}>Start Planner certification</button></div><p class="muted-text">Closing this browser does not cancel a durable Planner run.</p></div>`;
 }
 
 

@@ -559,6 +559,18 @@ def runtime_approve_new_identity(worker_id):
     return jsonify(admin().approve_worker_identity(worker_id, allow_replace=True))
 
 
+@api.post("/runtime/workers/<worker_id>/archive")
+def runtime_archive_worker(worker_id):
+    json_object({})
+    return jsonify(admin().archive_worker(worker_id))
+
+
+@api.post("/runtime/workers/<worker_id>/reactivate")
+def runtime_reactivate_worker(worker_id):
+    json_object({})
+    return jsonify(admin().reactivate_worker(worker_id))
+
+
 @api.get("/tailscale")
 def tailscale_status():
     return jsonify(admin().tailscale_view())

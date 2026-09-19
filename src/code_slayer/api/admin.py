@@ -27,7 +27,9 @@ from code_slayer.config.schema import (
     OllamaServerConfig,
     WorkerRuntimeConfig,
 )
+from code_slayer.security.certification_service import KIND_BASELINE, KIND_PLANNER
 from code_slayer.security.live_certification import probe_ollama_inventory
+from code_slayer.store.certification_runs_repo import CertificationRunsRepo
 
 
 class AdminFacade:
@@ -159,8 +161,79 @@ class AdminFacade:
                 },
                 "identity_approved": worker.identity_approved,
                 "attestation": attestation,
+                **self._lifecycle_view(worker.worker_id),
             })
         return {"ollama_servers": servers, "workers": workers}
+
+    def _lifecycle_view(self, worker_id: str) -> dict:
+        """H.3: the DB `workers.lifecycle_state` merged into a config-
+        bound worker entry -- operator state, never runtime liveness.
+        A worker declared in persistent config but never yet registered
+        in the DB (should not normally happen once `refresh_persistent_
+        workers()` has run) reports ACTIVE/available -- there is
+        nothing to archive yet. `archive_available`/`reactivate_
+        available` are a display snapshot of current lifecycle only,
+        never a live-recomputed guarantee that a mutation will succeed
+        (the mutation itself is the real authority, and independently
+        enforces the active-work invariant)."""
+        with self._app.reads() as reads:
+            worker = reads.worker(worker_id)
+        if worker is None:
+            return {
+                "lifecycle_state": "ACTIVE",
+                "lifecycle_changed_at": None,
+                "archive_available": True,
+                "archive_reason": "",
+                "reactivate_available": False,
+                "reactivate_reason": "not_archived",
+            }
+        active = worker.lifecycle_state == "ACTIVE"
+        return {
+            "lifecycle_state": worker.lifecycle_state,
+            "lifecycle_changed_at": worker.lifecycle_changed_at,
+            "archive_available": active,
+            "archive_reason": "" if active else "already_archived",
+            "reactivate_available": not active,
+            "reactivate_reason": "" if not active else "already_active",
+        }
+
+    def _active_certification_work_reason(self, worker_id: str) -> str | None:
+        """H.3: a SEPARATE, best-effort, non-atomic, cross-DB
+        precondition (never part of the canonical lifecycle
+        transaction -- see `workers.lifecycle`'s own module docstring
+        for exactly why, and why correctness never depends on this
+        alone). `None` means no QUEUED/RUNNING Certification Center run
+        was observed for either track at the moment of this read; a
+        READY (not yet started) run is never "active work" here, same
+        as `workers.lifecycle`'s own runner_runs policy."""
+        with self._app.certification() as service:
+            conn = service.validation_conn()
+            for kind in (KIND_BASELINE, KIND_PLANNER):
+                active = CertificationRunsRepo(conn).active_for_worker(worker_id, kind=kind)
+                if active is not None and active.state in ("QUEUED", "RUNNING"):
+                    return "worker_has_active_work"
+        return None
+
+    def archive_worker(self, worker_id: str) -> dict:
+        blocking = self._active_certification_work_reason(worker_id)
+        if blocking is not None:
+            raise APIError(blocking, "A certification run is currently active.", 409)
+        with self._app.runner() as runner:
+            result = runner.archive_worker(worker_id)
+        if not result.ok:
+            if result.reason == "unknown_worker":
+                raise APIError("not_found", "Worker is not registered.", 404)
+            raise APIError(result.reason, "Worker has active work and cannot be archived.", 409)
+        return self._lifecycle_view(worker_id)
+
+    def reactivate_worker(self, worker_id: str) -> dict:
+        with self._app.runner() as runner:
+            result = runner.reactivate_worker(worker_id)
+        if not result.ok:
+            if result.reason == "unknown_worker":
+                raise APIError("not_found", "Worker is not registered.", 404)
+            raise APIError(result.reason, "Worker could not be reactivated.", 409)
+        return self._lifecycle_view(worker_id)
 
     def add_ollama_server(self, server_id: str, origin: str) -> dict:
         try:

@@ -336,7 +336,7 @@ function runtimeControls() {
   }
   document
     .querySelectorAll(
-      "[data-runtime-test-server], [data-runtime-approve], [data-runtime-replace-ask], [data-runtime-replace-confirm], [data-runtime-replace-cancel]",
+      "[data-runtime-test-server], [data-runtime-approve], [data-runtime-replace-ask], [data-runtime-replace-confirm], [data-runtime-replace-cancel], [data-runtime-archive], [data-runtime-reactivate]",
     )
     .forEach((el) => {
       el.disabled = busy;
@@ -679,7 +679,9 @@ function certificationControls() {
     el.disabled = busy;
   });
   document.querySelectorAll("[data-cert-preflight]").forEach((el) => {
-    el.disabled = busy || active;
+    el.disabled = !certificationPreflightEnabled(state.selectedCertificationWorker, {
+      busy, activeRun: state.certificationActiveRun,
+    });
   });
   document.querySelectorAll("[data-cert-start]").forEach((el) => {
     el.disabled = busy
@@ -693,7 +695,7 @@ function certificationControls() {
     });
   });
   document.querySelectorAll("[data-cert-planner-preflight]").forEach((el) => {
-    el.disabled = !certificationPlannerPreflightEnabled({
+    el.disabled = !certificationPlannerPreflightEnabled(state.selectedCertificationWorker, {
       busy: state.certificationBusy,
       activePlannerRun: state.certificationActivePlannerRun,
     });
@@ -1146,6 +1148,8 @@ $("runtime-stack").addEventListener("click", (event) => {
   const replaceAsk = event.target.closest("[data-runtime-replace-ask]");
   const replaceConfirm = event.target.closest("[data-runtime-replace-confirm]");
   const replaceCancel = event.target.closest("[data-runtime-replace-cancel]");
+  const archiveButton = event.target.closest("[data-runtime-archive]");
+  const reactivateButton = event.target.closest("[data-runtime-reactivate]");
   if (testButton) {
     runtimeAction(() => observeServerTest(testButton.dataset.runtimeTestServer));
     return;
@@ -1177,6 +1181,26 @@ $("runtime-stack").addEventListener("click", (event) => {
       const snapshot = await api.runtime();
       acceptIdentityResult(state, workerId, result, snapshot);
     }));
+    return;
+  }
+  if (archiveButton) {
+    const workerId = archiveButton.dataset.runtimeArchive;
+    runtimeAction(() => mutateRuntime(async () => {
+      await api.archiveRuntimeWorker(workerId);
+      // Never trust the mutation response's own echoed state as final --
+      // refresh durable state, same as every other runtime mutation here.
+      const snapshot = await api.runtime();
+      acceptRuntimeSnapshot(state, snapshot);
+    }), "Worker archived.");
+    return;
+  }
+  if (reactivateButton) {
+    const workerId = reactivateButton.dataset.runtimeReactivate;
+    runtimeAction(() => mutateRuntime(async () => {
+      await api.reactivateRuntimeWorker(workerId);
+      const snapshot = await api.runtime();
+      acceptRuntimeSnapshot(state, snapshot);
+    }), "Worker reactivated.");
   }
 });
 $("intel-refresh").addEventListener("click", async () => {
@@ -1354,7 +1378,7 @@ $("cert-stack").addEventListener("click", (event) => {
   if (preflightButton) {
     const workerId = preflightButton.dataset.certPreflight;
     const version = state.certificationSelectionVersion;
-    if (!certificationPreflightEnabled({
+    if (!certificationPreflightEnabled(state.selectedCertificationWorker, {
       busy: state.certificationBusy,
       activeRun: state.certificationActiveRun,
     })) return;
@@ -1418,7 +1442,7 @@ $("cert-stack").addEventListener("click", (event) => {
   if (plannerPreflightButton) {
     const workerId = plannerPreflightButton.dataset.certPlannerPreflight;
     const version = state.certificationSelectionVersion;
-    if (!certificationPlannerPreflightEnabled({
+    if (!certificationPlannerPreflightEnabled(state.selectedCertificationWorker, {
       busy: state.certificationBusy,
       activePlannerRun: state.certificationActivePlannerRun,
     })) return;

@@ -493,6 +493,142 @@ def test_add_test_register_approve_identity(admin_app, runtime_server):
     assert any(item["worker_id"] == "w1" for item in workers)
 
 
+# -- H.3: archive/reactivate admin routes ------------------------------------
+
+
+def _register_worker(client, worker_id="w1"):
+    return client.post(
+        "/api/runtime/workers",
+        json={"worker_id": worker_id, "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+
+
+def test_archive_reactivate_round_trip_via_http(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    _register_worker(client)
+
+    before = client.get("/api/runtime").get_json()
+    worker_before = next(w for w in before["workers"] if w["worker_id"] == "w1")
+    assert worker_before["lifecycle_state"] == "ACTIVE"
+    assert worker_before["lifecycle_changed_at"] is None
+    assert worker_before["archive_available"] is True
+    assert worker_before["reactivate_available"] is False
+
+    archived = client.post("/api/runtime/workers/w1/archive", json={})
+    assert archived.status_code == 200
+    body = archived.get_json()
+    assert body["lifecycle_state"] == "ARCHIVED"
+    assert body["lifecycle_changed_at"] is not None
+    assert body["archive_available"] is False
+    assert body["reactivate_available"] is True
+
+    after = client.get("/api/runtime").get_json()
+    worker_after = next(w for w in after["workers"] if w["worker_id"] == "w1")
+    assert worker_after["lifecycle_state"] == "ARCHIVED"
+    # ARCHIVED workers remain listed, never hidden from /api/runtime.
+    assert any(w["worker_id"] == "w1" for w in after["workers"])
+
+    reactivated = client.post("/api/runtime/workers/w1/reactivate", json={})
+    assert reactivated.status_code == 200
+    assert reactivated.get_json()["lifecycle_state"] == "ACTIVE"
+    assert reactivated.get_json()["archive_available"] is True
+
+
+def test_archive_reactivate_idempotent_no_op_returns_200(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    _register_worker(client)
+
+    client.post("/api/runtime/workers/w1/archive", json={})
+    second = client.post("/api/runtime/workers/w1/archive", json={})
+    assert second.status_code == 200
+    assert second.get_json()["lifecycle_state"] == "ARCHIVED"
+
+    client.post("/api/runtime/workers/w1/reactivate", json={})
+    second_reactivate = client.post("/api/runtime/workers/w1/reactivate", json={})
+    assert second_reactivate.status_code == 200
+    assert second_reactivate.get_json()["lifecycle_state"] == "ACTIVE"
+
+
+def test_archive_unknown_worker_is_404(admin_app):
+    client, _app, _config, _repo = admin_app
+    response = client.post("/api/runtime/workers/ghost/archive", json={})
+    assert response.status_code == 404
+    assert response.get_json()["error"]["code"] == "not_found"
+
+
+def test_reactivate_unknown_worker_is_404(admin_app):
+    client, _app, _config, _repo = admin_app
+    response = client.post("/api/runtime/workers/ghost/reactivate", json={})
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("route", ["archive", "reactivate"])
+def test_archive_reactivate_accept_only_an_empty_body(admin_app, runtime_server, route):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    _register_worker(client)
+
+    for bad_field, value in (
+        ("state", "ARCHIVED"),
+        ("reason", "operator request"),
+        ("force", True),
+        ("certificate_id", "cert-1"),
+        ("fingerprint", "abc"),
+        ("digest", "sha256:abc"),
+        ("eligibility", True),
+        ("cancel_active_work", True),
+    ):
+        response = client.post(f"/api/runtime/workers/w1/{route}", json={bad_field: value})
+        assert response.status_code == 400, bad_field
+        assert response.get_json()["error"]["code"] == "invalid_fields"
+
+    ok = client.post(f"/api/runtime/workers/w1/{route}", json={})
+    assert ok.status_code == 200
+
+
+def test_archive_refuses_while_a_certification_run_is_active(admin_app, runtime_server):
+    """The cross-DB precondition: a QUEUED/RUNNING Certification Center
+    run for this worker refuses the archive attempt before the
+    canonical lifecycle transaction is even opened."""
+    from code_slayer.repo import identity as repo_identity
+    from code_slayer.security.certification_service import CertificationService
+    from code_slayer.store.certification_runs_repo import CertificationRunsRepo
+    from code_slayer.store.db import transaction, utcnow_iso
+    from code_slayer.store.workers_repo import WorkersRepo
+
+    client, _app, _config, repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    _register_worker(client)
+
+    resolved = repo_identity.resolve(repo, create=False)
+    service = CertificationService(resolved.repo_id, resolved.worktree_id)
+    try:
+        WorkersRepo(service.validation_conn()).register(
+            worker_id="w1", kind="fake", network_class="local",
+        )
+        with transaction(service.validation_conn()):
+            CertificationRunsRepo(service.validation_conn()).create_in_transaction(
+                run_id="run-active", worker_id="w1", kind="baseline_security",
+                environment="VALIDATION", state="QUEUED", created_at=utcnow_iso(),
+            )
+    finally:
+        service.close()
+
+    response = client.post("/api/runtime/workers/w1/archive", json={})
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "worker_has_active_work"
+
+    still_active = client.get("/api/runtime").get_json()
+    worker = next(w for w in still_active["workers"] if w["worker_id"] == "w1")
+    assert worker["lifecycle_state"] == "ACTIVE"
+
+
 def test_mismatch_without_replace_does_not_overwrite(admin_app, runtime_server):
     client, _app, config, _repo = admin_app
     script, origin = runtime_server

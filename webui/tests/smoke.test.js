@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
-import { provenanceClass, provenanceBadge, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, certificationPromoteEnabled, certificationPlannerStartEnabled, certificationPlannerPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, acceptCertificationPromotion, beginCertificationPlannerPreflight, acceptCertificationPlannerPreflight, beginCertificationPlannerRun, acceptCertificationPlannerStart, applyCertificationPlannerPoll, clearCertificationTransient, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
+import { provenanceClass, provenanceBadge, lifecycleBadge, lifecycleBadgeClass, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, certificationPromoteEnabled, certificationPlannerStartEnabled, certificationPlannerPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, acceptCertificationPromotion, beginCertificationPlannerPreflight, acceptCertificationPlannerPreflight, beginCertificationPlannerRun, acceptCertificationPlannerStart, applyCertificationPlannerPoll, clearCertificationTransient, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
 import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
@@ -953,6 +953,93 @@ test("runtime workers display digest and version and do not post them", () => {
   assert.doesNotMatch(html, /data-runtime-replace-confirm/);
 });
 
+// -- H.3: administrative worker lifecycle (ACTIVE/ARCHIVED) ------------------
+
+test("lifecycleBadge renders the backend state verbatim and escapes it", () => {
+  assert.match(lifecycleBadge("ACTIVE"), /badge lifecycle lifecycle-active">ACTIVE</);
+  assert.match(lifecycleBadge("ARCHIVED"), /badge lifecycle lifecycle-archived">ARCHIVED</);
+  assert.equal(lifecycleBadgeClass("ACTIVE"), "lifecycle-active");
+  assert.equal(lifecycleBadgeClass("ARCHIVED"), "lifecycle-archived");
+  // Undefined/missing defaults to ACTIVE display, never a blank/broken badge.
+  assert.match(lifecycleBadge(undefined), />ACTIVE</);
+  assert.doesNotMatch(lifecycleBadge('<img src=x onerror="alert(1)">'), /<img/);
+});
+
+test("runtime worker card shows an Archive action for an ACTIVE worker with archive_available", () => {
+  const html = renderRuntimeWorkers({
+    workers: [{
+      ...runtimeConfig.workers[0],
+      lifecycle_state: "ACTIVE",
+      lifecycle_changed_at: null,
+      archive_available: true,
+      archive_reason: "",
+      reactivate_available: false,
+      reactivate_reason: "not_archived",
+    }],
+  });
+  assert.match(html, /badge lifecycle lifecycle-active">ACTIVE</);
+  assert.match(html, /data-runtime-archive="w1"/);
+  assert.doesNotMatch(html, /data-runtime-reactivate="w1"/);
+  assert.doesNotMatch(html, /lifecycle-deemphasized/);
+});
+
+test("runtime worker card shows a Reactivate action and de-emphasized styling for an ARCHIVED worker", () => {
+  const html = renderRuntimeWorkers({
+    workers: [{
+      ...runtimeConfig.workers[0],
+      lifecycle_state: "ARCHIVED",
+      lifecycle_changed_at: "2026-01-01T00:00:00.000000Z",
+      archive_available: false,
+      archive_reason: "already_archived",
+      reactivate_available: true,
+      reactivate_reason: "",
+    }],
+  });
+  assert.match(html, /badge lifecycle lifecycle-archived">ARCHIVED</);
+  assert.match(html, /data-runtime-reactivate="w1"/);
+  assert.doesNotMatch(html, /data-runtime-archive="w1"/);
+  assert.match(html, /lifecycle-deemphasized/);
+  // Runtime/config identity remains inspectable even while archived.
+  assert.match(html, /sha256:abc/);
+  assert.match(html, /approved_model_digest/);
+});
+
+test("api.js exposes archiveRuntimeWorker/reactivateRuntimeWorker as POSTs with an empty body", async () => {
+  const calls = [];
+  const fetcher = async (url, opts) => {
+    calls.push({ url, opts });
+    return reply({ lifecycle_state: "ARCHIVED" });
+  };
+  const api = createAPI(fetcher);
+  await api.archiveRuntimeWorker("w1");
+  await api.reactivateRuntimeWorker("w1");
+  assert.equal(calls[0].url, "/api/runtime/workers/w1/archive");
+  assert.equal(calls[0].opts.method, "POST");
+  assert.equal(calls[0].opts.body, JSON.stringify({}));
+  assert.equal(calls[1].url, "/api/runtime/workers/w1/reactivate");
+  assert.equal(calls[1].opts.method, "POST");
+  assert.equal(calls[1].opts.body, JSON.stringify({}));
+});
+
+test("archive/reactivate wiring refreshes the full runtime snapshot, never trusts the mutation echo", async () => {
+  const appSource = await readFile(new URL("../static/app.js", import.meta.url), "utf8");
+  const clickHandlerStart = appSource.indexOf('$("runtime-stack").addEventListener("click"');
+  const clickHandlerEnd = appSource.indexOf('$("intel-refresh")');
+  const handler = appSource.slice(clickHandlerStart, clickHandlerEnd);
+  assert.match(handler, /data-runtime-archive/);
+  assert.match(handler, /data-runtime-reactivate/);
+  assert.match(handler, /api\.archiveRuntimeWorker\(workerId\)/);
+  assert.match(handler, /api\.reactivateRuntimeWorker\(workerId\)/);
+  // Both mutations refresh via GET /api/runtime and route through
+  // mutateRuntime() (the same fail-closed wrapper as every other
+  // runtime mutation) -- never a bespoke retry of the archive/
+  // reactivate call itself.
+  const archiveBlock = handler.slice(handler.indexOf("if (archiveButton)"));
+  assert.match(archiveBlock, /mutateRuntime\(async \(\) => \{/);
+  assert.match(archiveBlock, /const snapshot = await api\.runtime\(\)/);
+  assert.match(archiveBlock, /acceptRuntimeSnapshot\(state, snapshot\)/);
+});
+
 test("registerRuntimeWorker payload copies only supplied allowlisted fields", () => {
   assert.deepEqual(runtimeRegistrationPayload({
     worker_id: "w1",
@@ -1251,7 +1338,10 @@ test("app.js fail-closes runtime evidence on GET, attest, add, register and appr
   assert.match(appSource, /acceptRuntimeAttest\(state, result\)/);
   assert.match(appSource, /const snapshot = await api\.addOllamaServer/);
   assert.match(appSource, /const snapshot = await api\.registerRuntimeWorker/);
-  assert.equal((appSource.match(/acceptRuntimeSnapshot\(state, snapshot\)/g) || []).length, 3);
+  // 5 (was 3 pre-H.3): addOllamaServer, registerRuntimeWorker, and the
+  // three mutations that refresh the full snapshot afterward for their
+  // own evidence -- approve-new-identity, archive, reactivate.
+  assert.equal((appSource.match(/acceptRuntimeSnapshot\(state, snapshot\)/g) || []).length, 5);
   assert.match(appSource, /acceptIdentityResult\(state, workerId, result, snapshot\)/);
 });
 
@@ -1312,7 +1402,10 @@ test("failed add/register/approve mutations invalidate the runtime snapshot", as
   const mutateFn = appSource.slice(mutateStart, mutateEnd);
   assert.match(mutateFn, /rejectRuntimeSnapshot\(state\)/);
   assert.equal((mutateFn.match(/work\(\)/g) || []).length, 1);
-  assert.equal((appSource.match(/mutateRuntime\(/g) || []).length, 5);
+  // 7 (was 5 pre-H.3): the "async function mutateRuntime(" definition
+  // itself, plus 6 call sites -- add server, register, approve,
+  // approve-new-identity, and the new archive/reactivate mutations.
+  assert.equal((appSource.match(/mutateRuntime\(/g) || []).length, 7);
   assert.match(appSource, /mutateRuntime\(async \(\) => \{\n    const snapshot = await api\.addOllamaServer/);
   assert.match(appSource, /mutateRuntime\(async \(\) => \{\n    const snapshot = await api\.registerRuntimeWorker/);
   assert.match(appSource, /mutateRuntime\(async \(\) => \{\n      const result = await api\.approveRuntimeWorker/);
@@ -1707,10 +1800,14 @@ test("H.2: Planner certification action is a separate track from Baseline Securi
     certificationPlannerStartEnabled(ready, { activeRun: { state: "RUNNING" } }),
     true,
   );
-  assert.equal(certificationPlannerPreflightEnabled(), true);
-  assert.equal(certificationPlannerPreflightEnabled({ busy: true }), false);
+  assert.equal(certificationPlannerPreflightEnabled(ready), true);
+  assert.equal(certificationPlannerPreflightEnabled(ready, { busy: true }), false);
   assert.equal(
-    certificationPlannerPreflightEnabled({ activePlannerRun: { state: "QUEUED" } }),
+    certificationPlannerPreflightEnabled(ready, { activePlannerRun: { state: "QUEUED" } }),
+    false,
+  );
+  assert.equal(
+    certificationPlannerPreflightEnabled({ ...ready, lifecycle_state: "ARCHIVED" }),
     false,
   );
 
@@ -1920,8 +2017,8 @@ test("QUEUED and RUNNING active runs disable start and preflight; terminal state
   const readyWorker = { ...certWorker, ready_for_certification: true };
   assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state: "QUEUED" } }), false);
   assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state: "RUNNING" } }), false);
-  assert.equal(certificationPreflightEnabled({ activeRun: { state: "QUEUED" } }), false);
-  assert.equal(certificationPreflightEnabled({ activeRun: { state: "RUNNING" } }), false);
+  assert.equal(certificationPreflightEnabled(readyWorker, { activeRun: { state: "QUEUED" } }), false);
+  assert.equal(certificationPreflightEnabled(readyWorker, { activeRun: { state: "RUNNING" } }), false);
   const queued = renderCertificationWorkerDetail(readyWorker, { activeRun: { state: "QUEUED" } });
   assert.match(queued, /data-cert-start="cw1" disabled/);
   assert.match(queued, /data-cert-preflight="cw1" disabled/);
@@ -1931,8 +2028,12 @@ test("QUEUED and RUNNING active runs disable start and preflight; terminal state
   for (const state of ["PASS", "FAIL", "HARD_DISQUALIFIED", "INCOMPLETE"]) {
     assert.equal(certificationStartEnabled(readyWorker, { activeRun: { state } }), true);
     assert.equal(certificationStartEnabled(certWorker, { activeRun: { state } }), false);
-    assert.equal(certificationPreflightEnabled({ activeRun: { state } }), true);
+    assert.equal(certificationPreflightEnabled(readyWorker, { activeRun: { state } }), true);
   }
+  assert.equal(
+    certificationPreflightEnabled({ ...readyWorker, lifecycle_state: "ARCHIVED" }),
+    false,
+  );
   const passNotReady = renderCertificationWorkerDetail(certWorker, { activeRun: { state: "PASS" } });
   assert.match(passNotReady, /data-cert-start="cw1" disabled/);
   assert.doesNotMatch(passNotReady, /data-cert-preflight="cw1" disabled/);
