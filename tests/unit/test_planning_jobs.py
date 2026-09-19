@@ -70,6 +70,7 @@ WORKER_ID = "w1"
 POLICY_VERSION = "planner-certification-v1"
 OUTPUT_TOKEN_BUDGET = 4096
 TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
+PLANNER_TIMEOUT_SECONDS = 45.0
 OLLAMA_ROOT = "http://local:11434"
 
 
@@ -196,6 +197,7 @@ def _seed_route(
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     role = record_role_certificate(
@@ -213,6 +215,7 @@ def _seed_route(
         role_certificate_id=role.certificate.certificate_id,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         planner_policy_version=POLICY_VERSION,
     )
     baseline_targets = (
@@ -232,7 +235,8 @@ def _seed_route(
         RoleEvaluationTarget(
             worker_id=worker_id, role=ProductionRole.PLANNER,
             output_token_budget=OUTPUT_TOKEN_BUDGET,
-            tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT, policy_version=POLICY_VERSION,
+            tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+            planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, policy_version=POLICY_VERSION,
         ),
     )
     return binding, baseline_targets, role_targets
@@ -976,6 +980,7 @@ def test_certified_output_token_budget_reaches_the_adapter_http_payload(
         role=ProductionRole.PLANNER,
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=budget, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     role = record_role_certificate(
@@ -992,6 +997,7 @@ def test_certified_output_token_budget_reaches_the_adapter_http_payload(
         security_certificate_id=security.certificate.certificate_id,
         role_certificate_id=role.certificate.certificate_id,
         output_token_budget=budget, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         planner_policy_version=POLICY_VERSION,
     )
     baseline_targets = (
@@ -1009,7 +1015,7 @@ def test_certified_output_token_budget_reaches_the_adapter_http_payload(
         RoleEvaluationTarget(
             worker_id="budget-worker", role=ProductionRole.PLANNER,
             output_token_budget=budget, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
-            policy_version=POLICY_VERSION,
+            planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, policy_version=POLICY_VERSION,
         ),
     )
     job = service.create_job(

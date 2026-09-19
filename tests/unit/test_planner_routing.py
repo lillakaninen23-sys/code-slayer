@@ -46,6 +46,7 @@ from code_slayer.workers.security_baseline import (
 POLICY_VERSION = "planner-certification-v1"
 OUTPUT_TOKEN_BUDGET = 4096
 TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
+PLANNER_TIMEOUT_SECONDS = 45.0
 OLLAMA_ROOT = "http://local:11434"  # never live-probed unless a test opts in
 
 
@@ -116,10 +117,13 @@ def _target(worker_id: str, *, root: str = OLLAMA_ROOT, model_tag: str = "devstr
     )
 
 
-def _role_target(worker_id: str) -> RoleEvaluationTarget:
+def _role_target(
+    worker_id: str, *, planner_timeout_seconds: float = PLANNER_TIMEOUT_SECONDS,
+) -> RoleEvaluationTarget:
     return RoleEvaluationTarget(
         worker_id=worker_id, role=ProductionRole.PLANNER,
         output_token_budget=OUTPUT_TOKEN_BUDGET, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=planner_timeout_seconds,
         policy_version=POLICY_VERSION,
     )
 
@@ -139,6 +143,7 @@ def _certify_eligible(
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     role = record_role_certificate(
@@ -156,6 +161,7 @@ def _certify_eligible(
         role_certificate_id=role.certificate.certificate_id,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         planner_policy_version=POLICY_VERSION,
     )
 
@@ -298,7 +304,8 @@ def test_revalidate_refuses_when_output_token_budget_changed_in_config(db_conn):
     changed_role_target = RoleEvaluationTarget(
         worker_id="w1", role=ProductionRole.PLANNER,
         output_token_budget=8192,  # different from the certified 4096
-        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT, policy_version=POLICY_VERSION,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, policy_version=POLICY_VERSION,
     )
     result = revalidate_route_binding(
         db_conn, binding, baseline_targets=(_target("w1"),), role_targets=(changed_role_target,),
@@ -308,6 +315,23 @@ def test_revalidate_refuses_when_output_token_budget_changed_in_config(db_conn):
     # A different output_token_budget changes the role-evaluation
     # fingerprint itself, so this worker is no longer eligible under
     # that (now-unmatched) role-evaluation profile at all.
+    assert result.outcome in (
+        RevalidationOutcome.ROUTE_BINDING_STALE, RevalidationOutcome.WORKER_NOT_ELIGIBLE,
+    )
+
+
+def test_revalidate_refuses_when_planner_timeout_changed_in_config(db_conn):
+    """H.4.1: a job bound at `planner_timeout_seconds=45.0` must NEVER
+    silently adopt a later config timeout -- proves the ninth
+    route-binding field participates in the same exact-match staleness
+    check as the original eight."""
+    binding = _certify_eligible(db_conn, "w1")
+    changed_role_target = _role_target("w1", planner_timeout_seconds=300.0)
+    result = revalidate_route_binding(
+        db_conn, binding, baseline_targets=(_target("w1"),), role_targets=(changed_role_target,),
+        verify_live_runtime=False,
+    )
+    assert not result.ok
     assert result.outcome in (
         RevalidationOutcome.ROUTE_BINDING_STALE, RevalidationOutcome.WORKER_NOT_ELIGIBLE,
     )
@@ -343,7 +367,7 @@ class _FakeJobRow:
         for key in (
             "worker_id", "runtime_identity_fingerprint", "role_evaluation_fingerprint",
             "security_certificate_id", "role_certificate_id", "output_token_budget",
-            "tool_choice_enforcement", "planner_policy_version",
+            "tool_choice_enforcement", "planner_policy_version", "planner_timeout_seconds",
         ):
             setattr(self, key, kwargs.get(key))
 
@@ -353,17 +377,30 @@ def test_route_binding_from_job_reconstructs_a_bound_job():
         worker_id="w1", runtime_identity_fingerprint="rf", role_evaluation_fingerprint="ef",
         security_certificate_id="sec-1", role_certificate_id="role-1",
         output_token_budget=4096, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
-        planner_policy_version=POLICY_VERSION,
+        planner_timeout_seconds=45.0, planner_policy_version=POLICY_VERSION,
     )
     binding = route_binding_from_job(row)
     assert binding == PlannerRouteBinding(
         worker_id="w1", runtime_identity_fingerprint="rf", role_evaluation_fingerprint="ef",
         security_certificate_id="sec-1", role_certificate_id="role-1",
         output_token_budget=4096, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
-        planner_policy_version=POLICY_VERSION,
+        planner_timeout_seconds=45.0, planner_policy_version=POLICY_VERSION,
     )
 
 
 def test_route_binding_from_job_is_none_for_legacy_unbound_job():
     row = _FakeJobRow(worker_id=None)
+    assert route_binding_from_job(row) is None
+
+
+def test_route_binding_from_job_is_none_for_v19_job_missing_timeout():
+    """H.4.1: a schema-v19 job (fully bound to a worker, but created
+    before `planner_timeout_seconds` existed) is treated as unbound here
+    -- never reconstructed with a guessed timeout."""
+    row = _FakeJobRow(
+        worker_id="w1", runtime_identity_fingerprint="rf", role_evaluation_fingerprint="ef",
+        security_certificate_id="sec-1", role_certificate_id="role-1",
+        output_token_budget=4096, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_policy_version=POLICY_VERSION, planner_timeout_seconds=None,
+    )
     assert route_binding_from_job(row) is None

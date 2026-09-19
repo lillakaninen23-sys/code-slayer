@@ -57,6 +57,7 @@ WORKER_ID = "w1"
 POLICY_VERSION = "planner-certification-v1"
 OUTPUT_TOKEN_BUDGET = 4096
 TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
+PLANNER_TIMEOUT_SECONDS = 45.0
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +154,7 @@ def _seed_eligible_worker(app, root: str, *, worker_id: str = WORKER_ID) -> None
             runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
             output_token_budget=OUTPUT_TOKEN_BUDGET,
             tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+            execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
             policy_version=POLICY_VERSION,
         )
         role = record_role_certificate(
@@ -185,7 +187,7 @@ def _role_target(*, worker_id: str = WORKER_ID) -> RoleEvaluationTarget:
     return RoleEvaluationTarget(
         worker_id=worker_id, role=ProductionRole.PLANNER,
         output_token_budget=OUTPUT_TOKEN_BUDGET, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
-        policy_version=POLICY_VERSION,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, policy_version=POLICY_VERSION,
     )
 
 
@@ -250,6 +252,7 @@ def test_create_returns_202_immediately_then_reaches_ready_over_http(
     assert job["state"] == "QUEUED"
     assert job["worker_id"] == WORKER_ID
     assert job["output_token_budget"] == OUTPUT_TOKEN_BUDGET
+    assert job["planner_timeout_seconds"] == PLANNER_TIMEOUT_SECONDS
     plan_id = job["plan_id"]
     assert created.headers["Location"] == job["status_url"] == f"/api/planning-jobs/{job['job_id']}"
 
@@ -335,6 +338,10 @@ def test_blocked_plan_resolution_and_async_replan_over_http(git_repo_with_commit
     # certificate authority for a planning mutation -- the backend
     # always selects it.
     "worker_id", "model", "certificate_id", "runtime_identity_fingerprint",
+    # H.4.1: nor the Planner inference timeout -- it is server-owned,
+    # certified route-binding provenance exactly like the fields above,
+    # never a client-supplied override.
+    "planner_timeout_seconds",
 ])
 def test_api_rejects_forbidden_authority_fields(git_repo_with_commit, ollama_server, field):
     client, _ = application(
@@ -367,6 +374,23 @@ def test_post_plans_with_worker_id_creates_nothing(git_repo_with_commit, ollama_
     exercise."""
     client, _ = application(git_repo_with_commit, ollama_server)
     response = client.post("/api/plans", json={"request": REQUEST, "worker_id": WORKER_ID})
+    assert response.status_code == 400
+    assert response.json["error"]["code"] == "invalid_fields"
+    assert client.get("/api/planning-jobs").get_json()["jobs"] == []
+    assert client.get("/api/plans").get_json()["plans"] == []
+
+
+def test_post_plans_with_planner_timeout_seconds_creates_nothing(
+    git_repo_with_commit, ollama_server,
+):
+    """H.4.1 mandatory regression: `POST /api/plans` with a client-
+    supplied `planner_timeout_seconds` must fail closed with
+    `invalid_fields` -- no plan, no job, ever created -- mirroring
+    `test_post_plans_with_worker_id_creates_nothing` for the new field."""
+    client, _ = application(git_repo_with_commit, ollama_server)
+    response = client.post(
+        "/api/plans", json={"request": REQUEST, "planner_timeout_seconds": 999},
+    )
     assert response.status_code == 400
     assert response.json["error"]["code"] == "invalid_fields"
     assert client.get("/api/planning-jobs").get_json()["jobs"] == []
@@ -471,6 +495,7 @@ def test_executor_observes_persistent_config_changed_after_construction(
         normalizer_id=None, normalizer_version=None,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         planner_policy_version=POLICY_VERSION,
     )
     save_config(

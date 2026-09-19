@@ -170,6 +170,7 @@ def _role_target() -> RoleEvaluationTarget:
         role=ProductionRole.PLANNER,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        planner_timeout_seconds=45.0,
         policy_version="planner-certification-v1",
     )
 
@@ -203,6 +204,7 @@ def app_client(git_repo_with_commit, runtime_server):
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version="planner-certification-v1",
     )
     resolved = repo_identity.resolve(git_repo_with_commit, create=False)

@@ -69,6 +69,7 @@ def seeded(db_conn, profile, tmp_path):
         role=ProductionRole.PLANNER,
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=4096, tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version=POLICY_VERSION,
     )
     role = record_role_certificate(

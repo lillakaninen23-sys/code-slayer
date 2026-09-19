@@ -92,6 +92,7 @@ def _eval_for(profile, **overrides):
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version=POLICY_VERSION,
     )
     kwargs.update(overrides)
@@ -370,6 +371,7 @@ def test_missing_new_identity_fields_fail_closed(db_conn, registered_worker):
             runtime_identity_fingerprint=None,
             output_token_budget=4096,
             tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+            execution_timeout_seconds=45.0,
             policy_version=POLICY_VERSION,
         )
 
@@ -545,11 +547,12 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
 
 def test_schema_v17_is_known_and_prior_identity_migrations_are_untouched():
     # Bumped to 19 by H.4 (`planner_worker_routing`, after H.3's own
-    # bump to 18 for `worker_lifecycle`) -- this test's own purpose
-    # (every prior identity-related migration this file cares about is
-    # still present and untouched) still holds; it is not itself a
-    # claim that 19 is the LAST version anything may ever add.
-    assert db_module.known_schema_version() == 19
+    # bump to 18 for `worker_lifecycle`), then to 20 by H.4.1
+    # (`planner_timeout_binding`) -- this test's own purpose (every
+    # prior identity-related migration this file cares about is still
+    # present and untouched) still holds; it is not itself a claim that
+    # 20 is the LAST version anything may ever add.
+    assert db_module.known_schema_version() == 20
     names = [name for _version, name, _sql in db_module._discover_migrations()]
     assert "runtime_profile_normalizer_identity" in names
     assert "runtime_config_fingerprint" in names
@@ -588,6 +591,7 @@ def test_durable_planner_evidence_round_trips_both_fingerprints_and_detects_tamp
         endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
         temperature=0.0,
+        planner_timeout_seconds=45.0,
     )
     planner = FakePlanner(
         [
@@ -716,10 +720,11 @@ def test_generic_role_evaluation_identity_is_not_planner_specific():
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=2048,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version="reviewer-certification-v1",
     )
     assert spec["role"] == "REVIEWER"
-    assert spec["spec_version"] == "role-evaluation-spec-v1"
+    assert spec["spec_version"] == "role-evaluation-spec-v2"
 
 
 # -- adversarial: identities are structurally self-verifying -----------------
@@ -736,6 +741,7 @@ def test_direct_role_evaluation_identity_rejects_mismatched_fingerprint():
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=genuine.output_token_budget,
             tool_choice_enforcement=genuine.tool_choice_enforcement,
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=_FORGED_SHA256,
         )
@@ -750,6 +756,7 @@ def test_role_evaluation_identity_rejects_budget_change_retaining_old_fingerprin
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=1024,
             tool_choice_enforcement=genuine.tool_choice_enforcement,
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
         )
@@ -764,6 +771,7 @@ def test_role_evaluation_identity_rejects_tool_choice_change_retaining_old_finge
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=genuine.output_token_budget,
             tool_choice_enforcement="REQUIRED_STRUCTURED_TOOL",
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
         )
@@ -949,6 +957,7 @@ def test_matching_direct_role_evaluation_construction_is_accepted():
         runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
         output_token_budget=genuine.output_token_budget,
         tool_choice_enforcement=genuine.tool_choice_enforcement,
+        execution_timeout_seconds=genuine.execution_timeout_seconds,
         policy_version=genuine.policy_version,
         role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
     )

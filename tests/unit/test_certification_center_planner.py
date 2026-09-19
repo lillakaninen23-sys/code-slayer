@@ -19,6 +19,7 @@ import pytest
 
 from code_slayer.api import create_app
 from code_slayer.api.service import RuntimeBindings, WorkerRegistration
+from code_slayer.planning.planner_certification import PLANNER_CERTIFICATION_POLICY_VERSION
 from code_slayer.repo import identity as repo_identity
 from code_slayer.security.certification_service import (
     BaselineCertificationTarget,
@@ -193,7 +194,8 @@ def _role_target() -> RoleEvaluationTarget:
         role=ProductionRole.PLANNER,
         output_token_budget=1024,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
-        policy_version="planner-certification-v1",
+        planner_timeout_seconds=45.0,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
     )
 
 

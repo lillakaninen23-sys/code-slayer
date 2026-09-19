@@ -80,6 +80,7 @@ _PROFILE = RuntimeContextProfile(
     endpoint="http://local:11436/v1",
     runtime_version="0.1.0",
     temperature=0.0,
+    planner_timeout_seconds=45.0,
 )
 
 
@@ -551,6 +552,7 @@ def test_normalized_qualification_evidence_binds_normalizer_identity(conn, blobs
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
         temperature=0.0,
+        planner_timeout_seconds=45.0,
     )
     planner = FakePlanner([_structured()])
     evidence = run_planner_case_with_correction(
@@ -717,6 +719,7 @@ def test_output_budget_mismatch_across_instances_is_ambiguous(conn, blobs_dir):
         endpoint=_PROFILE.endpoint,
         runtime_version=_PROFILE.runtime_version,
         temperature=_PROFILE.temperature,
+        planner_timeout_seconds=_PROFILE.planner_timeout_seconds,
     )
     planner = FakePlanner([_structured()])
     other_result = run_planner_case_with_correction(
@@ -730,6 +733,71 @@ def test_output_budget_mismatch_across_instances_is_ambiguous(conn, blobs_dir):
         blobs_dir,
         worker_id="w1",
         results=(_pass_first_try_result(), other_result),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "ambiguous_or_unverified_role_evaluation_in_evidence"
+
+
+def test_planner_timeout_mismatch_across_instances_is_ambiguous(conn, blobs_dir):
+    """H.4.1: a Planner INFERENCE timeout materially affects the role
+    evaluation profile exactly like output-token budget does -- evidence
+    from two instances run under different `planner_timeout_seconds`
+    must never be silently collapsed into one certificate."""
+    other = RuntimeContextProfile(
+        model_tag=_PROFILE.model_tag,
+        effective_context_tokens=_PROFILE.effective_context_tokens,
+        output_token_budget=_PROFILE.output_token_budget,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        temperature=_PROFILE.temperature,
+        planner_timeout_seconds=120.0,
+    )
+    planner = FakePlanner([_structured()])
+    other_result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=other,
+    )
+    result = _certify(
+        conn,
+        blobs_dir,
+        worker_id="w1",
+        results=(_pass_first_try_result(), other_result),
+        early_stopped=False,
+    )
+    assert not result.ok
+    assert result.reason == "ambiguous_or_unverified_role_evaluation_in_evidence"
+
+
+def test_missing_planner_timeout_in_evidence_is_refused(conn, blobs_dir):
+    """A qualification run whose provenance never established
+    `planner_timeout_seconds` (e.g. constructed against a pre-H.4.1
+    profile) must be refused, never certified with a guessed timeout."""
+    no_timeout = RuntimeContextProfile(
+        model_tag=_PROFILE.model_tag,
+        effective_context_tokens=_PROFILE.effective_context_tokens,
+        output_token_budget=_PROFILE.output_token_budget,
+        model_digest=_PROFILE.model_digest,
+        endpoint=_PROFILE.endpoint,
+        runtime_version=_PROFILE.runtime_version,
+        temperature=_PROFILE.temperature,
+    )
+    planner = FakePlanner([_structured()])
+    evidence = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="C",
+        context_profile=no_timeout,
+    )
+    assert evidence.provenance[0].planner_timeout_seconds is None
+    result = _certify(
+        conn,
+        blobs_dir,
+        worker_id="w1",
+        results=(evidence,),
         early_stopped=False,
     )
     assert not result.ok

@@ -23,7 +23,10 @@ from code_slayer.planning.planner import (
     PlannerStructuredOutput,
     ToolCallTransport,
 )
-from code_slayer.planning.planner_certification import certify_planner_from_qualification
+from code_slayer.planning.planner_certification import (
+    PLANNER_CERTIFICATION_POLICY_VERSION,
+    certify_planner_from_qualification,
+)
 from code_slayer.planning.qualification import (
     RuntimeContextProfile,
     run_planner_case_with_correction,
@@ -72,6 +75,7 @@ _PROFILE = RuntimeContextProfile(
     endpoint="http://local:11436/v1",
     runtime_version="0.1.0",
     temperature=0.0,
+    planner_timeout_seconds=45.0,
 )
 
 
@@ -83,13 +87,15 @@ def _identity_and_eval(results, profile=_PROFILE):
         runtime_identity_fingerprint=identity_fp,
         output_token_budget=profile.output_token_budget,
         tool_choice_enforcement=profile.tool_choice_enforcement,
-        policy_version="planner-certification-v1",
+        execution_timeout_seconds=profile.planner_timeout_seconds,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
     )
     evaluation_spec = canonical_role_evaluation_spec(
         role=evaluation.role,
         runtime_identity_fingerprint=evaluation.runtime_identity_fingerprint,
         output_token_budget=evaluation.output_token_budget,
         tool_choice_enforcement=evaluation.tool_choice_enforcement,
+        execution_timeout_seconds=evaluation.execution_timeout_seconds,
         policy_version=evaluation.policy_version,
     )
     return identity_spec, identity_fp, evaluation_spec, evaluation.role_evaluation_fingerprint
@@ -106,7 +112,7 @@ def _build_document(results, profile=_PROFILE, *, classification="PASS_FIRST_TRY
         runtime_identity_fingerprint=identity_fp,
         role_evaluation_spec=evaluation_spec,
         role_evaluation_fingerprint=evaluation_fp,
-        policy_version="planner-certification-v1",
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
         classification=classification,
     ), identity_fp, evaluation_fp
 
@@ -391,6 +397,7 @@ def test_native_vs_normalized_transport_is_retained_in_evidence(conn, blobs_dir)
         endpoint=_PROFILE.endpoint,
         runtime_version=_PROFILE.runtime_version,
         temperature=_PROFILE.temperature,
+        planner_timeout_seconds=_PROFILE.planner_timeout_seconds,
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
     )

@@ -79,6 +79,7 @@ def _role_eval(profile: RuntimeProfileIdentity, role=ProductionRole.PLANNER, **o
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=30.0,
         policy_version=POLICY_VERSION,
     )
     kwargs.update(overrides)

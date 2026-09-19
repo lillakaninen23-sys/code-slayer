@@ -54,6 +54,7 @@ REQUEST = "Add a read-only endpoint reporting repository intelligence snapshot a
 POLICY_VERSION = "planner-certification-v1"
 OUTPUT_TOKEN_BUDGET = 4096
 TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
+PLANNER_TIMEOUT_SECONDS = 45.0
 OLLAMA_ROOT = "http://local:11434"
 
 
@@ -95,7 +96,7 @@ def _role_target(worker_id: str) -> RoleEvaluationTarget:
     return RoleEvaluationTarget(
         worker_id=worker_id, role=ProductionRole.PLANNER,
         output_token_budget=OUTPUT_TOKEN_BUDGET, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
-        policy_version=POLICY_VERSION,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, policy_version=POLICY_VERSION,
     )
 
 
@@ -114,6 +115,7 @@ def _certify_eligible(conn, worker_id: str, *, root: str = OLLAMA_ROOT):
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     role = record_role_certificate(

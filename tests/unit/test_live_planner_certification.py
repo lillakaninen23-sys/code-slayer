@@ -42,7 +42,12 @@ from code_slayer.workers.security_baseline import (
 WORKER = "w1"
 OUTPUT_TOKEN_BUDGET = 1024
 TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
-POLICY_VERSION = "planner-certification-v1"
+POLICY_VERSION = PLANNER_CERTIFICATION_POLICY_VERSION
+# H.4.1: deliberately different from `_expected()`'s own `timeout=5.0`
+# (the runtime-attestation PROBE timeout) -- proves the Planner
+# INFERENCE timeout is threaded through independently, never reused
+# from the probe's.
+PLANNER_TIMEOUT_SECONDS = 9.0
 
 
 class _Script:
@@ -343,7 +348,9 @@ def _seed_production_baseline_pass(conn, root, *, outcome=SecurityBaselineOutcom
     return result.certificate
 
 
-def _certify(conn, blobs_dir, root, **overrides):
+def _certify(
+    conn, blobs_dir, root, *, planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS, **overrides,
+):
     return certify_live_planner_role(
         conn,
         worker_id=WORKER,
@@ -351,6 +358,7 @@ def _certify(conn, blobs_dir, root, **overrides):
         expected=_expected(root, **overrides),
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=planner_timeout_seconds,
         policy_version=POLICY_VERSION,
     )
 
@@ -450,6 +458,7 @@ def test_certify_refuses_when_archive_wins_the_final_write_race(
                 expected=_expected(root),
                 output_token_budget=OUTPUT_TOKEN_BUDGET,
                 tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+                planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
                 policy_version=POLICY_VERSION,
             )
         finally:
@@ -491,6 +500,7 @@ def test_certificate_binds_exact_runtime_and_role_evaluation_fingerprint(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
 
@@ -515,6 +525,7 @@ def test_production_eligibility_changes_only_through_the_existing_evaluator(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     before = evaluate_production_eligibility(
@@ -626,6 +637,7 @@ def test_unknown_worker_blocks_certification(production_conn, blobs_dir, runtime
         expected=_expected(root),
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     assert not result.ok
@@ -659,6 +671,7 @@ def test_qualification_fail_never_records_a_pass_certificate(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     decision = evaluate_production_eligibility(
@@ -699,6 +712,7 @@ def _seed_role_certificate(
     outcome=RoleQualificationOutcome.PASS,
     output_token_budget=OUTPUT_TOKEN_BUDGET,
     tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+    execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
     policy_version=POLICY_VERSION,
     identity=None,
 ):
@@ -708,6 +722,7 @@ def _seed_role_certificate(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=output_token_budget,
         tool_choice_enforcement=tool_choice_enforcement,
+        execution_timeout_seconds=execution_timeout_seconds,
         policy_version=policy_version,
     )
     result = record_role_certificate(
@@ -767,6 +782,7 @@ def test_stale_planner_policy_does_not_block_recertification(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     pre_decision = evaluate_production_eligibility(
@@ -815,6 +831,7 @@ def test_role_evaluation_fingerprint_mismatch_does_not_block_recertification(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     pre_decision = evaluate_production_eligibility(
@@ -898,6 +915,7 @@ def test_currently_eligible_worker_allows_explicit_recertification(
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=POLICY_VERSION,
     )
     pre_decision = evaluate_production_eligibility(
@@ -1037,6 +1055,7 @@ def test_mismatched_configured_policy_blocks_before_any_model_call(
         expected=_expected(root),
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version="some-other-policy-version",
     )
 
@@ -1064,6 +1083,7 @@ def test_certificate_and_role_evaluation_bind_the_exact_canonical_policy_version
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
     )
     assert row.role_evaluation_fingerprint == expected_role_eval.role_evaluation_fingerprint
@@ -1096,6 +1116,7 @@ def test_certificate_under_an_older_policy_version_is_not_current_under_the_cano
         runtime_identity_fingerprint=identity.runtime_identity_fingerprint,
         output_token_budget=OUTPUT_TOKEN_BUDGET,
         tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        execution_timeout_seconds=PLANNER_TIMEOUT_SECONDS,
         policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
     )
     decision = evaluate_production_eligibility(
