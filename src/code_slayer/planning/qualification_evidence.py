@@ -590,6 +590,10 @@ def _verify_v2_document(
     return document
 
 
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
 def _verify_v3_document(
     document: dict,
     *,
@@ -602,9 +606,15 @@ def _verify_v3_document(
     seconds`), verified via the CURRENT `verify_role_evaluation_
     fingerprint()`. Additionally re-verifies, from the persisted bytes
     themselves (tamper detection, not merely the build-time check in
-    `build_planner_qualification_evidence_document()`), that every
-    attempt's own persisted `planner_timeout_seconds` still agrees with
-    the canonical spec's `execution_timeout_seconds`."""
+    `build_planner_qualification_evidence_document()`), that the
+    top-level `planner_timeout_seconds` copy and every attempt's own
+    persisted `planner_timeout_seconds` still agree with the canonical
+    spec's `execution_timeout_seconds` -- and that at least one real
+    attempt actually exists to prove it: `instances` must be a non-empty
+    list, and every instance's own `provenance` must be a non-empty
+    list, so a document with `instances: []` (or a provenance-less
+    instance) can never vacuously satisfy the timeout proof by having no
+    attempts to check at all."""
     identity_spec = document.get("runtime_identity_spec")
     claimed_identity = document.get("runtime_identity_fingerprint")
     evaluation_spec = document.get("role_evaluation_spec")
@@ -631,14 +641,32 @@ def _verify_v3_document(
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     if evaluation_spec.get("runtime_identity_fingerprint") != claimed_identity:
         raise QualificationEvidenceError("role_evaluation_runtime_identity_mismatch")
+
     expected_timeout = evaluation_spec.get("execution_timeout_seconds")
-    for instance in document.get("instances", []):
+    if not _is_positive_number(expected_timeout):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    top_level_timeout = document.get("planner_timeout_seconds")
+    if not _is_positive_number(top_level_timeout):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    if top_level_timeout != expected_timeout:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+
+    instances = document.get("instances")
+    if not isinstance(instances, list) or not instances:
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    for instance in instances:
         if not isinstance(instance, dict):
             raise QualificationEvidenceError("malformed_qualification_evidence")
-        for attempt in instance.get("provenance", []):
+        provenance = instance.get("provenance")
+        if not isinstance(provenance, list) or not provenance:
+            raise QualificationEvidenceError("malformed_qualification_evidence")
+        for attempt in provenance:
             if not isinstance(attempt, dict):
                 raise QualificationEvidenceError("malformed_qualification_evidence")
-            if attempt.get("planner_timeout_seconds") != expected_timeout:
+            attempt_timeout = attempt.get("planner_timeout_seconds")
+            if not _is_positive_number(attempt_timeout):
+                raise QualificationEvidenceError("malformed_qualification_evidence")
+            if attempt_timeout != expected_timeout:
                 raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     return document
 

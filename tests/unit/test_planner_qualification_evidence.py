@@ -645,3 +645,121 @@ def test_tampered_attempt_timeout_in_persisted_evidence_refuses_verification(con
             expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
             expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
         )
+
+
+# -- H.4.1 review round 3: v3 read must never vacuously accept a --------------
+# -- document with no real, provably-timed attempt at all --------------------
+
+
+def _certified_v3_document(conn, blobs_dir):
+    """A real, freshly certified, valid v3 document plus the certificate
+    that reads it -- the shared starting point every tamper test below
+    mutates a COPY of."""
+    result = _certify(conn, blobs_dir, (_pass_result(),))
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        conn, blobs_dir, result.certificate.evidence_ref,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+    return result, document
+
+
+def _reread_tampered(conn, blobs_dir, result, tampered):
+    """Store `tampered` (a mutated copy of an authentic document) as its
+    own new content-addressed blob and attempt to read it back under the
+    ORIGINAL certificate's expected fingerprints -- exactly what a
+    caller re-reading durable evidence would do."""
+    store = ContentStore(conn, blobs_dir)
+    payload = canonical_json(tampered).encode("utf-8")
+    blob = store.put(
+        payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    return read_planner_qualification_evidence(
+        conn, blobs_dir, blob.content_hash,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+
+
+def test_v3_read_succeeds_for_a_genuinely_valid_document(conn, blobs_dir):
+    """Baseline: the already-added happy path, kept alongside the
+    refusal cases below so a future regression in the stricter checks
+    is caught immediately next to what it would break."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    assert document["spec_version"] == "planner-qualification-evidence-v3"
+    assert document["instances"]
+    assert document["instances"][0]["provenance"]
+
+
+def test_v3_read_refuses_missing_instances_key(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_empty_instances_list(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"] = []
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_instance_with_missing_provenance_key(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"][0]["provenance"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_instance_with_empty_provenance_list(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"][0]["provenance"] = []
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_missing_top_level_timeout(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["planner_timeout_seconds"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_top_level_timeout_disagreeing_with_canonical_spec(conn, blobs_dir):
+    """The top-level `planner_timeout_seconds` convenience copy must
+    never be allowed to disagree with its own canonical authority
+    (`role_evaluation_spec.execution_timeout_seconds`), even though
+    changing it alone does not touch either outer fingerprint."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["planner_timeout_seconds"] = 999.0
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_attempt_with_missing_timeout(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"][0]["provenance"][0]["planner_timeout_seconds"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_attempt_timeout_disagreeing_with_canonical_spec(conn, blobs_dir):
+    """Mirrors `test_tampered_attempt_timeout_in_persisted_evidence_
+    refuses_verification` above, named to match the explicit review
+    checklist -- kept as a separate, narrowly-named test rather than
+    folded away."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"][0]["provenance"][0]["planner_timeout_seconds"] = 999.0
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
