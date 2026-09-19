@@ -131,7 +131,7 @@ from code_slayer.workers.security_baseline import (
     require_sha256_hex,
 )
 
-ROLE_EVALUATION_SPEC_VERSION = "role-evaluation-spec-v1"
+ROLE_EVALUATION_SPEC_VERSION = "role-evaluation-spec-v2"
 
 
 class ProductionRole(StrEnum):
@@ -165,12 +165,22 @@ def _non_negative_int(name: str, value: object) -> int:
     return value
 
 
+def _positive_float(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    number = float(value)
+    if number <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return number
+
+
 def canonical_role_evaluation_spec(
     *,
     role: ProductionRole,
     runtime_identity_fingerprint: str,
     output_token_budget: int,
     tool_choice_enforcement: str,
+    execution_timeout_seconds: float,
     policy_version: str,
 ) -> dict:
     """The one canonical, versioned role/evaluation document a role
@@ -183,7 +193,15 @@ def canonical_role_evaluation_spec(
     identity, so a Planner evaluation profile can never silently
     authorize a Coder (or Baseline Security) decision. The common
     runtime-identity fingerprint is included so a role profile is
-    never detached from the runtime it was evaluated on."""
+    never detached from the runtime it was evaluated on.
+
+    `execution_timeout_seconds` (H.4.1) is the role-generic name for
+    the actual inference-request timeout that materially affects
+    qualification/production behavior for that role (for PLANNER,
+    `config.schema.WorkerRuntimeConfig.planner_timeout_seconds`,
+    threaded through as `OpenAICompatibleConfig.timeout`) -- never the
+    separate, bounded runtime-attestation probe timeout (`security.
+    live_certification.LiveOllamaRuntimeExpectation.timeout`)."""
     if not isinstance(role, ProductionRole):
         raise TypeError("role must be a ProductionRole")
     require_sha256_hex("runtime_identity_fingerprint", runtime_identity_fingerprint)
@@ -197,6 +215,9 @@ def canonical_role_evaluation_spec(
         "runtime_identity_fingerprint": runtime_identity_fingerprint,
         "output_token_budget": _non_negative_int("output_token_budget", output_token_budget),
         "tool_choice_enforcement": tool_choice_enforcement,
+        "execution_timeout_seconds": _positive_float(
+            "execution_timeout_seconds", execution_timeout_seconds,
+        ),
         "policy_version": policy_version,
     }
 
@@ -220,6 +241,7 @@ def role_evaluation_identity_from_config(
     runtime_identity_fingerprint: str,
     output_token_budget: int,
     tool_choice_enforcement: str,
+    execution_timeout_seconds: float,
     policy_version: str,
 ) -> RoleEvaluationIdentity:
     """The one production-grade constructor: the fingerprint is derived
@@ -230,6 +252,7 @@ def role_evaluation_identity_from_config(
         runtime_identity_fingerprint=runtime_identity_fingerprint,
         output_token_budget=output_token_budget,
         tool_choice_enforcement=tool_choice_enforcement,
+        execution_timeout_seconds=execution_timeout_seconds,
         policy_version=policy_version,
     )
     return RoleEvaluationIdentity(
@@ -237,6 +260,7 @@ def role_evaluation_identity_from_config(
         runtime_identity_fingerprint=runtime_identity_fingerprint,
         output_token_budget=spec["output_token_budget"],
         tool_choice_enforcement=tool_choice_enforcement,
+        execution_timeout_seconds=spec["execution_timeout_seconds"],
         policy_version=policy_version,
         role_evaluation_fingerprint=fingerprint_role_evaluation(spec),
     )
@@ -262,6 +286,7 @@ class RoleEvaluationIdentity:
     runtime_identity_fingerprint: str
     output_token_budget: int
     tool_choice_enforcement: str
+    execution_timeout_seconds: float
     policy_version: str
     role_evaluation_fingerprint: str
 
@@ -271,12 +296,14 @@ class RoleEvaluationIdentity:
             runtime_identity_fingerprint=self.runtime_identity_fingerprint,
             output_token_budget=self.output_token_budget,
             tool_choice_enforcement=self.tool_choice_enforcement,
+            execution_timeout_seconds=self.execution_timeout_seconds,
             policy_version=self.policy_version,
         )
         expected = fingerprint_role_evaluation(spec)
         if self.role_evaluation_fingerprint != expected:
             raise ValueError(
-                "role_evaluation_fingerprint does not match canonical role-evaluation-spec-v1",
+                f"role_evaluation_fingerprint does not match canonical "
+                f"{ROLE_EVALUATION_SPEC_VERSION}",
             )
 
     def matches(self, other: RoleEvaluationIdentity) -> bool:
@@ -288,6 +315,7 @@ class RoleEvaluationIdentity:
             and self.runtime_identity_fingerprint == other.runtime_identity_fingerprint
             and self.output_token_budget == other.output_token_budget
             and self.tool_choice_enforcement == other.tool_choice_enforcement
+            and self.execution_timeout_seconds == other.execution_timeout_seconds
             and self.policy_version == other.policy_version
             and self.role_evaluation_fingerprint == other.role_evaluation_fingerprint
         )
@@ -305,6 +333,7 @@ class RoleEvaluationIdentity:
                 runtime_identity_fingerprint=self.runtime_identity_fingerprint,
                 output_token_budget=self.output_token_budget,
                 tool_choice_enforcement=self.tool_choice_enforcement,
+                execution_timeout_seconds=self.execution_timeout_seconds,
                 policy_version=self.policy_version,
             )
         except (TypeError, ValueError):
@@ -413,6 +442,7 @@ def record_role_certificate(
                     runtime_identity_fingerprint=role_evaluation.runtime_identity_fingerprint,
                     output_token_budget=role_evaluation.output_token_budget,
                     tool_choice_enforcement=role_evaluation.tool_choice_enforcement,
+                    execution_timeout_seconds=role_evaluation.execution_timeout_seconds,
                     policy_version=role_evaluation.policy_version,
                 ),
             )
