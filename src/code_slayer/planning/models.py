@@ -144,12 +144,13 @@ class PlanningJobRecord:
     code-owned codes `EngineeringPlanContent`/`PlanRecord` already use;
     full detail stays durable-internal-only via `planning.provenance`).
 
-    `worker_id` through `planner_policy_version` (H.4) are the exact
-    durable Planner route-binding provenance this job was created
-    with — bounded, non-secret identifiers safe to expose over HTTP/
-    WebUI (never an API key or raw runtime credential); `None` only for
-    a job created before schema v19 (see `planning.routing`'s own
-    module docstring)."""
+    `worker_id` through `planner_policy_version` (H.4), plus
+    `planner_timeout_seconds` (H.4.1), are the exact durable Planner
+    route-binding provenance this job was created with — bounded,
+    non-secret identifiers safe to expose over HTTP/WebUI (never an API
+    key or raw runtime credential); `None` only for a job created
+    before schema v19 (or, for `planner_timeout_seconds` alone, before
+    schema v20 — see `planning.routing`'s own module docstring)."""
 
     job_id: str
     plan_id: str
@@ -170,6 +171,7 @@ class PlanningJobRecord:
     output_token_budget: int | None = None
     tool_choice_enforcement: str | None = None
     planner_policy_version: str | None = None
+    planner_timeout_seconds: float | None = None
 
 
 class AffectedFileAction(StrEnum):

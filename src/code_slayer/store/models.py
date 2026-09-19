@@ -317,7 +317,15 @@ class PlanningJobRow:
     requiring them as mandatory parameters and by that migration's own
     `planning_jobs_require_route_binding_on_insert` trigger. Locked at
     creation exactly like every other identity field above — see that
-    migration's `planning_jobs_no_mutate_identity` trigger."""
+    migration's `planning_jobs_no_mutate_identity` trigger.
+
+    `planner_timeout_seconds` (schema v20, H.4.1) is a NINTH route-
+    binding field, added later — `None` for any job created before
+    schema v20 (a v19 job otherwise fully bound; never a value this job
+    was never actually queued with — see `store.migrations.
+    0020_planner_timeout_binding`), mandatory and immutable for every
+    job created at or after v20, same enforcement pattern as the
+    original eight."""
 
     job_id: str
     plan_id: str
@@ -344,6 +352,7 @@ class PlanningJobRow:
     output_token_budget: int | None = None
     tool_choice_enforcement: str | None = None
     planner_policy_version: str | None = None
+    planner_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)

@@ -139,6 +139,7 @@ class PlannerRouteBinding:
     role_certificate_id: str
     output_token_budget: int
     tool_choice_enforcement: str
+    planner_timeout_seconds: float
     planner_policy_version: str
 
 
@@ -198,6 +199,7 @@ def _binding_for_target(
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=role_target.output_token_budget,
         tool_choice_enforcement=role_target.tool_choice_enforcement,
+        execution_timeout_seconds=role_target.planner_timeout_seconds,
         policy_version=role_target.policy_version,
     )
     decision = evaluate_production_eligibility(
@@ -220,6 +222,7 @@ def _binding_for_target(
         role_certificate_id=decision.role_certificate_id,
         output_token_budget=role_target.output_token_budget,
         tool_choice_enforcement=role_target.tool_choice_enforcement,
+        planner_timeout_seconds=role_target.planner_timeout_seconds,
         planner_policy_version=role_target.policy_version,
     )
 
@@ -383,6 +386,7 @@ def revalidate_route_binding(
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=role_target.output_token_budget,
         tool_choice_enforcement=role_target.tool_choice_enforcement,
+        execution_timeout_seconds=role_target.planner_timeout_seconds,
         policy_version=role_target.policy_version,
     )
     decision = evaluate_production_eligibility(
@@ -406,6 +410,7 @@ def revalidate_route_binding(
         role_certificate_id=decision.role_certificate_id,
         output_token_budget=role_target.output_token_budget,
         tool_choice_enforcement=role_target.tool_choice_enforcement,
+        planner_timeout_seconds=role_target.planner_timeout_seconds,
         planner_policy_version=role_target.policy_version,
     )
     if current != binding:
@@ -433,15 +438,25 @@ def revalidate_route_binding(
 
 def route_binding_from_job(job) -> PlannerRouteBinding | None:
     """Reconstruct a `PlannerRouteBinding` from any object exposing the
-    eight H.4 route-binding attributes by name — `store.models.
+    nine H.4/H.4.1 route-binding attributes by name — `store.models.
     PlanningJobRow` (`planning.executor.PlanningJobExecutor`'s own
     claimed-row shape) and `planning.models.PlanningJobRecord` both
     qualify, structurally. `None` when `job.worker_id is None` — a
     legacy, pre-H.4 job with no binding to reconstruct at all (never a
-    `KeyError`/`AttributeError` on the other seven fields, which are
+    `KeyError`/`AttributeError` on the other eight fields, which are
     written together or not at all — see `store.migrations.
-    0019_planner_worker_routing`'s own INSERT-completeness trigger)."""
-    if job.worker_id is None:
+    0019_planner_worker_routing`'s own INSERT-completeness trigger).
+    A job created under schema v19 (H.4, pre-H.4.1) has a fully bound
+    `worker_id` and the other seven original fields, but no durable
+    `planner_timeout_seconds` (that column did not exist yet — `store.
+    migrations.0020_planner_timeout_binding` adds it nullable, and never
+    invents a value for a historical row). Such a job is ALSO treated as
+    unbound here (`None`, not a reconstructed binding with a guessed
+    timeout) — fail closed exactly like a `job.worker_id is None`
+    legacy job, forcing `revalidate_route_binding()`'s caller down the
+    `WORKER_UNBOUND` path rather than ever fabricating a timeout this
+    job was never actually queued with."""
+    if job.worker_id is None or job.planner_timeout_seconds is None:
         return None
     return PlannerRouteBinding(
         worker_id=job.worker_id,
@@ -451,5 +466,6 @@ def route_binding_from_job(job) -> PlannerRouteBinding | None:
         role_certificate_id=job.role_certificate_id,
         output_token_budget=job.output_token_budget,
         tool_choice_enforcement=job.tool_choice_enforcement,
+        planner_timeout_seconds=job.planner_timeout_seconds,
         planner_policy_version=job.planner_policy_version,
     )

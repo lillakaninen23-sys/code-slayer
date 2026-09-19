@@ -25,21 +25,23 @@ class PlanningJobsRepo:
         kind: str,
         worker_id: str, runtime_identity_fingerprint: str, role_evaluation_fingerprint: str,
         security_certificate_id: str, role_certificate_id: str, output_token_budget: int,
-        tool_choice_enforcement: str, planner_policy_version: str,
+        tool_choice_enforcement: str, planner_timeout_seconds: float,
+        planner_policy_version: str,
         predecessor_job_id: str | None = None,
     ) -> PlanningJobRow:
-        """H.4 (schema v19): every new job requires a complete Planner
-        route binding -- `worker_id` through `planner_policy_version`
-        are all mandatory (never `None`/omitted), mirroring
-        `store.migrations.0019_planner_worker_routing`'s own
-        `planning_jobs_require_route_binding_on_insert` trigger, which
-        refuses at the schema level if this method (or any other
-        insertion path) ever tried to land an incomplete row. This
-        method itself decides no eligibility/legality -- the caller
-        (`planning.service.EngineeringPlanningService.create_job()`/
-        `.replan_job()`) has already selected and, inside this SAME
-        open transaction, atomically reverified the binding's worker
-        lifecycle before calling here."""
+        """H.4 (schema v19) + H.4.1 (schema v20): every new job requires
+        a complete Planner route binding -- `worker_id` through
+        `planner_timeout_seconds` are all mandatory (never `None`/
+        omitted), mirroring `store.migrations.0019_planner_worker_
+        routing`/`0020_planner_timeout_binding`'s own `planning_jobs_
+        require_route_binding_on_insert` trigger, which refuses at the
+        schema level if this method (or any other insertion path) ever
+        tried to land an incomplete row. This method itself decides no
+        eligibility/legality -- the caller (`planning.service.
+        EngineeringPlanningService.create_job()`/`.replan_job()`) has
+        already selected and, inside this SAME open transaction,
+        atomically reverified the binding's worker lifecycle before
+        calling here."""
         if not self._conn.in_transaction:
             raise RuntimeError("planning job creation requires an open write transaction")
         self._conn.execute(
@@ -48,12 +50,13 @@ class PlanningJobsRepo:
             " attempt, owner_generation, predecessor_job_id, worker_id, "
             " runtime_identity_fingerprint, role_evaluation_fingerprint, "
             " security_certificate_id, role_certificate_id, output_token_budget, "
-            " tool_choice_enforcement, planner_policy_version) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " tool_choice_enforcement, planner_policy_version, planner_timeout_seconds) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (job_id, plan_id, repo_id, worktree_id, created_at, created_at, kind,
              predecessor_job_id, worker_id, runtime_identity_fingerprint,
              role_evaluation_fingerprint, security_certificate_id, role_certificate_id,
-             output_token_budget, tool_choice_enforcement, planner_policy_version),
+             output_token_budget, tool_choice_enforcement, planner_policy_version,
+             planner_timeout_seconds),
         )
         return self.get(job_id)
 
@@ -211,5 +214,11 @@ def _row_to_job(row: sqlite3.Row) -> PlanningJobRow:
         ),
         planner_policy_version=(
             row["planner_policy_version"] if "planner_policy_version" in keys else None
+        ),
+        # H.4.1 (schema v20): also `None` for a v19-or-earlier row (the
+        # column did not exist yet), and for any legitimate v19 job row
+        # (the column exists but that row predates it) -- never invented.
+        planner_timeout_seconds=(
+            row["planner_timeout_seconds"] if "planner_timeout_seconds" in keys else None
         ),
     )

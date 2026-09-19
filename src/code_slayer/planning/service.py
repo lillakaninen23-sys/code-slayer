@@ -703,6 +703,7 @@ class EngineeringPlanningService:
             output_token_budget=row.output_token_budget,
             tool_choice_enforcement=row.tool_choice_enforcement,
             planner_policy_version=row.planner_policy_version,
+            planner_timeout_seconds=row.planner_timeout_seconds,
         )
 
     def _reverify_route_binding_in_transaction(
@@ -759,6 +760,7 @@ class EngineeringPlanningService:
             output_token_budget=route_binding.output_token_budget,
             tool_choice_enforcement=route_binding.tool_choice_enforcement,
             planner_policy_version=route_binding.planner_policy_version,
+            planner_timeout_seconds=route_binding.planner_timeout_seconds,
         )
         self._job_audit(job_id, EventType.PLANNING_JOB_ACCEPTED, {
             "plan_id": plan_id, "kind": kind, "worker_id": route_binding.worker_id,
