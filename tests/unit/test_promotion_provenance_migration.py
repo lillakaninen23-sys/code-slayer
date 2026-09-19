@@ -111,8 +111,11 @@ def test_upgrade_succeeds_with_duplicate_historical_triples(tmp_path):
     # The exact scenario the earlier, broader
     # UNIQUE(worker_id, runtime_identity_fingerprint, evidence_ref)
     # invariant would have failed an upgrade against: two historical
-    # rows sharing that triple. This migration must not.
-    assert db_module.migrate(conn) == 17
+    # rows sharing that triple. This migration must not -- and neither
+    # must any migration added after it, so this asserts against
+    # "whatever the latest known version is" rather than a hardcoded
+    # 17 that a future schema bump would otherwise make stale.
+    assert db_module.migrate(conn) == db_module.known_schema_version()
 
     rows_after = conn.execute(
         "SELECT certificate_id, promoted_from_validation_certificate_id "

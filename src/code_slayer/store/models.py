@@ -103,6 +103,11 @@ class Worker:
     available_after: str | None
     last_probe_at: str | None
     last_error: str | None
+    # H.3: administrative lifecycle (schema v18) -- separate from
+    # `availability_state` (runtime health/reachability). See
+    # `code_slayer.store.workers_repo.WorkerLifecycleState`.
+    lifecycle_state: str = "ACTIVE"
+    lifecycle_changed_at: str | None = None
 
 
 @dataclass(frozen=True)

@@ -511,7 +511,10 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
         ).fetchone(),
     )
     assert "runtime_identity_fingerprint" not in before_role
-    assert db_module.migrate(conn) == 17
+    # "Whatever the latest known version is" rather than a hardcoded 17
+    # that a future schema bump (e.g. H.3's v18) would otherwise make
+    # stale for reasons unrelated to this test's own subject.
+    assert db_module.migrate(conn) == db_module.known_schema_version()
     after_role = dict(
         conn.execute(
             "SELECT * FROM worker_role_certificates WHERE certificate_id = ?",
@@ -541,7 +544,11 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
 
 
 def test_schema_v17_is_known_and_prior_identity_migrations_are_untouched():
-    assert db_module.known_schema_version() == 17
+    # Bumped to 18 by H.3 (`worker_lifecycle`) -- this test's own
+    # purpose (every prior identity-related migration this file cares
+    # about is still present and untouched) still holds; it is not
+    # itself a claim that 18 is the LAST version anything may ever add.
+    assert db_module.known_schema_version() == 18
     names = [name for _version, name, _sql in db_module._discover_migrations()]
     assert "runtime_profile_normalizer_identity" in names
     assert "runtime_config_fingerprint" in names
