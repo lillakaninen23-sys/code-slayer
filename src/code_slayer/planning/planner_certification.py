@@ -148,7 +148,7 @@ from code_slayer.workers.security_baseline import (
 # semantics a certificate was decided under, so a later change to what
 # "Planner-qualified" even means never gets silently applied to old
 # evidence.
-PLANNER_CERTIFICATION_POLICY_VERSION = "planner-certification-v1"
+PLANNER_CERTIFICATION_POLICY_VERSION = "planner-certification-v2"
 
 _PASS_OUTCOMES = frozenset(
     {
@@ -222,28 +222,35 @@ def _agreed_role_evaluation(
     results: tuple[QualificationAttemptResult, ...],
     runtime_profile: RuntimeProfileIdentity,
 ) -> RoleEvaluationIdentity | None:
-    """`None` if output-token budget or tool-choice enforcement disagree
-    across attempts, or if the common runtime identity is missing.
-    Mixed Planner evaluation configurations are never collapsed into
-    the shared runtime identity."""
+    """`None` if output-token budget, tool-choice enforcement, or
+    Planner timeout (H.4.1) disagree across attempts, or if the common
+    runtime identity is missing. Mixed Planner evaluation configurations
+    are never collapsed into the shared runtime identity."""
     fingerprint = runtime_profile.runtime_identity_fingerprint
     if not isinstance(fingerprint, str) or not fingerprint:
         return None
-    tuples: set[tuple[int, str]] = set()
+    tuples: set[tuple[int, str, float | None]] = set()
     for result in results:
         if not result.provenance:
             return None
         for attempt in result.provenance:
-            tuples.add((attempt.output_token_budget, attempt.tool_choice_enforcement))
+            tuples.add((
+                attempt.output_token_budget,
+                attempt.tool_choice_enforcement,
+                attempt.planner_timeout_seconds,
+            ))
     if len(tuples) != 1:
         return None
-    output_token_budget, tool_choice_enforcement = next(iter(tuples))
+    output_token_budget, tool_choice_enforcement, planner_timeout_seconds = next(iter(tuples))
+    if planner_timeout_seconds is None:
+        return None
     try:
         return role_evaluation_identity_from_config(
             role=ProductionRole.PLANNER,
             runtime_identity_fingerprint=fingerprint,
             output_token_budget=output_token_budget,
             tool_choice_enforcement=tool_choice_enforcement,
+            execution_timeout_seconds=planner_timeout_seconds,
             policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
         )
     except (TypeError, ValueError):
@@ -287,6 +294,7 @@ def _persist_evidence(
         runtime_identity_fingerprint=role_evaluation.runtime_identity_fingerprint,
         output_token_budget=role_evaluation.output_token_budget,
         tool_choice_enforcement=role_evaluation.tool_choice_enforcement,
+        execution_timeout_seconds=role_evaluation.execution_timeout_seconds,
         policy_version=role_evaluation.policy_version,
     )
     document = build_planner_qualification_evidence_document(

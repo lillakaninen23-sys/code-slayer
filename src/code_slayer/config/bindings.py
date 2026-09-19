@@ -127,6 +127,7 @@ def planner_role_evaluation_target_from_worker(
         role=ProductionRole.PLANNER,
         output_token_budget=worker.output_token_budget,
         tool_choice_enforcement=worker.tool_choice_enforcement,
+        planner_timeout_seconds=worker.planner_timeout_seconds,
         policy_version=worker.planner_policy_version,
     )
 
@@ -167,6 +168,7 @@ def planner_for_worker(config: CSLRConfig, worker_id: str, job_id: str):
     adapter = OpenAICompatibleAdapter(OpenAICompatibleConfig(
         base_url=f"{server.origin.rstrip('/')}/v1", model=worker.model_tag,
         temperature=float(worker.temperature),
+        timeout=float(worker.planner_timeout_seconds),
     ))
     normalizer_registry = (
         build_default_normalizer_registry() if worker.normalizer_id is not None else None

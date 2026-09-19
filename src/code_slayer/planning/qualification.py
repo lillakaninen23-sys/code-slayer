@@ -979,6 +979,13 @@ class RuntimeContextProfile:
     # established for this qualification run -- production identity
     # then cannot compute a runtime-config fingerprint.
     temperature: float | None = None
+    # H.4.1: the actual Planner INFERENCE request timeout
+    # (`OpenAICompatibleConfig.timeout`) this qualification run's adapter
+    # was constructed with -- caller-asserted, like `output_token_budget`,
+    # never introspected from the wire (a socket-level HTTP timeout has no
+    # observable trace in the request/response payload). `None` means not
+    # established. Distinct from any runtime-attestation probe timeout.
+    planner_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_tag, str) or not self.model_tag:
@@ -1008,6 +1015,15 @@ class RuntimeContextProfile:
             if not (0.0 <= temperature <= 2.0):
                 raise ValueError("temperature must be between 0.0 and 2.0")
             object.__setattr__(self, "temperature", temperature)
+        if self.planner_timeout_seconds is not None:
+            if isinstance(self.planner_timeout_seconds, bool) or not isinstance(
+                self.planner_timeout_seconds, (int, float),
+            ):
+                raise ValueError("planner_timeout_seconds must be a number or None")
+            timeout = float(self.planner_timeout_seconds)
+            if timeout <= 0:
+                raise ValueError("planner_timeout_seconds must be positive")
+            object.__setattr__(self, "planner_timeout_seconds", timeout)
 
     def required_context_tokens(self, measured_input_tokens: int) -> int:
         return measured_input_tokens + self.output_token_budget + self.safety_margin_tokens
@@ -1717,6 +1733,7 @@ class AttemptProvenance:
     temperature: float | None = None
     runtime_config_fingerprint: str | None = None
     runtime_identity_fingerprint: str | None = None
+    planner_timeout_seconds: float | None = None
 
 
 def build_attempt_provenance(
@@ -1803,6 +1820,7 @@ def build_attempt_provenance(
         temperature=profile.temperature,
         runtime_config_fingerprint=profile.runtime_config_fingerprint(),
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint(),
+        planner_timeout_seconds=profile.planner_timeout_seconds,
     )
 
 

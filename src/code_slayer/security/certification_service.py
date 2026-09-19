@@ -105,6 +105,7 @@ class RoleEvaluationTarget:
     role: ProductionRole
     output_token_budget: int
     tool_choice_enforcement: str
+    planner_timeout_seconds: float
     policy_version: str
 
 
@@ -477,6 +478,7 @@ class CertificationService:
             runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
             output_token_budget=role_target.output_token_budget,
             tool_choice_enforcement=role_target.tool_choice_enforcement,
+            execution_timeout_seconds=role_target.planner_timeout_seconds,
             policy_version=role_target.policy_version,
         )
         decision = evaluate_production_eligibility(
@@ -803,6 +805,7 @@ class CertificationService:
                 runtime_identity_fingerprint=fingerprint,
                 output_token_budget=role_target.output_token_budget,
                 tool_choice_enforcement=role_target.tool_choice_enforcement,
+                execution_timeout_seconds=role_target.planner_timeout_seconds,
                 policy_version=role_target.policy_version,
             )
         except (TypeError, ValueError) as exc:
@@ -1196,6 +1199,7 @@ class CertificationService:
             expected=target.expectation,
             output_token_budget=role_target.output_token_budget,
             tool_choice_enforcement=role_target.tool_choice_enforcement,
+            planner_timeout_seconds=role_target.planner_timeout_seconds,
             policy_version=role_target.policy_version,
         )
         if result.ok and result.outcome is not None:

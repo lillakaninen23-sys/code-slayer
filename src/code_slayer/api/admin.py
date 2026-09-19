@@ -348,6 +348,7 @@ class AdminFacade:
             output_token_budget=worker.output_token_budget,
             tool_choice_enforcement=worker.tool_choice_enforcement,
             planner_policy_version=worker.planner_policy_version,
+            planner_timeout_seconds=worker.planner_timeout_seconds,
         )
         self._app.save_persistent_config(cfg.with_worker(updated))
         return {

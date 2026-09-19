@@ -187,6 +187,25 @@ output_token_budget`. Any attempt that does not is refused
 qualification()` is ever called -- fail closed rather than mint a
 certificate from evidence that does not actually prove what it claims.
 
+## Planner inference timeout is enforced, not merely certified (H.4.1)
+
+`planner_timeout_seconds` (the caller-supplied, role-target-configured
+Planner INFERENCE request timeout -- distinct from `expected.timeout`,
+which only bounds the earlier runtime-attestation probe traffic) is used
+directly as this run's `OpenAICompatibleConfig.timeout`, and is also
+recorded onto `RuntimeContextProfile.planner_timeout_seconds`, which
+`build_attempt_provenance()` copies onto every `AttemptProvenance.
+planner_timeout_seconds` unconditionally. Unlike the output-token-budget
+chain above, a socket-level HTTP timeout has no observable trace in the
+request/response wire payload, so this cannot be independently
+re-verified from response evidence -- the check here instead re-asserts,
+for every attempt, that the SAME `planner_timeout_seconds` value this
+adapter was actually constructed with is the one recorded, closing any
+gap where a future refactor silently constructs the adapter from a
+different value than the one this function validated and certifies
+against. Any mismatch is refused (`planner_timeout_not_enforced`)
+before `certify_planner_from_qualification()` is ever called.
+
 ## The security/runtime layer vs the role layer -- a semantic gate, not
 ## a reason-specific one
 
@@ -597,6 +616,7 @@ def certify_live_planner_role(
     expected: LiveOllamaRuntimeExpectation,
     output_token_budget: int,
     tool_choice_enforcement: str,
+    planner_timeout_seconds: float,
     policy_version: str,
 ) -> LivePlannerCertificationResult:
     """Verify live runtime + PRODUCTION Baseline Security eligibility,
@@ -613,6 +633,12 @@ def certify_live_planner_role(
     if not isinstance(blobs_dir, (str, Path)) or not str(blobs_dir).strip():
         return _deny("missing_durable_qualification_evidence")
     if not isinstance(policy_version, str) or not policy_version:
+        return _deny("malformed_planner_certification_request")
+    if (
+        isinstance(planner_timeout_seconds, bool)
+        or not isinstance(planner_timeout_seconds, (int, float))
+        or planner_timeout_seconds <= 0
+    ):
         return _deny("malformed_planner_certification_request")
     # Pre-condition 2 (module docstring, "One authoritative policy
     # identity"): the configured policy version must equal EXACTLY the
@@ -636,6 +662,7 @@ def certify_live_planner_role(
             runtime_identity_fingerprint=fingerprint,
             output_token_budget=output_token_budget,
             tool_choice_enforcement=tool_choice_enforcement,
+            execution_timeout_seconds=float(planner_timeout_seconds),
             policy_version=policy_version,
         )
     except (TypeError, ValueError):
@@ -662,10 +689,15 @@ def certify_live_planner_role(
     if expected.normalizer_id is not None:
         normalizer_registry = build_default_normalizer_registry()
 
+    # H.4.1: `expected.timeout` bounds the runtime-attestation probe
+    # traffic (`/api/version`/`/api/tags`) already spent in
+    # `_verify_live_identity()` above -- the actual Planner inference
+    # request (`/v1/chat/completions`) below must use the role target's
+    # OWN configured `planner_timeout_seconds`, never the probe timeout.
     config = OpenAICompatibleConfig(
         base_url=expected.openai_base_url,
         model=expected.model_tag,
-        timeout=expected.timeout,
+        timeout=float(planner_timeout_seconds),
         api_key=expected.api_key,
         max_response_bytes=expected.max_response_bytes,
         temperature=float(expected.temperature),
@@ -696,6 +728,7 @@ def certify_live_planner_role(
         normalizer_id=expected.normalizer_id,
         normalizer_version=expected.normalizer_version,
         temperature=float(expected.temperature),
+        planner_timeout_seconds=float(planner_timeout_seconds),
     )
 
     combined_results: list[QualificationAttemptResult] = []
@@ -750,6 +783,16 @@ def certify_live_planner_role(
                 ):
                     return _deny(
                         "output_token_budget_not_enforced",
+                        runtime_identity_fingerprint=fingerprint,
+                        role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
+                    )
+                # H.4.1: fail closed rather than mint a certificate from
+                # evidence that does not actually prove the configured
+                # Planner inference timeout was the one used -- mirrors
+                # the output-token-budget proof immediately above.
+                if attempt.planner_timeout_seconds != float(planner_timeout_seconds):
+                    return _deny(
+                        "planner_timeout_not_enforced",
                         runtime_identity_fingerprint=fingerprint,
                         role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
                     )
