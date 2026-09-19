@@ -7,16 +7,37 @@ Qualification Certification foundation).
 
 Production eligibility requires ALL of:
 
+0. the worker is administratively `ACTIVE` (`workers.lifecycle`, schema
+   v18/H.3) — checked before either certificate is even looked up
 1. a valid Baseline Security Certificate (`workers.security_baseline`)
 2. a valid Role Certificate for the EXACT requested role
    (`workers.role_qualification`)
 3. no hard Security disqualifier
 
 — never any subset, and never a strong role certificate compensating for
-a missing/failed/disqualifying Baseline Security Certificate. Security
-is always decided first, and a hard disqualifier is decided before the
-role certificate is even looked up — see "Hard disqualifiers always
-win" below.
+a missing/failed/disqualifying Baseline Security Certificate, and never a
+perfect certificate pair compensating for an administratively `ARCHIVED`
+worker. Security is always decided first, and a hard disqualifier is
+decided before the role certificate is even looked up — see "Hard
+disqualifiers always win" below. Lifecycle is decided before either.
+
+## Administrative lifecycle (H.3)
+
+An `ARCHIVED` worker denies with `worker_archived`, unconditionally,
+before any certificate is loaded — the same "checked first, no
+certificate can compensate" treatment as a hard Security disqualifier,
+but a SEPARATE dimension from it: `worker_archived` says nothing about
+whether the worker's certificates are still good, only that it is not
+currently authorized to receive new production work at all. This
+function never mutates `workers.lifecycle_state` and never invalidates
+a certificate because a worker is archived — see `workers.lifecycle`'s
+own module docstring for the full archive/reactivate contract. Once
+reactivated, eligibility is re-derived exactly as for any other
+worker: if the runtime/certificates on file are still exact and
+current, eligibility can become `eligible=True` again immediately,
+with no new certification required; if the runtime identity or policy
+changed while archived, the ordinary mismatch/staleness reasons below
+still apply unchanged.
 
 ## `evaluate_production_eligibility()` is the ONE authoritative path
 
@@ -147,7 +168,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
 )
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
-from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleEvaluationIdentity,
@@ -264,8 +285,17 @@ def evaluate_production_eligibility(
     ):
         return _deny("role_evaluation_runtime_identity_mismatch")
 
-    if WorkersRepo(conn).get(worker_id) is None:
+    worker = WorkersRepo(conn).get(worker_id)
+    if worker is None:
         return _deny("unknown_worker")
+    # H.3: administrative lifecycle takes precedence over both security
+    # and role eligibility -- checked before either certificate is even
+    # looked up, exactly like a hard Security disqualifier. An archived
+    # worker is blocked regardless of how strong its certificates are;
+    # this never mutates or invalidates them (see `workers.lifecycle`'s
+    # own module docstring for why archiving never touches this table).
+    if worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+        return _deny("worker_archived")
 
     security_certificates = BaselineSecurityCertificatesRepo(conn).list_for_worker(worker_id)
     if not security_certificates:

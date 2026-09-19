@@ -686,3 +686,36 @@ def test_unrelated_internal_error_is_still_masked_as_a_generic_500(setup):
     assert response.status_code == 500
     assert response.json["error"]["code"] == "application_error"
     assert "connection_refused" not in response.text
+
+
+# -- H.3: POST /api/runs refuses an archived worker before doing anything ----
+
+
+def test_post_runs_refuses_archived_worker_before_opening_the_runner(setup):
+    from code_slayer.workers.lifecycle import archive_worker
+
+    with_runner = LocalWorkerRunner(setup)
+    archived = archive_worker(with_runner._control_conn, worker_id=WORKER)
+    assert archived.ok and archived.changed
+    with_runner.close()
+
+    client, analyst, adapter = application(setup)
+    response = start(client)
+    assert response.status_code == 409
+    assert response.json["error"]["code"] == "worker_archived"
+    assert len(analyst.calls) == 0
+    assert adapter.calls == ()
+    assert client.get("/api/runs").json == {"runs": [], "next_offset": None}
+
+
+def test_post_runs_succeeds_again_after_reactivation(setup):
+    from code_slayer.workers.lifecycle import archive_worker, reactivate_worker
+
+    with_runner = LocalWorkerRunner(setup)
+    archive_worker(with_runner._control_conn, worker_id=WORKER)
+    reactivate_worker(with_runner._control_conn, worker_id=WORKER)
+    with_runner.close()
+
+    client, _analyst, _adapter = application(setup)
+    response = start(client)
+    assert response.status_code == 201

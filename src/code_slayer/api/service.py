@@ -272,8 +272,17 @@ class ApplicationService:
 
     def start(self, data):
         with self.reads() as reads:
-            if reads.worker(data["worker_id"]) is None:
+            worker = reads.worker(data["worker_id"])
+            if worker is None:
                 raise APIError("unknown_worker", "Worker is not registered.", 404)
+            # H.3: defense-in-depth surfacing only -- `LocalWorkerRunner.
+            # start()` is the authoritative gate below the HTTP layer and
+            # refuses independently; this check exists so an archived
+            # worker fails fast, before configuring an adapter or opening
+            # the runner, with a clean 409 rather than a 201 whose body
+            # says `reason: worker_archived`.
+            if worker.lifecycle_state != "ACTIVE":
+                raise APIError("worker_archived", "Worker is administratively archived.", 409)
         if self.bindings.analyst_factory is None:
             raise APIError("analyst_not_configured", "Configure a server-side PromptAnalyst.", 503)
         adapter = self.adapter(data["worker_id"], data["role"])

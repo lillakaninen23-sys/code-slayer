@@ -193,3 +193,14 @@ class EventType(StrEnum):
     SECURITY_BASELINE_CERTIFICATE_PROMOTED_TO_PRODUCTION = (
         "SECURITY_BASELINE_CERTIFICATE_PROMOTED_TO_PRODUCTION"
     )
+    # H.3: one durable record of an ACTIVE<->ARCHIVED administrative
+    # worker-lifecycle transition (`code_slayer.workers.lifecycle`) --
+    # a SEPARATE, purely administrative dimension from every other
+    # worker event above (trust, conformance, certification): it never
+    # implies a trust/certificate/permission change by itself, and
+    # neither event is ever emitted for an idempotent no-op (already-
+    # ARCHIVED archive, already-ACTIVE reactivate). Recorded with
+    # `task_id=None`, same as any other system-level event with no task
+    # to attribute it to (see JOB_WORKTREE_CREATED above).
+    WORKER_ARCHIVED = "WORKER_ARCHIVED"
+    WORKER_REACTIVATED = "WORKER_REACTIVATED"

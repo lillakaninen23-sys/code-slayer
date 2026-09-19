@@ -93,6 +93,17 @@ class RunnerRepo:
             raise KeyError(run_id)
         return _row_to_run(row)
 
+    def list_for_worker(self, worker_id: str, *, limit: int = 200) -> list[RunnerRun]:
+        """Every run for `worker_id`, most recent first. Read-only; used
+        by `workers.lifecycle`'s active-work check (H.3) and available
+        generally for a worker's own run history."""
+        rows = self._conn.execute(
+            "SELECT * FROM runner_runs WHERE worker_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (worker_id, limit),
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
     def get_or_none(self, run_id: str) -> RunnerRun | None:
         try:
             return self.get(run_id)

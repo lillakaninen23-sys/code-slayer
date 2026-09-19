@@ -206,6 +206,9 @@ from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.tools import file_tools as files
 from code_slayer.workers.cloud_escalation import CloudEscalationAuthorization
 from code_slayer.workers.execution import execute_guarded_turn
+from code_slayer.workers.lifecycle import LifecycleTransitionResult
+from code_slayer.workers.lifecycle import archive_worker as _lifecycle_archive_worker
+from code_slayer.workers.lifecycle import reactivate_worker as _lifecycle_reactivate_worker
 from code_slayer.workers.prompt_analysis import (
     EvidenceSource,
     PromptAnalysis,
@@ -354,7 +357,32 @@ class LocalWorkerRunner:
             worker_id=worker_id, kind=kind, network_class=network_class,
         )
 
+    def archive_worker(self, worker_id: str) -> LifecycleTransitionResult:
+        """H.3: thin pass-through to the one canonical lifecycle
+        transition (`workers.lifecycle.archive_worker()`) against this
+        runner's own PRODUCTION control connection -- exists so
+        `api.admin.AdminFacade` can perform the administrative
+        transition through the same `self._app.runner()` context
+        manager it already uses for `register_worker()`, rather than
+        opening a second connection to the same database. See that
+        module's own docstring for the complete atomicity/policy
+        contract; this method adds no policy of its own."""
+        return _lifecycle_archive_worker(self._control_conn, worker_id=worker_id)
+
+    def reactivate_worker(self, worker_id: str) -> LifecycleTransitionResult:
+        """See `archive_worker()`'s own docstring."""
+        return _lifecycle_reactivate_worker(self._control_conn, worker_id=worker_id)
+
     # -- audit ----------------------------------------------------------
+
+    def _worker_archived(self, worker_id: str) -> bool:
+        """H.3: `True` only for a worker that is REGISTERED and
+        ARCHIVED. An unregistered `worker_id` is not this gate's
+        concern (a run cannot durably exist for a worker that was
+        never registered in the first place under this codebase's
+        existing invariants) -- never treated as archived."""
+        worker = WorkersRepo(self._control_conn).get(worker_id)
+        return worker is not None and worker.lifecycle_state != "ACTIVE"
 
     def _audit(self, run_id: str, event_type: EventType, payload: dict) -> None:
         AuditWriter(self._control_conn).append(
@@ -405,6 +433,17 @@ class LocalWorkerRunner:
         regardless."""
         if not isinstance(original_prompt, str):
             raise TypeError("original_prompt must be a str")
+        # H.3: an ARCHIVED worker never gets a new production run at
+        # all -- checked before any row is created, mirroring how an
+        # unknown run_id in `resume()` returns a result with nothing
+        # durable behind it. Unknown `worker_id` is unchanged: this
+        # method has never validated worker existence itself (that is
+        # `api.service.ApplicationService.start()`'s own existing
+        # `unknown_worker` check, before it ever calls here) and still
+        # does not -- only a REGISTERED, ARCHIVED worker is refused.
+        existing_worker = WorkersRepo(self._control_conn).get(worker_id)
+        if existing_worker is not None and existing_worker.lifecycle_state != "ACTIVE":
+            return RunResult(run_id="", status=RunStatus.FAILED, reason="worker_archived")
         run_id = uuid.uuid4().hex
         now = utcnow_iso()
         store = ContentStore(self._control_conn, self._control_blobs_dir)
@@ -501,7 +540,24 @@ class LocalWorkerRunner:
         call that could reach execution for a cloud worker — no prior
         authorization is durably remembered across a crash/restart; see
         `workers.cloud_escalation`'s module docstring for why that is
-        deliberate."""
+        deliberate.
+
+        H.3: an ARCHIVED worker never reaches worker/model execution
+        through `resume()`, on ANY durable status a run can be found
+        in. A terminal run is always returned unchanged regardless of
+        lifecycle (see the check above). For every non-terminal status,
+        the gate below is placed exactly where that status's own
+        handling would otherwise invoke the worker (`adapter is not
+        None` is, precisely and only, the caller's own signal that
+        this call might reach execution — `_evaluate_gate()`/
+        `_proceed_to_execution()`/`_recover_mid_turn()` are all
+        themselves no-ops for inference purposes when `adapter is
+        None`) — never a single blanket check applied uniformly before
+        branching, so `ANALYZING` (which never touches `adapter` at
+        all) is untouched by this gate. Refusing here never mutates the
+        run: no status/reason is written, so a legitimate later
+        `resume()` after reactivation can still continue exactly where
+        this one left off."""
         run = RunnerRepo(self._control_conn).get_or_none(run_id)
         if run is None:
             return RunResult(run_id=run_id, status=RunStatus.FAILED, reason="unknown_run")
@@ -510,6 +566,8 @@ class LocalWorkerRunner:
             return self._to_result(run)
 
         if run.status == RunStatus.BLOCKED_ON_QUESTIONS.value:
+            if adapter is not None and self._worker_archived(run.worker_id):
+                return self._to_result(run, reason_override="worker_archived")
             original_prompt = read_original_prompt(
                 self._control_conn, self._control_blobs_dir, run.original_prompt_hash,
             )
@@ -522,6 +580,8 @@ class LocalWorkerRunner:
             )
 
         if run.status == RunStatus.READY.value:
+            if adapter is not None and self._worker_archived(run.worker_id):
+                return self._to_result(run, reason_override="worker_archived")
             claimed = self._claim_for_execution(run_id)
             if claimed is None:
                 return self._to_result(RunnerRepo(self._control_conn).get(run_id))
@@ -529,6 +589,8 @@ class LocalWorkerRunner:
             return self._proceed_to_execution(claimed, adapter, cloud_escalation)
 
         if run.status == RunStatus.RUNNING.value:
+            if adapter is not None and self._worker_archived(run.worker_id):
+                return self._to_result(run, reason_override="worker_archived")
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
             return self._recover_mid_turn(run, adapter, cloud_escalation)
 
@@ -1205,7 +1267,12 @@ class LocalWorkerRunner:
             })
         return self._to_result(updated)
 
-    def _to_result(self, run: RunnerRun) -> RunResult:
+    def _to_result(self, run: RunnerRun, *, reason_override: str | None = None) -> RunResult:
+        """`reason_override`, when given, replaces the durable `reason`
+        in the returned `RunResult` WITHOUT writing it back to `run` --
+        used only for a H.3 archived-worker refusal, which must never
+        mutate the run it refused to continue (see `resume()`'s own
+        docstring)."""
         questions = tuple(json.loads(run.questions_json)) if run.questions_json else ()
         final_text = None
         if run.final_text_content_hash is not None:
@@ -1214,5 +1281,7 @@ class LocalWorkerRunner:
             ).decode("utf-8")
         return RunResult(
             run_id=run.run_id, status=RunStatus(run.status), task_id=run.task_id,
-            questions=questions, reason=run.reason, final_text=final_text,
+            questions=questions,
+            reason=reason_override if reason_override is not None else run.reason,
+            final_text=final_text,
         )
