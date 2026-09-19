@@ -1,0 +1,352 @@
+"""H.4: real, coordinated two-connection/thread concurrency for durable
+Planner route creation vs. worker archive.
+
+Each racer opens its OWN connection to the SAME on-disk database in the
+thread that uses it (Python's `sqlite3` connections are not safe to
+share across threads) -- the same discipline `tests/unit/
+test_worker_lifecycle_service.py`'s own H.3 concurrency tests already
+established. Assertions branch on WHICH side actually won (never a
+hardcoded order), so these tests are correct regardless of real OS
+thread-scheduling nondeterminism; `threading.Event`/`threading.Barrier`
+are used to force or maximize a specific interleaving where the
+invariant under test needs one.
+"""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+
+from code_slayer.planning.executor import PlanningJobExecutor
+from code_slayer.planning.fake_planner import FakePlanner
+from code_slayer.planning.models import JobFailureCategory
+from code_slayer.planning.planner import PlannerOutcome, PlannerResponse, parse_planner_output
+from code_slayer.planning.routing import RoutingOutcome, select_planner_route
+from code_slayer.planning.service import (
+    EngineeringPlanningService,
+    PlannerRouteBindingRejectedError,
+)
+from code_slayer.security.certification_service import (
+    BaselineCertificationTarget,
+    RoleEvaluationTarget,
+)
+from code_slayer.security.live_certification import LiveOllamaRuntimeExpectation
+from code_slayer.store import db as db_module
+from code_slayer.workers.lifecycle import archive_worker
+from code_slayer.workers.role_qualification import (
+    ProductionRole,
+    RoleQualificationOutcome,
+    record_role_certificate,
+    role_evaluation_identity_from_config,
+)
+from code_slayer.workers.security_baseline import (
+    SecurityBaselineOutcome,
+    record_baseline_certificate,
+    runtime_profile_identity_from_config,
+)
+
+REQUEST = "Add a read-only endpoint reporting repository intelligence snapshot age."
+POLICY_VERSION = "planner-certification-v1"
+OUTPUT_TOKEN_BUDGET = 4096
+TOOL_CHOICE_ENFORCEMENT = "ADVISORY_ONLY_UNVERIFIED"
+OLLAMA_ROOT = "http://local:11434"
+
+
+def structured_response(**overrides) -> PlannerResponse:
+    data = {
+        "goal": "Add the endpoint", "requirements": [], "assumptions": [], "affected_files": [],
+        "planned_changes": [], "dependencies": [], "risks": [], "verification_steps": [],
+        "discovered_commands": [], "authority_requirements": [], "evidence_claims": [],
+        "ambiguities": [],
+    }
+    data.update(overrides)
+    output = parse_planner_output(data)
+    assert output is not None
+    return PlannerResponse(PlannerOutcome.STRUCTURED, output=output, raw="{}")
+
+
+def _profile(worker_id: str):
+    return runtime_profile_identity_from_config(
+        model_tag=f"{worker_id}-model", model_digest="sha256:abc", endpoint=f"{OLLAMA_ROOT}/v1",
+        runtime_version="0.16.1", effective_context_tokens=16384, temperature=0.0,
+        normalizer_id=None, normalizer_version=None,
+    )
+
+
+def _target(worker_id: str) -> BaselineCertificationTarget:
+    profile = _profile(worker_id)
+    return BaselineCertificationTarget(
+        worker_id=worker_id,
+        expectation=LiveOllamaRuntimeExpectation(
+            ollama_root=OLLAMA_ROOT, model_tag=f"{worker_id}-model", model_digest="sha256:abc",
+            runtime_version="0.16.1", effective_context_tokens=16384, temperature=0.0,
+            expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+            normalizer_id=None, normalizer_version=None,
+        ),
+    )
+
+
+def _role_target(worker_id: str) -> RoleEvaluationTarget:
+    return RoleEvaluationTarget(
+        worker_id=worker_id, role=ProductionRole.PLANNER,
+        output_token_budget=OUTPUT_TOKEN_BUDGET, tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        policy_version=POLICY_VERSION,
+    )
+
+
+def _certify_eligible(conn, worker_id: str):
+    from code_slayer.store.workers_repo import WorkersRepo
+
+    WorkersRepo(conn).register(worker_id=worker_id, kind="fake", network_class="local")
+    profile = _profile(worker_id)
+    security = record_baseline_certificate(
+        conn, worker_id=worker_id, runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS, evidence_ref=f"sec-ev-{worker_id}", reason="ok",
+    )
+    assert security.ok, security.reason
+    role_evaluation = role_evaluation_identity_from_config(
+        role=ProductionRole.PLANNER,
+        runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
+        output_token_budget=OUTPUT_TOKEN_BUDGET,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        policy_version=POLICY_VERSION,
+    )
+    role = record_role_certificate(
+        conn, worker_id=worker_id, role=ProductionRole.PLANNER, runtime_profile=profile,
+        policy_version=POLICY_VERSION, outcome=RoleQualificationOutcome.PASS,
+        classification="PASS_FIRST_TRY", evidence_ref=f"role-ev-{worker_id}", reason="ok",
+        role_evaluation=role_evaluation,
+    )
+    assert role.ok, role.reason
+
+
+@pytest.fixture
+def state_root(tmp_path):
+    root = tmp_path / "_codeslayer_state"
+    root.mkdir()
+    return root
+
+
+# -- create vs archive: both winner orders -----------------------------------
+
+
+def test_create_job_vs_archive_worker_concurrency_both_winner_orders(
+    git_repo_with_commit, state_root,
+):
+    """H.4 review §10: inside the SAME production `BEGIN IMMEDIATE`
+    transaction that creates the new plan/job, `create_job()` reloads
+    and re-verifies the route binding's worker. Races that against a
+    genuinely concurrent `archive_worker()` call: if archive wins,
+    NOTHING is created; if create wins, archive subsequently sees the
+    new QUEUED job as active work and refuses."""
+    setup = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        _certify_eligible(setup.production_conn(), "w1")
+        selection = select_planner_route(
+            setup.production_conn(), baseline_targets=(_target("w1"),),
+            role_targets=(_role_target("w1"),),
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        binding = selection.binding
+    finally:
+        setup.close()
+
+    barrier = threading.Barrier(2)
+    results: dict[str, object] = {}
+
+    def _create():
+        svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+        try:
+            barrier.wait(timeout=5)
+            try:
+                results["job"] = svc.create_job(
+                    original_request=REQUEST, route_binding=binding,
+                    baseline_targets=(_target("w1"),), role_targets=(_role_target("w1"),),
+                )
+            except PlannerRouteBindingRejectedError as exc:
+                results["create_error"] = exc
+        finally:
+            svc.close()
+
+    def _archive():
+        conn = db_module.connect(setup._db_path)
+        try:
+            barrier.wait(timeout=5)
+            results["archive"] = archive_worker(conn, worker_id="w1")
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=_create), threading.Thread(target=_archive)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+
+    archive_result = results["archive"]
+    verify = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        jobs = verify.list_jobs()
+        if "job" in results:
+            # create() won first: a real QUEUED job exists, bound to w1,
+            # and archive (racing against it) saw genuinely active work.
+            assert len(jobs) == 1
+            assert jobs[0].worker_id == "w1"
+            assert jobs[0].state == "QUEUED"
+            assert archive_result.ok is False
+            assert archive_result.reason == "worker_has_active_work"
+        else:
+            # archive() won first: create's own atomic recheck saw
+            # ARCHIVED and created NOTHING -- no plan, no job.
+            assert "create_error" in results
+            assert results["create_error"].reason == "planner_worker_archived"
+            assert jobs == []
+            assert verify.list(limit=50) == []
+            assert archive_result.ok and archive_result.changed
+    finally:
+        verify.close()
+
+
+# -- certificate authority changes between selection and the create
+# transaction (H.4 review correction #2) -------------------------------------
+
+
+def test_certificate_authority_change_between_selection_and_create_is_refused(
+    git_repo_with_commit, state_root,
+):
+    """A deterministic DB race, forced via events rather than a free-
+    running barrier (the exact interleaving under test -- a NEW
+    certificate landing strictly between route SELECTION and the
+    CREATE transaction's own atomic recheck -- must be guaranteed, not
+    merely likely): route selection happens, then (before the create
+    transaction ever opens) a genuinely concurrent re-certification
+    commits a NEW Baseline Security certificate for the same worker,
+    on a separate connection/thread. The stale binding must be refused
+    -- `planner_route_binding_stale` -- and create NOTHING; a job must
+    never be accepted already-stale merely because execution-time
+    revalidation would eventually have caught it too."""
+    setup = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        _certify_eligible(setup.production_conn(), "w1")
+        selection = select_planner_route(
+            setup.production_conn(), baseline_targets=(_target("w1"),),
+            role_targets=(_role_target("w1"),),
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        binding = selection.binding
+    finally:
+        setup.close()
+
+    recertified = threading.Event()
+
+    def _recertify():
+        conn = db_module.connect(setup._db_path)
+        try:
+            profile = _profile("w1")
+            result = record_baseline_certificate(
+                conn, worker_id="w1", runtime_profile=profile,
+                outcome=SecurityBaselineOutcome.PASS, evidence_ref="sec-ev-w1-NEW",
+                reason="re-certified",
+            )
+            assert result.ok, result.reason
+            assert result.certificate.certificate_id != binding.security_certificate_id
+        finally:
+            conn.close()
+        recertified.set()
+
+    thread = threading.Thread(target=_recertify)
+    thread.start()
+    thread.join(timeout=5)
+    assert recertified.is_set()
+
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        with pytest.raises(PlannerRouteBindingRejectedError) as excinfo:
+            svc.create_job(
+                original_request=REQUEST, route_binding=binding,
+                baseline_targets=(_target("w1"),), role_targets=(_role_target("w1"),),
+            )
+        assert excinfo.value.reason == "planner_route_binding_stale"
+        assert svc.list_jobs() == []
+        assert svc.list(limit=50) == []
+    finally:
+        svc.close()
+
+
+# -- no-reroute: an ineligible bound worker never falls back to another ------
+
+
+def test_bound_worker_ineligible_never_reroutes_to_a_different_eligible_worker(
+    git_repo_with_commit, state_root,
+):
+    """H.4's central invariant: `job` is bound to worker-A at creation.
+    worker-A later becomes ineligible (its Baseline Security certificate
+    is superseded by a FAIL re-certification -- a realistic scenario
+    that, unlike archiving, is never blocked by the job itself being
+    QUEUED). worker-B becomes eligible in the meantime. The claimed job
+    must FAIL -- never silently execute on worker-B. worker-B's own
+    factory must never be called at all."""
+    setup = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        _certify_eligible(setup.production_conn(), "worker-a")
+        selection = select_planner_route(
+            setup.production_conn(), baseline_targets=(_target("worker-a"),),
+            role_targets=(_role_target("worker-a"),),
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        binding_a = selection.binding
+        job = setup.create_job(
+            original_request=REQUEST, route_binding=binding_a,
+            baseline_targets=(_target("worker-a"),), role_targets=(_role_target("worker-a"),),
+        )
+        assert job.worker_id == "worker-a"
+
+        # worker-A becomes ineligible; worker-B becomes eligible.
+        fail_cert = record_baseline_certificate(
+            setup.production_conn(), worker_id="worker-a", runtime_profile=_profile("worker-a"),
+            outcome=SecurityBaselineOutcome.FAIL, evidence_ref="sec-ev-worker-a-FAIL",
+            reason="regressed",
+        )
+        assert fail_cert.ok, fail_cert.reason
+        _certify_eligible(setup.production_conn(), "worker-b")
+    finally:
+        setup.close()
+
+    worker_b_calls: list[tuple[str, str]] = []
+
+    def _planner_factory_for_worker(worker_id: str, job_id: str):
+        worker_b_calls.append((worker_id, job_id))
+        return FakePlanner([structured_response()])
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, planner_factory_for_worker=_planner_factory_for_worker,
+        baseline_targets=(_target("worker-a"), _target("worker-b")),
+        role_targets=(_role_target("worker-a"), _role_target("worker-b")),
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    try:
+        executor.start()
+        deadline_service = EngineeringPlanningService(
+            git_repo_with_commit, state_root_override=state_root,
+        )
+        import time
+        deadline = time.time() + 10
+        try:
+            while time.time() < deadline:
+                if deadline_service.get_job(job.job_id).state in ("SUCCEEDED", "FAILED"):
+                    break
+                time.sleep(0.02)
+            final = deadline_service.get_job(job.job_id)
+        finally:
+            deadline_service.close()
+    finally:
+        executor.stop()
+
+    assert final.state == "FAILED"
+    assert final.failure_category == JobFailureCategory.ROUTING.value
+    assert final.failure_reason == "planner_worker_not_eligible:security_baseline_fail"
+    # The factory was never called for ANY worker -- neither the
+    # archived worker-a (revalidation refused before construction) nor
+    # a substituted worker-b (this job was never re-routed to it).
+    assert worker_b_calls == []

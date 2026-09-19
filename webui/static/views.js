@@ -518,6 +518,59 @@ export function renderJobStatus(job) {
   return `<p class="notice">${jobBadge(job.state)} Planning attempt finished.</p>`;
 }
 
+/** H.4: the backend-selected, durably-bound Planner routing authority
+ * for one job -- worker_id/certificate ids/output budget/tool-choice
+ * profile/policy version are bounded, non-secret provenance (never an
+ * API key or raw runtime credential), safe to render directly. There
+ * is deliberately no worker selector and no "change worker" control
+ * anywhere in this view: the backend already made this decision, and
+ * it is immutable for this job once made (see `planning.routing`'s own
+ * module docstring). `job.worker_id` is null only for a job created
+ * before this routing existed (schema v18 and earlier) -- rendered as
+ * an explicit "unbound (legacy)" state, never blank/silently omitted. */
+export function renderPlannerRouteBinding(job) {
+  if (!job) return "";
+  if (!job.worker_id) {
+    return `
+      <div class="plan-binding">
+        <div class="plan-binding-item">
+          <span class="plan-binding-label">Planner worker</span>
+          <strong class="muted-text">Unbound (legacy job)</strong>
+        </div>
+      </div>
+    `;
+  }
+  const shortCert = (id) => (id ? escapeHTML(String(id).slice(0, 12)) : "—");
+  return `
+    <div class="plan-binding">
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Planner worker</span>
+        <strong>${escapeHTML(job.worker_id)}</strong>
+      </div>
+
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Baseline Security certificate</span>
+        <strong>${shortCert(job.security_certificate_id)}</strong>
+      </div>
+
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Planner role certificate</span>
+        <strong>${shortCert(job.role_certificate_id)}</strong>
+      </div>
+
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Output token budget</span>
+        <strong>${escapeHTML(job.output_token_budget)}</strong>
+      </div>
+
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Tool-choice enforcement</span>
+        <strong>${escapeHTML(job.tool_choice_enforcement)}</strong>
+      </div>
+    </div>
+  `;
+}
+
 export function renderPlanDetail(record, job) {
   if (!record) {
     return `
@@ -542,6 +595,8 @@ export function renderPlanDetail(record, job) {
         </div>
       `
       : "";
+
+  const plannerRouteBinding = renderPlannerRouteBinding(job);
 
   const binding = `
     <div class="plan-binding">
@@ -600,6 +655,7 @@ export function renderPlanDetail(record, job) {
       return `
         ${jobNotice}
         ${binding}
+        ${plannerRouteBinding}
 
         <div class="plan-empty">
           <div class="muted-text">
@@ -613,6 +669,7 @@ export function renderPlanDetail(record, job) {
       ${jobNotice}
       ${staleNotice}
       ${binding}
+      ${plannerRouteBinding}
 
       <div class="plan-error">
 
@@ -642,6 +699,7 @@ export function renderPlanDetail(record, job) {
     ${jobNotice}
     ${staleNotice}
     ${binding}
+    ${plannerRouteBinding}
 
     <div class="plan-detail-section plan-goal">
       <div class="section-label">GOAL</div>

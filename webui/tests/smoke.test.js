@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createAPI, APIError } from "../static/api.js";
 import { workerAlias, saveWorkerAlias } from "../static/aliases.js";
 import { provenanceClass, provenanceBadge, lifecycleBadge, lifecycleBadgeClass, renderRuntimeServers, renderRuntimeWorkers, renderRuntimeAttestation, renderOllamaServerTest, renderRuntimeIdentityResult, renderReplaceIdentityConfirm, renderRuntimeServerOptions, runtimeRegistrationPayload, clearRuntimeEvidence, acceptRuntimeSnapshot, rejectRuntimeSnapshot, acceptRuntimeAttest, acceptIdentityResult, attestationForWorker, beginRuntimeObservation, invalidateServerTest, acceptServerTest, identityResultBindable, certificationStateClass, certificationStateBadge, plannerEligibilityLabel, isCertificationTerminal, isCertificationActive, shouldContinueCertificationPoll, certificationPollDelay, certificationStartEnabled, certificationPreflightEnabled, certificationPromoteEnabled, certificationPlannerStartEnabled, certificationPlannerPreflightEnabled, bindCertificationEvidence, selectCertificationWorkerId, acceptCertificationWorker, beginCertificationRun, applyCertificationPoll, beginCertificationEvidenceRequest, acceptCertificationEvidence, rejectCertificationEvidence, beginCertificationPreflight, certificationSelectionMatches, acceptCertificationStart, acceptCertificationPreflight, acceptCertificationPromotion, beginCertificationPlannerPreflight, acceptCertificationPlannerPreflight, beginCertificationPlannerRun, acceptCertificationPlannerStart, applyCertificationPlannerPoll, clearCertificationTransient, renderCertificationWorkers, renderCertificationWorkerSummary, renderCertificationWorkerDetail, renderCertificationEligibility, renderCertificationRoles, renderCertificationPreflight, renderCertificationRun, renderCertificationHistory, renderCertificationEvidence, beginSystemRequest, acceptSystemSnapshot, rejectSystemSnapshot, beginTailscaleRequest, acceptTailscaleSnapshot, rejectTailscaleSnapshot, renderSystemSettings, renderTailscaleSettings, beginDashboardSummaryRequest, acceptDashboardSummary, rejectDashboardSummary, renderDashboardSystemSummary, renderDashboardRuntimeSummary, renderDashboardCertificationSummary, renderDashboardTailscaleSummary } from "../static/views-admin.js";
-import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
+import { badge, connectionText, pollDelay, renderRun, renderRuns, renderQuestions, renderTrust, renderAudit, renderConformance, intelStatusClass, intelStatusLabel, renderIntelStatus, renderIntelProjects, renderIntelCommands, renderIntelResults, planStateClass, planBadge, renderPlanList, renderPlanAffectedFiles, renderPlanCommands, renderPlanQuestions, renderPlanDetail, jobStateClass, jobBadge, renderJobStatus, renderPlannerRouteBinding, permissionSensitivityBadge, renderPermissionTechnicalDetails, renderPermissionExplanation, renderPendingPermissionRequest, renderPendingPermissionRequests, permissionGrantStateClass, permissionGrantBadge, renderActivePermissionGrants, renderPermissionHistory } from "../static/views.js";
 
 const run = { run_id: "real-run-id", worker_id: "local-worker", role: "coder", status: "RUNNING", task_status: "IMPLEMENTING", reason: null, next_safe_action: "wait", execution_state_available: true };
 const reply = (data, ok = true) => ({ ok, json: async () => data });
@@ -294,6 +294,50 @@ test("planning HTML/JS never wires trust, execution, or arbitrary path fields", 
   assert.match(html, /plan-form/);
   assert.match(html, /planning only/i);
   assert.doesNotMatch(js, /trust_level|lease_generation|checkpoint_id|repo_path|db_path/);
+});
+
+// --- H.4: worker-bound Planner routing provenance ---------------------------
+
+test("a job's bound Planner worker and authority provenance are shown", () => {
+  const job = {
+    state: "SUCCEEDED", worker_id: "qwen3-coder-ctx16k",
+    security_certificate_id: "abcdef1234567890", role_certificate_id: "1234567890abcdef",
+    output_token_budget: 4096, tool_choice_enforcement: "ADVISORY_ONLY_UNVERIFIED",
+  };
+  const html = renderPlannerRouteBinding(job);
+  assert.match(html, /qwen3-coder-ctx16k/);
+  assert.match(html, /Planner worker/);
+  assert.match(html, /4096/);
+  assert.match(html, /ADVISORY_ONLY_UNVERIFIED/);
+  assert.match(html, /abcdef1234567890|abcdef123456/); // truncated certificate id is acceptable
+});
+
+test("a legacy job with no worker binding renders an explicit unbound state, never blank", () => {
+  const html = renderPlannerRouteBinding({state: "SUCCEEDED", worker_id: null});
+  assert.match(html, /Unbound/i);
+  assert.equal(renderPlannerRouteBinding(null), "");
+});
+
+test("planner route binding rendering escapes untrusted worker/certificate values", () => {
+  const attack = '<img src=x onerror="alert(1)">';
+  const html = renderPlannerRouteBinding({
+    state: "SUCCEEDED", worker_id: attack, security_certificate_id: attack,
+    role_certificate_id: attack, output_token_budget: 4096,
+    tool_choice_enforcement: attack,
+  });
+  assert.doesNotMatch(html, /<img/);
+});
+
+test("no worker selector or change-worker control exists anywhere in the planning UI", async () => {
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const apiJs = await readFile(new URL("../static/api.js", import.meta.url), "utf8");
+  const viewsJs = await readFile(new URL("../static/views.js", import.meta.url), "utf8");
+  // Nothing in the planning surface ever lets an HTTP caller choose a
+  // worker -- the backend always selects it (H.4). `createPlan`/
+  // `replanPlan` take no worker-identifying argument at all.
+  assert.doesNotMatch(html, /worker[-_]?select/i);
+  assert.match(apiJs, /createPlan:\s*\(text\)\s*=>\s*request\("\/plans",\s*\{\s*request:\s*text\s*\}\)/);
+  assert.doesNotMatch(viewsJs, /<select[^>]*worker/i);
 });
 
 // --- Phase 8.2d: durable background planning jobs ---------------------------

@@ -261,7 +261,8 @@ def test_v17_to_v18_upgrade_succeeds_and_existing_worker_becomes_active(tmp_path
     )
     conn.execute("COMMIT")
 
-    assert db_module.migrate(conn) == 18
+    _apply_through(conn, 18)
+    assert db_module.schema_version(conn) == 18
 
     row = conn.execute("SELECT * FROM workers WHERE worker_id = 'w1'").fetchone()
     assert row["lifecycle_state"] == "ACTIVE"
@@ -311,7 +312,8 @@ def test_v17_to_v18_upgrade_preserves_certificate_and_history_rows(tmp_path):
     )
     run_before = dict(conn.execute("SELECT * FROM runner_runs WHERE run_id = 'run-1'").fetchone())
 
-    assert db_module.migrate(conn) == 18
+    _apply_through(conn, 18)
+    assert db_module.schema_version(conn) == 18
 
     cert_after = dict(
         conn.execute(
@@ -327,7 +329,8 @@ def test_v17_to_v18_upgrade_preserves_certificate_and_history_rows(tmp_path):
 def test_fresh_db_gets_lifecycle_columns_at_v18(tmp_path):
     path = tmp_path / "state.db"
     conn = db_module.connect(path)
-    assert db_module.migrate(conn) == 18
+    _apply_through(conn, 18)
+    assert db_module.schema_version(conn) == 18
     WorkersRepo(conn).register(worker_id="w1", kind="fake", network_class="local")
     worker = WorkersRepo(conn).get("w1")
     assert worker.lifecycle_state == "ACTIVE"

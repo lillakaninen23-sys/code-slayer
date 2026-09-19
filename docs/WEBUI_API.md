@@ -126,20 +126,28 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | --- | --- |
 | `GET /api/plans?limit=100&offset=0` | `{plans: [...]}`; a plan summary/detail per entry (see below), newest first |
 | `GET /api/plans/{plan_id}` | Full plan detail: `state`, `effective_state` (`"STALE"` in place of `"READY"` when the repository has changed since binding), `reason`, revision/predecessor linkage, repository binding, `questions`, and full `content` |
-| `POST /api/plans` | `{request}` → **202** `{job_id, plan_id, state: "QUEUED", status_url}` immediately; `503 planner_not_configured` if no server-side `Planner` is configured. Durable, server-owned background execution — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#durable-background-jobs-phase-82d); HTTP client disconnect never cancels it |
+| `POST /api/plans` | `{request}` → **202** `{job_id, plan_id, state: "QUEUED", status_url, worker_id, ...}` immediately; `503 planner_not_configured`/`no_eligible_planner_worker`/`multiple_eligible_planner_workers` if no single eligible Planner worker is currently available; `409 <reason>` if the backend-selected worker fails its own atomic re-verification before the job is accepted. Durable, server-owned background execution, worker-bound at creation (H.4) — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#durable-background-jobs-phase-82d) and its "Worker-bound Planner routing (H.4)" section; HTTP client disconnect never cancels it. **Never accepts a `worker_id`/`model`/`certificate_id`/`runtime_identity_fingerprint` field** — the backend always selects the worker |
 | `POST /api/plans/{plan_id}/resume` | `{}` → **200**, synchronous: re-evaluates the Question Gate against durable resolutions; never invokes the planner, so there is no long-running turn to background |
-| `POST /api/plans/{plan_id}/replan` | `{}` → **202**, same durable-job contract as `POST /api/plans` |
+| `POST /api/plans/{plan_id}/replan` | `{}` → **202**, same durable-job contract as `POST /api/plans`, including its own freshly and independently selected worker binding — never inherited from the predecessor's job |
 | `POST /api/plans/{plan_id}/resolutions` | `{ambiguity_id, answer, resolution_kind: "FACT" or "AUTHORIZATION"}` → current plan detail through `record_user_resolution`; recording alone does not advance state — resume re-evaluates |
-| `GET /api/planning-jobs?limit=100&offset=0` | `{jobs: [...]}`; each with `job_id`, `plan_id`, `kind` (`"create"`/`"replan"`), `state` (`QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`), `attempt`, timestamps, `failure_category`/`failure_reason` |
+| `GET /api/planning-jobs?limit=100&offset=0` | `{jobs: [...]}`; each with `job_id`, `plan_id`, `kind` (`"create"`/`"replan"`), `state` (`QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`), `attempt`, timestamps, `failure_category`/`failure_reason`, and (H.4) `worker_id`, `runtime_identity_fingerprint`, `role_evaluation_fingerprint`, `security_certificate_id`, `role_certificate_id`, `output_token_budget`, `tool_choice_enforcement`, `planner_policy_version` — `null` only for a job created before schema v19 |
 | `GET /api/planning-jobs/{job_id}` | One job's full durable status — poll this after a `202` until `state` is `SUCCEEDED`/`FAILED`, then read the plan via `plan_id` |
 
 A job's `state` is distinct from the plan's own `state`: `SUCCEEDED` means
 the planner turn itself completed and produced genuine structured output —
 the resulting plan may legitimately be `READY`, `NEEDS_INPUT`, or even
 `DRAFT` (evidence validation rejected a claim). `FAILED` means the turn
-itself never produced valid structured output; `failure_category` is one
-of the small, safe, code-owned `PlannerFailureCategory` values — never raw
-model text, which stays durable-internal-only.
+either never reached a Planner at all (`failure_category: "routing"` — H.4:
+a routing/authorization refusal, e.g. `failure_reason:
+"planner_worker_archived"`/`"planner_worker_not_eligible:..."`/
+`"planner_route_binding_stale"`/`"planner_runtime_unreachable"`/
+`"planner_runtime_identity_mismatch"`/`"planner_worker_unbound"`) or reached
+one that never produced valid structured output (`failure_category:
+"planner"`, `failure_reason: "malformed_planner_output:<category>"` where
+`<category>` is one of the small, safe, code-owned `PlannerFailureCategory`
+values), or an unexpected internal error interrupted execution
+(`failure_category: "internal_error"`) — never raw model/exception/network
+text, which stays durable-internal-only.
 
 A plan's `content` (when not `None`) carries `goal`, `requirements`, `assumptions`,
 `affected_files` (each with `path`, `action`, `reason`, `exists_in_repository`,

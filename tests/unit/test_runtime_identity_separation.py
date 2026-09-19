@@ -544,11 +544,12 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
 
 
 def test_schema_v17_is_known_and_prior_identity_migrations_are_untouched():
-    # Bumped to 18 by H.3 (`worker_lifecycle`) -- this test's own
-    # purpose (every prior identity-related migration this file cares
-    # about is still present and untouched) still holds; it is not
-    # itself a claim that 18 is the LAST version anything may ever add.
-    assert db_module.known_schema_version() == 18
+    # Bumped to 19 by H.4 (`planner_worker_routing`, after H.3's own
+    # bump to 18 for `worker_lifecycle`) -- this test's own purpose
+    # (every prior identity-related migration this file cares about is
+    # still present and untouched) still holds; it is not itself a
+    # claim that 19 is the LAST version anything may ever add.
+    assert db_module.known_schema_version() == 19
     names = [name for _version, name, _sql in db_module._discover_migrations()]
     assert "runtime_profile_normalizer_identity" in names
     assert "runtime_config_fingerprint" in names
