@@ -133,10 +133,6 @@ MAX_QUALIFICATION_EVIDENCE_BYTES = 256 * 1024
 # for verifying an authentic historical `planner-qualification-evidence-
 # v2` document's `role_evaluation_spec` -- never the current identity.
 _HISTORICAL_ROLE_EVALUATION_SPEC_VERSION_V1 = "role-evaluation-spec-v1"
-_HISTORICAL_ROLE_EVALUATION_SPEC_V1_KEYS = frozenset({
-    "spec_version", "role", "runtime_identity_fingerprint",
-    "output_token_budget", "tool_choice_enforcement", "policy_version",
-})
 
 # Structural denylist: the document builder never emits these keys, and
 # persist refuses a document that contains them so a later edit cannot
@@ -310,12 +306,17 @@ def verify_role_evaluation_fingerprint(spec: dict, expected_fingerprint: str) ->
 
 def _fingerprint_role_evaluation_v1_historical(spec: dict) -> str:
     """FROZEN reproduction of the pre-H.4.1 `role-evaluation-spec-v1`
-    fingerprint semantics (SHA-256 of the canonical JSON document with
-    exactly `spec_version`/`role`/`runtime_identity_fingerprint`/
-    `output_token_budget`/`tool_choice_enforcement`/`policy_version` --
-    no timeout field). Used ONLY to re-verify an authentic, already-
-    persisted `planner-qualification-evidence-v2` document's own
-    `role_evaluation_spec` -- forensic verification only.
+    fingerprint semantics -- exactly what the OLD `fingerprint_role_
+    evaluation()` did before H.4.1's v2 bump: require `spec["spec_
+    version"] == "role-evaluation-spec-v1"`, then SHA-256 the full
+    `canonical_json(spec)`, with no per-key shape validation of its own
+    (the old code never had any either -- `canonical_role_evaluation_
+    spec()`'s caller-side validation was the only gate, and this
+    function's job is only to re-verify an already-persisted document's
+    fingerprint, not to re-validate how it was built). Used ONLY to
+    re-verify an authentic, already-persisted `planner-qualification-
+    evidence-v2` document's own `role_evaluation_spec` -- forensic
+    verification only.
 
     This function never constructs a `RoleEvaluationIdentity`, is never
     called from anywhere in the production routing/certification/
@@ -327,8 +328,6 @@ def _fingerprint_role_evaluation_v1_historical(spec: dict) -> str:
     if not isinstance(spec, dict):
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     if spec.get("spec_version") != _HISTORICAL_ROLE_EVALUATION_SPEC_VERSION_V1:
-        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
-    if set(spec) != _HISTORICAL_ROLE_EVALUATION_SPEC_V1_KEYS:
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     digest = hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
     try:

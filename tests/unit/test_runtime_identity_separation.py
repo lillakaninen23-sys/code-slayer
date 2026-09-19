@@ -813,6 +813,76 @@ def test_historical_v2_evidence_document_with_role_evaluation_spec_v1_remains_re
         )
 
 
+def test_historical_v2_role_evaluation_spec_v1_with_extra_field_still_reads(db_conn, tmp_path):
+    """H.4.1 review round 4: the historical verifier must reproduce the
+    OLD `fingerprint_role_evaluation()` semantics exactly -- SHA-256 of
+    the full `canonical_json(spec)`, gated only on `spec_version`, with
+    NO per-key shape restriction of its own. A real deployment could
+    have persisted a role_evaluation_spec with an extra field the old
+    code never rejected (the old fingerprinting simply hashed whatever
+    `canonical_role_evaluation_spec()` produced, and never re-validated
+    the document's shape on read); this proves such a document is not
+    now spuriously refused by a NEW restriction this module never had
+    before H.4.1. The expected fingerprint is computed independently
+    here (not via the production historical helper), so this test
+    cannot pass merely by agreeing with itself."""
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    identity_spec = canonical_runtime_identity_spec(
+        model_tag="qwen3-coder-ctx16k:30b",
+        model_digest="sha256:abc",
+        endpoint="http://192.168.32.8:11434/v1",
+        runtime_version="0.16.1",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+        effective_context_tokens=16384,
+        temperature=0.0,
+    )
+    identity_fp = fingerprint_runtime_identity(identity_spec)
+    role_spec = _historical_role_evaluation_spec_v1(runtime_identity_fingerprint=identity_fp)
+    role_spec["extra_harmless_field"] = "some-value-old-code-never-rejected"
+    role_fp = hashlib.sha256(canonical_json(role_spec).encode("utf-8")).hexdigest()
+    document = {
+        "spec_version": QUALIFICATION_EVIDENCE_SPEC_VERSION_V2,
+        "role": "PLANNER",
+        "policy_version": POLICY_VERSION,
+        "runtime_identity_spec": identity_spec,
+        "runtime_identity_fingerprint": identity_fp,
+        "role_evaluation_spec": role_spec,
+        "role_evaluation_fingerprint": role_fp,
+        "model_tag": identity_spec["model_tag"],
+        "model_digest": identity_spec["model_digest"],
+        "endpoint": identity_spec["endpoint"],
+        "runtime_version": identity_spec["runtime_version"],
+        "normalizer_id": identity_spec["normalizer_id"],
+        "normalizer_version": identity_spec["normalizer_version"],
+        "effective_context_tokens": identity_spec["effective_context_tokens"],
+        "temperature": identity_spec["temperature"],
+        "output_token_budget": role_spec["output_token_budget"],
+        "tool_choice_enforcement": role_spec["tool_choice_enforcement"],
+        "final_classification": "PASS_FIRST_TRY",
+        "instance_count": 0,
+        "attempt_count": 0,
+        "correction_used": False,
+        "instances": [],
+    }
+    store = ContentStore(db_conn, blobs)
+    payload = canonical_json(document).encode("utf-8")
+    blob = store.put(
+        payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    loaded = read_planner_qualification_evidence(
+        db_conn, blobs, blob.content_hash,
+        expected_runtime_identity_fingerprint=identity_fp,
+        expected_role_evaluation_fingerprint=role_fp,
+    )
+    assert loaded["role_evaluation_spec"]["extra_harmless_field"] == (
+        "some-value-old-code-never-rejected"
+    )
+    assert loaded["role_evaluation_fingerprint"] == role_fp
+
+
 def test_historical_v1_role_evaluation_never_authorizes_current_v2_eligibility(db_conn):
     """The FROZEN historical role-evaluation-spec-v1 fingerprint for a
     given (runtime identity, output_token_budget, tool_choice_

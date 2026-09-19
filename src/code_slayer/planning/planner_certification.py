@@ -101,17 +101,26 @@ verdict about the model) when:
 `planning.qualification` durably stores nothing of its own. This module
 persists a bounded canonical JSON document via
 `planning.qualification_evidence` *before* recording the certificate,
-and stores that blob's content hash as `evidence_ref`. The v2 document
-contains the canonical `runtime-identity-spec-v2` and
-`role-evaluation-spec-v1` (so both fingerprints are later recomputable
-from durable state), each instance outcome, and the already-bounded
-`AttemptProvenance` records — never raw prompt or model text. A
-one-way fingerprint without that document is not sufficient forensic
-evidence; a document whose recomputed fingerprints do not match the
-certificate is refused. Existing certificates are never rewritten;
-their `evidence_ref` values stay as originally recorded. Existing v1
-evidence documents remain readable under v1 semantics and are never
-reinterpreted as v2."""
+and stores that blob's content hash as `evidence_ref`. New/current
+evidence is `planner-qualification-evidence-v3` (H.4.1) and contains
+the canonical `runtime-identity-spec-v2` and the CURRENT
+`role-evaluation-spec-v2` — which now also includes
+`execution_timeout_seconds`, the certified Planner inference timeout —
+so both fingerprints (and the timeout every attempt actually used) are
+later recomputable from durable state, alongside each instance outcome
+and the already-bounded `AttemptProvenance` records — never raw prompt
+or model text. A one-way fingerprint without that document is not
+sufficient forensic evidence; a document whose recomputed fingerprints
+(or, for v3, per-attempt timeout) do not match the certificate is
+refused. Existing certificates are never rewritten; their `evidence_ref`
+values stay as originally recorded. Existing `planner-qualification-
+evidence-v1` documents remain readable under v1 semantics, and existing
+`planner-qualification-evidence-v2` documents (H.2/H.3-era, whose
+`role_evaluation_spec` always carries the now-historical
+`role-evaluation-spec-v1`) remain readable under a dedicated, FROZEN
+historical verifier — see `planning.qualification_evidence`'s own
+module docstring. Neither is ever rewritten, upgraded, or reinterpreted
+as current (`v3`) authority."""
 
 from __future__ import annotations
 
