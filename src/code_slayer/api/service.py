@@ -15,7 +15,11 @@ from code_slayer.finalization.dispatcher import TaskLifecycleExecutor
 from code_slayer.intelligence import RepositoryIntelligenceService
 from code_slayer.permissions.service import PermissionService
 from code_slayer.planning.executor import PlanningJobExecutor
-from code_slayer.planning.service import EngineeringPlanningService
+from code_slayer.planning.routing import RoutingOutcome, select_planner_route
+from code_slayer.planning.service import (
+    EngineeringPlanningService,
+    PlannerRouteBindingRejectedError,
+)
 from code_slayer.repo import identity
 from code_slayer.runner import LocalWorkerRunner
 from code_slayer.security.certification_executor import CertificationJobExecutor
@@ -62,7 +66,23 @@ class RuntimeBindings:
 
     analyst_factory: Callable[[], PromptAnalyst] | None = None
     adapter_factory: Callable[[str, str], WorkerAdapter | None] | None = None
+    # LEGACY, non-authoritative (H.4). A zero-argument Planner factory
+    # with no worker identity at all -- `/api/plans`/`PlanningJobExecutor`
+    # never read this field for production routing and never infer a
+    # worker identity from it. Kept only so dev/test wiring that still
+    # constructs a `RuntimeBindings` with just this field continues to
+    # import/construct without error; it authorizes nothing on its own.
+    # See `planner_factory_for_worker` for the real, worker-bound path.
     planner_factory: Callable[[], object] | None = None
+    # H.4: the real, worker-bound production Planner factory —
+    # `Callable[[worker_id, job_id], planning.planner.Planner]`. The
+    # ONE thing `planning.executor.PlanningJobExecutor` ever calls to
+    # construct a Planner for a claimed job, and only after that job's
+    # own durable route binding has been freshly revalidated
+    # (`planning.routing.revalidate_route_binding()`) against the EXACT
+    # `worker_id` it names — never a caller-chosen worker, never this
+    # codebase's own zero-argument `planner_factory` above.
+    planner_factory_for_worker: Callable[[str, str], object] | None = None
     # Workers this runtime declares as existing (Phase: runtime
     # integration). Registered idempotently once at `ApplicationService`
     # construction -- never re-registered per request, and never itself
@@ -116,13 +136,27 @@ class ApplicationService:
         self.identity = identity.resolve(self.repo_path, create=False)
         # One long-lived background planning executor per process (Phase
         # 8.2d) -- never one per HTTP request. Only constructed/started
-        # when a Planner is actually configured; when it is not, POST
-        # /api/plans fails explicitly (see `_require_planner_configured()`)
-        # rather than accepting a job nothing could ever execute.
+        # when a worker-bound Planner factory is actually configured
+        # (H.4: `planner_factory_for_worker`, never the legacy zero-arg
+        # `planner_factory`); when it is not, POST /api/plans fails
+        # explicitly (see `_require_planner_configured()`) rather than
+        # accepting a job nothing could ever execute. `bindings_factory`
+        # (H.4 review finding) mirrors `_certification_executor`'s own
+        # pattern below exactly: when persistent config is in play, the
+        # executor re-derives current `baseline_certification_targets`/
+        # `role_evaluation_targets`/`planner_factory_for_worker` FRESH on
+        # every single job execution, never a snapshot frozen at this
+        # one construction instant.
         self._planning_executor = None
-        if self.bindings.planner_factory is not None:
+        if self.bindings.planner_factory_for_worker is not None:
             self._planning_executor = PlanningJobExecutor(
-                self.repo_path, planner_factory=self.bindings.planner_factory,
+                self.repo_path,
+                planner_factory_for_worker=self.bindings.planner_factory_for_worker,
+                baseline_targets=self.bindings.baseline_certification_targets,
+                role_targets=self.bindings.role_evaluation_targets,
+                bindings_factory=(
+                    self._compose_bindings if self._load_persistent_config else None
+                ),
                 state_root_override=self.state_root,
                 max_workers=self.bindings.planning_max_workers,
                 poll_interval_seconds=self.bindings.planning_poll_interval_seconds,
@@ -364,8 +398,25 @@ class ApplicationService:
     def _job_json(record):
         return asdict(record) | {"status_url": f"/api/planning-jobs/{record.job_id}"}
 
-    def _require_planner_configured(self):
-        if self.bindings.planner_factory is None:
+    def _current_planning_bindings(self) -> RuntimeBindings:
+        """H.4 review finding: route SELECTION (`create_plan()`/
+        `replan_plan()`) must use a FRESH current config/bindings
+        snapshot, never `self.bindings` as captured at the last config
+        save — persistent config can change between then and now.
+        Mirrors `planning.executor.PlanningJobExecutor._routing_inputs()`'s
+        own freshness discipline exactly, just on the HTTP request
+        thread rather than the background dispatcher thread. When this
+        process was never configured to load persistent config at all
+        (`load_persistent_config=False`, e.g. most dev/test wiring),
+        `self.bindings` already IS the only, unchanging source of truth
+        -- no separate resolution is needed or possible."""
+        if self._load_persistent_config:
+            return self._compose_bindings()
+        return self.bindings
+
+    def _require_planner_configured(self, bindings: RuntimeBindings | None = None) -> None:
+        bindings = bindings if bindings is not None else self.bindings
+        if bindings.planner_factory_for_worker is None:
             raise APIError("planner_not_configured", "Configure a server-side Planner.", 503)
 
     def list_plans(self, limit, offset):
@@ -379,15 +430,58 @@ class ApplicationService:
             except KeyError:
                 raise APIError("not_found", "Plan not found.", 404) from None
 
+    def _select_planner_route(self, bindings: RuntimeBindings, service: EngineeringPlanningService):
+        """The ONE place an HTTP request selects a NEW job's Planner
+        route (H.4) — `planning.routing.select_planner_route()`,
+        against `bindings`' FRESH `baseline_certification_targets`/
+        `role_evaluation_targets` and `service`'s own production
+        connection. Raises `APIError` (503) for zero/multiple eligible
+        candidates; returns the `PlannerRouteBinding` plus the exact
+        targets used, so the caller can pass the SAME snapshot into
+        `create_job()`/`replan_job()`'s own atomic re-verification."""
+        selection = select_planner_route(
+            service.production_conn(),
+            baseline_targets=bindings.baseline_certification_targets,
+            role_targets=bindings.role_evaluation_targets,
+        )
+        if selection.outcome != RoutingOutcome.SELECTED:
+            raise APIError(
+                selection.outcome.value,
+                "No single eligible Planner worker is currently available.", 503,
+            )
+        return selection.binding
+
     def create_plan(self, data):
         """Durably accepts a new planning job and returns immediately —
         HTTP 202 (see `api.routes.create_plan`). No planner is ever
         invoked on this request's own thread; `self._planning_executor`
         (started once at process startup, never per request) claims and
-        executes it in the background."""
-        self._require_planner_configured()
+        executes it in the background.
+
+        H.4: the server (never the client — `data` has no worker-
+        identifying field at all, enforced by `api.routes.body()`'s own
+        closed-set spec) selects the exact Planner worker for this new
+        job, from a FRESH current config/bindings snapshot
+        (`_current_planning_bindings()`), then durably binds the job to
+        it. `EngineeringPlanningService.create_job()`'s own atomic,
+        in-transaction re-verification (`PlannerRouteBindingRejectedError`)
+        is the final, genuinely-atomic guard against a certificate/
+        lifecycle change landing in the gap between that selection and
+        this request's own write."""
+        bindings = self._current_planning_bindings()
+        self._require_planner_configured(bindings)
         with self.planning() as service:
-            job = service.create_job(original_request=data["request"])
+            binding = self._select_planner_route(bindings, service)
+            try:
+                job = service.create_job(
+                    original_request=data["request"], route_binding=binding,
+                    baseline_targets=bindings.baseline_certification_targets,
+                    role_targets=bindings.role_evaluation_targets,
+                )
+            except PlannerRouteBindingRejectedError as exc:
+                raise APIError(
+                    exc.reason, "The selected Planner worker is no longer eligible.", 409,
+                ) from None
         self._planning_executor.notify()
         return self._job_json(job)
 
@@ -406,15 +500,34 @@ class ApplicationService:
     def replan_plan(self, plan_id):
         """Durably accepts a replan job and returns immediately — HTTP
         202, same as `create_plan()`. `replan()` (the synchronous,
-        planner-invoking equivalent) is never called from this path."""
-        self._require_planner_configured()
+        planner-invoking equivalent) is never called from this path.
+
+        H.4: a replan job gets its OWN, freshly and independently
+        selected route binding — never inherited from the predecessor
+        plan's own prior job. Route-selection failure (zero/multiple
+        eligible candidates, or the atomic in-transaction re-
+        verification refusing) happens BEFORE the predecessor plan is
+        ever marked `SUPERSEDED` (`EngineeringPlanningService.
+        replan_job()`'s own atomicity) — a failed replan attempt leaves
+        the original plan completely untouched."""
+        bindings = self._current_planning_bindings()
+        self._require_planner_configured(bindings)
         with self.planning() as service:
+            binding = self._select_planner_route(bindings, service)
             try:
-                job = service.replan_job(plan_id)
+                job = service.replan_job(
+                    plan_id, route_binding=binding,
+                    baseline_targets=bindings.baseline_certification_targets,
+                    role_targets=bindings.role_evaluation_targets,
+                )
             except KeyError:
                 raise APIError("not_found", "Plan not found.", 404) from None
             except ValueError as exc:
                 raise APIError("plan_superseded", str(exc), 409) from None
+            except PlannerRouteBindingRejectedError as exc:
+                raise APIError(
+                    exc.reason, "The selected Planner worker is no longer eligible.", 409,
+                ) from None
         self._planning_executor.notify()
         return self._job_json(job)
 

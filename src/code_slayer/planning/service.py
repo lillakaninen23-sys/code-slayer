@@ -78,10 +78,12 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
@@ -96,12 +98,14 @@ from code_slayer.planning.limits import (
 )
 from code_slayer.planning.models import (
     EngineeringPlanContent,
+    JobFailureCategory,
     JobState,
     OpenQuestion,
     PlanningJobRecord,
     PlanState,
 )
 from code_slayer.planning.planner import Planner, PlannerOutcome, PlannerRequest, PlannerResponse
+from code_slayer.planning.routing import PlannerRouteBinding, revalidate_route_binding
 from code_slayer.repo import identity
 from code_slayer.store import db as db_module
 from code_slayer.store import location
@@ -122,11 +126,43 @@ from code_slayer.workers.question_gate import (
     ResolutionKind,
 )
 
+if TYPE_CHECKING:
+    # Deferred: see `planning.routing`'s own identical `TYPE_CHECKING`
+    # block for why a top-level import of these two names here would be
+    # a genuine circular import (`config.bindings` -> `security`
+    # (package init) -> `certification_service` -> `planning.
+    # planner_certification` -> `planning` package init -> this module).
+    # Type-annotation-only; `from __future__ import annotations` already
+    # makes every annotation below a lazily-evaluated string.
+    from code_slayer.security.certification_service import (
+        BaselineCertificationTarget,
+        RoleEvaluationTarget,
+    )
+
 _HUMAN_RESOLUTION_SOURCES = frozenset({
     EvidenceSource.ORIGINAL_PROMPT, EvidenceSource.DURABLE_TASK_EVIDENCE,
 })
 
 _NO_NEW_WORK_STATES = frozenset({PlanState.READY.value, PlanState.SUPERSEDED.value})
+
+
+class PlannerRouteBindingRejectedError(Exception):
+    """H.4: raised by `EngineeringPlanningService.create_job()`/
+    `.replan_job()` when the proposed `planning.routing.
+    PlannerRouteBinding` fails its atomic, in-transaction recheck
+    (`_reverify_route_binding_in_transaction()`) — worker archived, no
+    longer configured, no longer eligible, or eligible under a
+    DIFFERENT authority than the one proposed. The whole transaction
+    rolls back: no plan, no job, and (for `replan_job()`) the
+    predecessor plan is never marked `SUPERSEDED`. `reason` is one of
+    `planning.routing.RevalidationResult.failure_reason`'s stable
+    values — `api.service.ApplicationService` maps this to an HTTP
+    error using that exact code, never raw exception text."""
+
+    def __init__(self, reason: str, worker_id: str) -> None:
+        self.reason = reason
+        self.worker_id = worker_id
+        super().__init__(f"route binding for worker {worker_id!r} rejected: {reason}")
 
 
 @dataclass(frozen=True)
@@ -196,6 +232,18 @@ class EngineeringPlanningService:
     def close(self) -> None:
         self._conn.close()
 
+    def production_conn(self) -> sqlite3.Connection:
+        """H.4: this service's own control-plane connection, exposed
+        narrowly for `planning.executor.PlanningJobExecutor`'s route
+        revalidation (`planning.routing.revalidate_route_binding()`)
+        and `api.service.ApplicationService`'s route selection
+        (`planning.routing.select_planner_route()`) — the same
+        connection `workers`/certificate tables already live on
+        (mirrors `security.certification_service.CertificationService.
+        production_conn()`'s own precedent/naming). Callers outside
+        this module never write through it directly."""
+        return self._conn
+
     @contextmanager
     def _intelligence(self):
         service = RepositoryIntelligenceService(
@@ -214,32 +262,47 @@ class EngineeringPlanningService:
 
     # -- public API -------------------------------------------------------
 
+    def _write_plan_row_in_transaction(self, original_request: str, run_id: str | None) -> str:
+        """Durably create a revision-1, `DRAFT` `engineering_plans` row
+        and its content-addressed original-request evidence. MUST be
+        called inside an already-open write transaction on `self._conn`
+        — never opens or commits one itself, so a caller can join it
+        into the same atomic commit as other work (H.4: the worker-
+        lifecycle/route-binding recheck and `planning_jobs` row
+        `create_job()` performs). Shared by `_create_plan_row()` (its
+        own, standalone transaction — the synchronous `create()` path)
+        and `create_job()`."""
+        if not isinstance(original_request, str) or not original_request.strip():
+            raise TypeError("original_request must be a non-empty str")
+        if not self._conn.in_transaction:
+            raise RuntimeError("_write_plan_row_in_transaction requires an open write transaction")
+        plan_id = uuid.uuid4().hex
+        now = utcnow_iso()
+        store = ContentStore(self._conn, self._blobs_dir)
+        request_blob = provenance.store_request(store, original_request)
+        PlanningRepo(self._conn).create_in_transaction(
+            plan_id=plan_id, created_at=now, schema_version=self.SCHEMA_VERSION,
+            repo_id=self._primary.repo_id, worktree_id=self._primary.worktree_id,
+            run_id=run_id, request_content_hash=request_blob.content_hash,
+            predecessor_plan_id=None, revision=1, state=PlanState.DRAFT.value,
+        )
+        self._audit(plan_id, EventType.PLAN_STARTED, {
+            "request_content_hash": request_blob.content_hash, "run_id": run_id,
+        })
+        return plan_id
+
     def _create_plan_row(self, original_request: str, run_id: str | None) -> str:
         """Durably create a revision-1, `DRAFT` `engineering_plans` row
         and its content-addressed original-request evidence — the part
         of `create()` that performs no model inference and is always
         safe to do synchronously, on the calling (HTTP request) thread.
-        Shared by the synchronous `create()` and the durable-job
-        `create_job()` (Phase 8.2d) so a job's `plan_id` is always real
-        and inspectable the instant a caller gets it back, even before
-        any planner turn has run."""
-        if not isinstance(original_request, str) or not original_request.strip():
-            raise TypeError("original_request must be a non-empty str")
-        plan_id = uuid.uuid4().hex
-        now = utcnow_iso()
-        store = ContentStore(self._conn, self._blobs_dir)
+        Used only by the synchronous `create()` path; `create_job()`
+        (Phase 8.2d / H.4) opens its own, wider transaction and calls
+        `_write_plan_row_in_transaction()` directly instead, so a
+        job's `plan_id` is always real and inspectable the instant a
+        caller gets it back, even before any planner turn has run."""
         with transaction(self._conn):
-            request_blob = provenance.store_request(store, original_request)
-            PlanningRepo(self._conn).create_in_transaction(
-                plan_id=plan_id, created_at=now, schema_version=self.SCHEMA_VERSION,
-                repo_id=self._primary.repo_id, worktree_id=self._primary.worktree_id,
-                run_id=run_id, request_content_hash=request_blob.content_hash,
-                predecessor_plan_id=None, revision=1, state=PlanState.DRAFT.value,
-            )
-            self._audit(plan_id, EventType.PLAN_STARTED, {
-                "request_content_hash": request_blob.content_hash, "run_id": run_id,
-            })
-        return plan_id
+            return self._write_plan_row_in_transaction(original_request, run_id)
 
     def create(
         self, *, original_request: str, planner: Planner, run_id: str | None = None,
@@ -283,12 +346,17 @@ class EngineeringPlanningService:
         self._audit(plan_id, EventType.PLAN_RESUMED, {"from_state": row.state})
         return self._evaluate_gate_and_finish(plan_id, original_request, content, resolutions)
 
-    def _prepare_replan(self, plan_id: str) -> tuple[str, str]:
+    def _write_replan_in_transaction(self, plan_id: str) -> tuple[str, str]:
         """Durably create the new revision's `DRAFT` row and mark
-        `plan_id` `SUPERSEDED` — the part of `replan()` that performs no
-        model inference. Returns `(new_plan_id, original_request)`.
-        Shared by the synchronous `replan()` and the durable-job
-        `replan_job()` (Phase 8.2d)."""
+        `plan_id` `SUPERSEDED`. MUST be called inside an already-open
+        write transaction on `self._conn` (H.4: so a caller can join a
+        worker-lifecycle/route-binding recheck into the same atomic
+        commit, BEFORE the predecessor is ever marked superseded — see
+        `replan_job()`). Returns `(new_plan_id, original_request)`.
+        Shared by `_prepare_replan()` (its own, standalone transaction
+        — the synchronous `replan()` path) and `replan_job()`."""
+        if not self._conn.in_transaction:
+            raise RuntimeError("_write_replan_in_transaction requires an open write transaction")
         old = PlanningRepo(self._conn).get(plan_id)
         if old.state == PlanState.SUPERSEDED.value:
             raise ValueError(f"plan {plan_id!r} is already superseded")
@@ -297,19 +365,28 @@ class EngineeringPlanningService:
         )
         new_plan_id = uuid.uuid4().hex
         now = utcnow_iso()
-        with transaction(self._conn):
-            PlanningRepo(self._conn).create_in_transaction(
-                plan_id=new_plan_id, created_at=now, schema_version=self.SCHEMA_VERSION,
-                repo_id=old.repo_id, worktree_id=old.worktree_id, run_id=old.run_id,
-                request_content_hash=old.request_content_hash, predecessor_plan_id=old.plan_id,
-                revision=old.revision + 1, state=PlanState.DRAFT.value,
-            )
-            PlanningRepo(self._conn).update_in_transaction(
-                old.plan_id, updated_at=now, state=PlanState.SUPERSEDED.value,
-                reason="superseded_by_replan",
-            )
-            self._audit(old.plan_id, EventType.PLAN_SUPERSEDED, {"successor_plan_id": new_plan_id})
+        PlanningRepo(self._conn).create_in_transaction(
+            plan_id=new_plan_id, created_at=now, schema_version=self.SCHEMA_VERSION,
+            repo_id=old.repo_id, worktree_id=old.worktree_id, run_id=old.run_id,
+            request_content_hash=old.request_content_hash, predecessor_plan_id=old.plan_id,
+            revision=old.revision + 1, state=PlanState.DRAFT.value,
+        )
+        PlanningRepo(self._conn).update_in_transaction(
+            old.plan_id, updated_at=now, state=PlanState.SUPERSEDED.value,
+            reason="superseded_by_replan",
+        )
+        self._audit(old.plan_id, EventType.PLAN_SUPERSEDED, {"successor_plan_id": new_plan_id})
         return new_plan_id, original_request
+
+    def _prepare_replan(self, plan_id: str) -> tuple[str, str]:
+        """Durably create the new revision's `DRAFT` row and mark
+        `plan_id` `SUPERSEDED` — the part of `replan()` that performs no
+        model inference. Used only by the synchronous `replan()` path;
+        `replan_job()` (Phase 8.2d / H.4) opens its own, wider
+        transaction and calls `_write_replan_in_transaction()`
+        directly instead."""
+        with transaction(self._conn):
+            return self._write_replan_in_transaction(plan_id)
 
     def replan(
         self, plan_id: str, *, planner: Planner, resolutions: tuple[ResolutionEvidence, ...] = (),
@@ -451,6 +528,7 @@ class EngineeringPlanningService:
     def _run_planning_attempt(
         self, plan_id: str, original_request: str, planner: Planner,
         resolutions: tuple[ResolutionEvidence, ...],
+        *, output_token_budget: int | None = None,
     ) -> PlanRecord:
         with self._intelligence() as intel:
             snapshot = intel.inspect()
@@ -464,9 +542,19 @@ class EngineeringPlanningService:
                 max_bytes=PLANNER_MAX_TOTAL_FILE_BYTES,
                 per_file_bytes=PLANNER_MAX_PER_FILE_BYTES,
             )
+        # `output_token_budget` (H.4): the certified completion-length
+        # cap this job's durable Planner route binding carries
+        # (`execute_claimed_job()` passes `job.output_token_budget`) —
+        # `None` (every synchronous `create()`/`replan()` caller, which
+        # never routes/certifies a worker at all) omits it entirely,
+        # exactly the prior behavior. Threaded unchanged into
+        # `WorkerRequest.max_output_tokens` by `planning.worker_planner.
+        # WorkerAdapterPlanner.plan()` — see `PlannerRequest`'s own
+        # docstring; this call site is the only thing H.4 needed to add.
         request = PlannerRequest(
             original_request=original_request, repo_context=snapshot.projects,
             discovered_commands=snapshot.commands, context_pack=context_pack,
+            output_token_budget=output_token_budget,
         )
         store = ContentStore(self._conn, self._blobs_dir)
         planner_input_blob = provenance.store_planner_input(store, request)
@@ -607,38 +695,136 @@ class EngineeringPlanningService:
             attempt=row.attempt, created_at=row.created_at, updated_at=row.updated_at,
             started_at=row.started_at, finished_at=row.finished_at,
             failure_category=row.failure_category, failure_reason=row.failure_reason,
+            worker_id=row.worker_id,
+            runtime_identity_fingerprint=row.runtime_identity_fingerprint,
+            role_evaluation_fingerprint=row.role_evaluation_fingerprint,
+            security_certificate_id=row.security_certificate_id,
+            role_certificate_id=row.role_certificate_id,
+            output_token_budget=row.output_token_budget,
+            tool_choice_enforcement=row.tool_choice_enforcement,
+            planner_policy_version=row.planner_policy_version,
         )
 
-    def _create_job_row(self, *, plan_id: str, kind: str) -> PlanningJobRecord:
+    def _reverify_route_binding_in_transaction(
+        self, route_binding: PlannerRouteBinding,
+        baseline_targets: tuple[BaselineCertificationTarget, ...],
+        role_targets: tuple[RoleEvaluationTarget, ...],
+    ) -> None:
+        """H.4 review finding (create/replan acceptance atomicity):
+        re-verify `route_binding` field-for-field against current
+        lifecycle + canonical eligibility, INSIDE the SAME open write
+        transaction that is about to durably create a plan/job bound to
+        it — never merely `worker.lifecycle_state == ACTIVE` alone.
+        `verify_live_runtime=False`: no Ollama network probe is ever
+        made while this transaction holds `self._conn`'s write lock
+        (see `planning.routing.revalidate_route_binding()`'s own
+        docstring). Raises `PlannerRouteBindingRejectedError` (caller's
+        transaction rolls back, nothing written) on any mismatch,
+        archived worker, no-longer-configured worker, or no-longer-
+        eligible worker. This does not, and cannot, make the ORIGINAL
+        config-file read atomic with this transaction — only genuinely
+        DB-backed facts (worker lifecycle, certificates) are re-checked
+        here; `baseline_targets`/`role_targets` must already be a
+        config snapshot the caller resolved fresh, immediately before
+        calling `create_job()`/`replan_job()`."""
+        if not self._conn.in_transaction:
+            raise RuntimeError(
+                "_reverify_route_binding_in_transaction requires an open write transaction"
+            )
+        result = revalidate_route_binding(
+            self._conn, route_binding,
+            baseline_targets=baseline_targets, role_targets=role_targets,
+            verify_live_runtime=False,
+        )
+        if not result.ok:
+            raise PlannerRouteBindingRejectedError(result.failure_reason, route_binding.worker_id)
+
+    def _create_job_row_in_transaction(
+        self, *, plan_id: str, kind: str, route_binding: PlannerRouteBinding,
+    ) -> PlanningJobRecord:
+        """MUST be called inside an already-open write transaction on
+        `self._conn`."""
+        if not self._conn.in_transaction:
+            raise RuntimeError("_create_job_row_in_transaction requires an open write transaction")
         job_id = uuid.uuid4().hex
         now = utcnow_iso()
-        with transaction(self._conn):
-            row = PlanningJobsRepo(self._conn).create_in_transaction(
-                job_id=job_id, plan_id=plan_id, repo_id=self._primary.repo_id,
-                worktree_id=self._primary.worktree_id, created_at=now, kind=kind,
-            )
-            self._job_audit(job_id, EventType.PLANNING_JOB_ACCEPTED, {
-                "plan_id": plan_id, "kind": kind,
-            })
+        row = PlanningJobsRepo(self._conn).create_in_transaction(
+            job_id=job_id, plan_id=plan_id, repo_id=self._primary.repo_id,
+            worktree_id=self._primary.worktree_id, created_at=now, kind=kind,
+            worker_id=route_binding.worker_id,
+            runtime_identity_fingerprint=route_binding.runtime_identity_fingerprint,
+            role_evaluation_fingerprint=route_binding.role_evaluation_fingerprint,
+            security_certificate_id=route_binding.security_certificate_id,
+            role_certificate_id=route_binding.role_certificate_id,
+            output_token_budget=route_binding.output_token_budget,
+            tool_choice_enforcement=route_binding.tool_choice_enforcement,
+            planner_policy_version=route_binding.planner_policy_version,
+        )
+        self._job_audit(job_id, EventType.PLANNING_JOB_ACCEPTED, {
+            "plan_id": plan_id, "kind": kind, "worker_id": route_binding.worker_id,
+            "runtime_identity_fingerprint": route_binding.runtime_identity_fingerprint,
+            "role_evaluation_fingerprint": route_binding.role_evaluation_fingerprint,
+            "security_certificate_id": route_binding.security_certificate_id,
+            "role_certificate_id": route_binding.role_certificate_id,
+        })
         return self._job_to_record(row)
 
-    def create_job(self, *, original_request: str, run_id: str | None = None) -> PlanningJobRecord:
+    def create_job(
+        self, *, original_request: str, route_binding: PlannerRouteBinding,
+        baseline_targets: tuple[BaselineCertificationTarget, ...] = (),
+        role_targets: tuple[RoleEvaluationTarget, ...] = (),
+        run_id: str | None = None,
+    ) -> PlanningJobRecord:
         """Durably accept a new planning request without ever invoking a
         planner on this call's own thread — `plan_id` is real and
         inspectable (still `DRAFT`) the instant this returns. A
         `planning.executor.PlanningJobExecutor` claims and executes the
         returned job later, in the background — this is the HTTP-facing
-        equivalent of `create()`, minus the blocking inference."""
-        plan_id = self._create_plan_row(original_request, run_id)
-        return self._create_job_row(plan_id=plan_id, kind="create")
+        equivalent of `create()`, minus the blocking inference.
 
-    def replan_job(self, plan_id: str) -> PlanningJobRecord:
+        `route_binding` (H.4) is the ALREADY-SELECTED Planner routing
+        authority (`planning.routing.select_planner_route()`) for this
+        new job — this method selects no route itself. Inside ONE
+        `BEGIN IMMEDIATE` transaction: re-verify `route_binding` is
+        still exactly current (`baseline_targets`/`role_targets` — the
+        SAME config snapshot the caller used for selection), THEN
+        create the plan row, THEN create the job row with the complete,
+        immutable binding. If re-verification fails
+        (`PlannerRouteBindingRejectedError`), NOTHING is created —
+        not the plan, not the job."""
+        with transaction(self._conn):
+            self._reverify_route_binding_in_transaction(
+                route_binding, baseline_targets, role_targets,
+            )
+            plan_id = self._write_plan_row_in_transaction(original_request, run_id)
+            return self._create_job_row_in_transaction(
+                plan_id=plan_id, kind="create", route_binding=route_binding,
+            )
+
+    def replan_job(
+        self, plan_id: str, *, route_binding: PlannerRouteBinding,
+        baseline_targets: tuple[BaselineCertificationTarget, ...] = (),
+        role_targets: tuple[RoleEvaluationTarget, ...] = (),
+    ) -> PlanningJobRecord:
         """The durable-job equivalent of `replan()` — creates the new
-        revision and marks the predecessor `SUPERSEDED` synchronously
-        (no inference), then returns a `QUEUED` job for the background
-        executor to claim."""
-        new_plan_id, _original_request = self._prepare_replan(plan_id)
-        return self._create_job_row(plan_id=new_plan_id, kind="replan")
+        revision and marks the predecessor `SUPERSEDED`, then returns a
+        `QUEUED` job for the background executor to claim; no inference
+        on this call's own thread.
+
+        `route_binding` is a FRESH, independently selected binding for
+        the new job — never inherited from the predecessor. Inside ONE
+        transaction: re-verify `route_binding` (see `create_job()`'s
+        own docstring) BEFORE the predecessor is ever marked
+        `SUPERSEDED` — a route-binding rejection leaves the predecessor
+        plan completely untouched, no successor plan, no job."""
+        with transaction(self._conn):
+            self._reverify_route_binding_in_transaction(
+                route_binding, baseline_targets, role_targets,
+            )
+            new_plan_id, _original_request = self._write_replan_in_transaction(plan_id)
+            return self._create_job_row_in_transaction(
+                plan_id=new_plan_id, kind="replan", route_binding=route_binding,
+            )
 
     def get_job(self, job_id: str) -> PlanningJobRecord:
         return self._job_to_record(PlanningJobsRepo(self._conn).get(job_id))
@@ -713,29 +899,55 @@ class EngineeringPlanningService:
     def execute_claimed_job(self, job, planner: Planner) -> PlanningJobRecord:
         """Run the one planner turn `job` (already claimed by this
         process — `claim_job()`) represents, and durably finalize it.
-        Never called with an unclaimed job; `planning.executor.
-        PlanningJobExecutor` is the only intended caller. Any exception
-        escaping the planner turn itself is caught and recorded as a
-        `FAILED` job with an `internal_error` category — never left
-        `RUNNING` forever inside the very process that would otherwise
-        be the only one able to prove it dead."""
+        Never called with an unclaimed job, and never called at all
+        unless the caller (`planning.executor.PlanningJobExecutor`) has
+        ALREADY revalidated `job`'s own durable route binding
+        (`planning.routing.revalidate_route_binding()`) and already
+        constructed `planner` for the EXACT worker that binding names —
+        this method itself performs no routing/eligibility decision; it
+        only uses `job.output_token_budget` (H.4), already durably
+        bound at job creation, to build this turn's `PlannerRequest`.
+        Any exception escaping the planner turn itself is caught and
+        recorded as a `FAILED` job with `JobFailureCategory.
+        INTERNAL_ERROR` — never left `RUNNING` forever inside the very
+        process that would otherwise be the only one able to prove it
+        dead."""
         try:
             plan_row = PlanningRepo(self._conn).get(job.plan_id)
             original_request = provenance.read_request(
                 self._conn, self._blobs_dir, plan_row.request_content_hash,
             )
-            record = self._run_planning_attempt(job.plan_id, original_request, planner, ())
+            record = self._run_planning_attempt(
+                job.plan_id, original_request, planner, (),
+                output_token_budget=job.output_token_budget,
+            )
         except Exception as exc:  # noqa: BLE001 -- must always reach a terminal job state
             return self._finish_job(
-                job, JobState.FAILED, failure_category="internal_error",
+                job, JobState.FAILED, failure_category=JobFailureCategory.INTERNAL_ERROR.value,
                 failure_reason=f"internal_error:{type(exc).__name__}",
             )
         if record.reason and record.reason.startswith("malformed_planner_output:"):
-            category = record.reason.rsplit(":", 1)[-1]
             return self._finish_job(
-                job, JobState.FAILED, failure_category=category, failure_reason=record.reason,
+                job, JobState.FAILED, failure_category=JobFailureCategory.PLANNER.value,
+                failure_reason=record.reason,
             )
         return self._finish_job(job, JobState.SUCCEEDED, failure_category=None, failure_reason=None)
+
+    def fail_claimed_job(
+        self, job, *, failure_category: str, failure_reason: str,
+    ) -> PlanningJobRecord:
+        """Durably terminalize `job` (already claimed by this process)
+        as `FAILED` WITHOUT ever running a planning attempt — H.4:
+        `planning.executor.PlanningJobExecutor`'s own call when
+        execution-time route revalidation (`planning.routing.
+        revalidate_route_binding()`) refuses a claimed job before any
+        Planner factory/model call. Mirrors `execute_claimed_job()`'s
+        own terminal-failure shape exactly (`_finish_job()`), just
+        without ever attempting `_run_planning_attempt()` — no
+        Repository Intelligence read, no `PlannerRequest`, nothing."""
+        return self._finish_job(
+            job, JobState.FAILED, failure_category=failure_category, failure_reason=failure_reason,
+        )
 
     def _finish_job(
         self, job, state: JobState, *, failure_category: str | None, failure_reason: str | None,

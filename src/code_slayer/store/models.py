@@ -305,7 +305,19 @@ class PlanningJobRow:
     `EngineeringPlanRow` it points at via `plan_id` — see
     `store.migrations.0009_planning_jobs`'s module comment. Identity
     fields locked at creation; ownership/outcome fields evolve as the
-    job progresses."""
+    job progresses.
+
+    `worker_id` through `planner_policy_version` (schema v19, H.4) are
+    the durable Planner route binding this job was created with — see
+    `store.migrations.0019_planner_worker_routing`'s own module
+    comment. All eight are `None` only for a job created before schema
+    v19 (never rewritten to claim a binding it never had); every job
+    created at or after v19 has all eight populated, enforced both by
+    `store.planning_jobs_repo.PlanningJobsRepo.create_in_transaction()`
+    requiring them as mandatory parameters and by that migration's own
+    `planning_jobs_require_route_binding_on_insert` trigger. Locked at
+    creation exactly like every other identity field above — see that
+    migration's `planning_jobs_no_mutate_identity` trigger."""
 
     job_id: str
     plan_id: str
@@ -324,6 +336,14 @@ class PlanningJobRow:
     failure_category: str | None
     failure_reason: str | None
     predecessor_job_id: str | None
+    worker_id: str | None = None
+    runtime_identity_fingerprint: str | None = None
+    role_evaluation_fingerprint: str | None = None
+    security_certificate_id: str | None = None
+    role_certificate_id: str | None = None
+    output_token_budget: int | None = None
+    tool_choice_enforcement: str | None = None
+    planner_policy_version: str | None = None
 
 
 @dataclass(frozen=True)

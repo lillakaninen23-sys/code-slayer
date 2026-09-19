@@ -30,10 +30,11 @@ This module does NOT own, and never touches:
 `archive_worker()`/`reactivate_worker()` open exactly ONE `BEGIN
 IMMEDIATE` transaction against the PRODUCTION control-plane connection
 they are given, and inside it: reload the worker row, check for
-active *ordinary runner* work (`runner_runs`, same DB), write the
-lifecycle column, and append the `WORKER_ARCHIVED`/`WORKER_REACTIVATED`
-audit event — genuinely atomic; either the whole thing commits or none
-of it does.
+active *ordinary runner* work (`runner_runs`, same DB) AND active
+*worker-bound planning job* work (`planning_jobs`, H.4, same DB — see
+`_worker_has_active_planning_work()`), write the lifecycle column, and
+append the `WORKER_ARCHIVED`/`WORKER_REACTIVATED` audit event —
+genuinely atomic; either the whole thing commits or none of it does.
 
 **Certification Center's active-run check is deliberately NOT part of
 this transaction.** `certification_runs` lives in a separate SQLite
@@ -119,6 +120,7 @@ from code_slayer.audit.events import EventType
 from code_slayer.audit.writer import AuditWriter
 from code_slayer.store.db import transaction
 from code_slayer.store.models import Worker
+from code_slayer.store.planning_jobs_repo import PlanningJobsRepo
 from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 
@@ -130,6 +132,16 @@ from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 # certification_runs_repo.ACTIVE_STATES`/`CLAIMABLE_STATES` already use
 # for `certification_runs.state` string literals.
 _BLOCKING_NON_TERMINAL_RUNNER_STATUSES = frozenset({"ANALYZING", "READY", "RUNNING"})
+
+# H.4: `planning_jobs.state` -- QUEUED/RUNNING are genuinely pending or
+# in-flight worker-bound Planner work; SUCCEEDED/FAILED are terminal and
+# never block (`store.migrations.0009_planning_jobs`'s own
+# `planning_jobs_no_reopen_terminal` trigger already makes a terminal
+# job unreopenable). A legacy, pre-H.4 row (`worker_id IS NULL`) can
+# never match a real `worker_id` in the `WHERE worker_id = ?` query
+# below -- SQL `NULL` never equals a non-NULL value -- so it blocks
+# archiving no specific worker, exactly as intended.
+_BLOCKING_PLANNING_JOB_STATUSES = frozenset({"QUEUED", "RUNNING"})
 
 _ACTOR_ID = "workers.lifecycle"
 
@@ -162,6 +174,22 @@ def _worker_has_active_runner_work(conn: sqlite3.Connection, worker_id: str) -> 
     )
 
 
+def _worker_has_active_planning_work(conn: sqlite3.Connection, worker_id: str) -> bool:
+    """H.4: `True` if any `planning_jobs` row durably bound to
+    `worker_id` is currently `QUEUED`/`RUNNING`. `planning_jobs` lives
+    in this SAME production database (unlike Certification Center's
+    `certification_runs`, a genuinely separate SQLite file — see the
+    module docstring's "Certification Center's active-run check is
+    deliberately NOT part of this transaction"), so this check is
+    joined into the SAME atomic transaction as the ordinary-runner
+    check and the lifecycle write itself — no distributed-transaction
+    problem here, and none of that section's non-atomic-precondition
+    caveat applies to this check."""
+    return PlanningJobsRepo(conn).has_status_for_worker_in_transaction(
+        worker_id, statuses=_BLOCKING_PLANNING_JOB_STATUSES,
+    )
+
+
 def archive_worker(conn: sqlite3.Connection, *, worker_id: str) -> LifecycleTransitionResult:
     """The ONE authorized way to transition a worker `ACTIVE ->
     ARCHIVED`. Opens its own transaction against `conn` (a PRODUCTION
@@ -176,7 +204,9 @@ def archive_worker(conn: sqlite3.Connection, *, worker_id: str) -> LifecycleTran
         if current is None:
             return LifecycleTransitionResult(False, "unknown_worker", None, False)
         if current.lifecycle_state == WorkerLifecycleState.ACTIVE:
-            if _worker_has_active_runner_work(conn, worker_id):
+            if _worker_has_active_runner_work(conn, worker_id) or _worker_has_active_planning_work(
+                conn, worker_id,
+            ):
                 return LifecycleTransitionResult(
                     False, "worker_has_active_work", current, False,
                 )

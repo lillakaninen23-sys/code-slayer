@@ -92,13 +92,56 @@ class JobState(StrEnum):
     FAILED = "FAILED"
 
 
+class JobFailureCategory(StrEnum):
+    """The coarse, code-owned, top-level reason a `JobState.FAILED` job
+    never reached `SUCCEEDED` (H.4 review finding) — distinct from
+    `planning.planner.PlannerFailureCategory`, which classifies WHY a
+    Planner *transport turn itself* failed, and is folded into THIS
+    category's own `PLANNER` value (the fine-grained code moves into
+    `failure_reason`, never lost — see `planning.service.
+    EngineeringPlanningService.execute_claimed_job()`). A routing
+    failure (H.4: `planning.routing.RevalidationOutcome`) is
+    structurally never a Planner transport/protocol/schema failure — it
+    means a Planner was never even constructed, let alone called — so
+    it must never be reported under `PlannerFailureCategory`'s own
+    vocabulary, which HTTP/WebUI consumers already read as "a model
+    turn happened and failed."
+
+    `ROUTING` — the durable Planner route binding could not be
+    (re)verified before a Planner was ever constructed/called; no
+    model or network contact of any kind happened. `failure_reason` is
+    one of `planning.routing.RevalidationOutcome`'s stable values
+    (optionally suffixed with a further stable detail code — see
+    `planning.routing.RevalidationResult.failure_reason`).
+    `PLANNER` — a real Planner turn was attempted and did not produce
+    valid structured output. `failure_reason` is
+    `f"malformed_planner_output:{category}"`, where `category` is
+    `planning.planner.PlannerFailureCategory`'s own lowercased value —
+    unchanged from this codebase's existing `failure_reason` format,
+    only `failure_category` itself is now this coarser bucket.
+    `INTERNAL_ERROR` — an unexpected exception interrupted execution
+    outside of the above two cases.
+    """
+
+    ROUTING = "routing"
+    PLANNER = "planner"
+    INTERNAL_ERROR = "internal_error"
+
+
 @dataclass(frozen=True)
 class PlanningJobRecord:
     """A structured, HTTP/WebUI-safe view of one planning job — never
     internal SQLite/connection details, and never raw planner output
     (`failure_category`/`failure_reason` are the same small, coarse,
     code-owned codes `EngineeringPlanContent`/`PlanRecord` already use;
-    full detail stays durable-internal-only via `planning.provenance`)."""
+    full detail stays durable-internal-only via `planning.provenance`).
+
+    `worker_id` through `planner_policy_version` (H.4) are the exact
+    durable Planner route-binding provenance this job was created
+    with — bounded, non-secret identifiers safe to expose over HTTP/
+    WebUI (never an API key or raw runtime credential); `None` only for
+    a job created before schema v19 (see `planning.routing`'s own
+    module docstring)."""
 
     job_id: str
     plan_id: str
@@ -111,6 +154,14 @@ class PlanningJobRecord:
     finished_at: str | None
     failure_category: str | None
     failure_reason: str | None
+    worker_id: str | None = None
+    runtime_identity_fingerprint: str | None = None
+    role_evaluation_fingerprint: str | None = None
+    security_certificate_id: str | None = None
+    role_certificate_id: str | None = None
+    output_token_budget: int | None = None
+    tool_choice_enforcement: str | None = None
+    planner_policy_version: str | None = None
 
 
 class AffectedFileAction(StrEnum):

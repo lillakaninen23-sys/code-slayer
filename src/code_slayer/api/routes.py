@@ -100,7 +100,13 @@ def health():
             "actions": {
                 "start": service().bindings.analyst_factory is not None,
                 "execution_configured": service().bindings.adapter_factory is not None,
-                "planning_configured": service().bindings.planner_factory is not None,
+                # H.4: reflects whether the NEW worker-bound Planner
+                # construction path is configured, never the legacy
+                # zero-argument `planner_factory` -- a historical worker
+                # existing in the DB never makes this True by itself
+                # (configuration and eligibility are separate; see
+                # `planning.routing`'s own module docstring).
+                "planning_configured": service().bindings.planner_factory_for_worker is not None,
             },
             "configuration_status": "ready"
             if service().bindings.analyst_factory
