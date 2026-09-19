@@ -704,6 +704,139 @@ def test_executor_never_reuses_one_sqlite_connection_across_threads(
         check.close()
 
 
+# -- H.4 review finding: a claimed job is never left stranded RUNNING ------
+#
+# Before this fix, an exception raised AFTER `claim_job()` but BEFORE
+# `execute_claimed_job()` (in routing-input resolution, revalidation, or
+# Planner construction) was only caught by `_run_one()`'s own OUTER
+# `try`/`except` (logging only) -- leaving `planning_jobs.state=RUNNING`
+# under this process's own live `owner_pid` forever, un-reclaimable by
+# `claimable_job_ids()`'s own liveness check short of an actual process
+# restart.
+
+
+def test_bindings_factory_exception_after_claim_terminalizes_not_stranded_running(
+    git_repo_with_commit, state_root, ollama_server,
+):
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        route = _seed_route(svc.production_conn(), root=ollama_server)
+        job = _create_job(svc, route)
+    finally:
+        svc.close()
+
+    def _raising_bindings_factory():
+        raise RuntimeError("bindings load boom -- must never reach failure_reason")
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, bindings_factory=_raising_bindings_factory,
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    try:
+        executor.start()
+        _wait_for_jobs_terminal(git_repo_with_commit, state_root, [job.job_id])
+    finally:
+        executor.stop()
+
+    check = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        final = check.get_job(job.job_id)
+        assert final.state == "FAILED"  # never left RUNNING
+        assert final.failure_category == "internal_error"
+        assert final.failure_reason == "internal_error:RuntimeError"
+        assert "boom" not in final.failure_reason  # raw exception text never leaks
+    finally:
+        check.close()
+
+
+def test_planner_factory_exception_after_revalidation_terminalizes_not_stranded_running(
+    git_repo_with_commit, state_root, ollama_server,
+):
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        route = _seed_route(svc.production_conn(), root=ollama_server)
+        job = _create_job(svc, route)
+    finally:
+        svc.close()
+
+    binding, baseline_targets, role_targets = route
+
+    def _raising_factory(worker_id, job_id):
+        raise RuntimeError("factory boom -- must never reach failure_reason")
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, planner_factory_for_worker=_raising_factory,
+        baseline_targets=baseline_targets, role_targets=role_targets,
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    try:
+        executor.start()
+        _wait_for_jobs_terminal(git_repo_with_commit, state_root, [job.job_id])
+    finally:
+        executor.stop()
+
+    check = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        final = check.get_job(job.job_id)
+        assert final.state == "FAILED"  # never left RUNNING
+        assert final.failure_category == "internal_error"
+        assert final.failure_reason == "internal_error:RuntimeError"
+        assert "boom" not in final.failure_reason
+    finally:
+        check.close()
+
+
+def test_one_internal_error_during_preparation_does_not_kill_the_dispatcher(
+    git_repo_with_commit, state_root, ollama_server,
+):
+    """A subsequent, independently-queued job must still be claimed and
+    executed by the SAME live dispatcher after an earlier job's
+    preparation exception -- the exception must never have killed the
+    poll loop or the thread pool."""
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        route = _seed_route(svc.production_conn(), root=ollama_server)
+        job1 = _create_job(svc, route, request=REQUEST + " one")
+    finally:
+        svc.close()
+
+    binding, baseline_targets, role_targets = route
+    calls = {"n": 0}
+
+    def _flaky_factory(worker_id, job_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom-once")
+        return FakePlanner([structured_response()])
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, planner_factory_for_worker=_flaky_factory,
+        baseline_targets=baseline_targets, role_targets=role_targets,
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    try:
+        executor.start()
+        _wait_for_jobs_terminal(git_repo_with_commit, state_root, [job1.job_id])
+
+        svc2 = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+        try:
+            job2 = _create_job(svc2, route, request=REQUEST + " two")
+        finally:
+            svc2.close()
+        executor.notify()
+        _wait_for_jobs_terminal(git_repo_with_commit, state_root, [job2.job_id])
+    finally:
+        executor.stop()
+
+    check = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        assert check.get_job(job1.job_id).state == "FAILED"
+        assert check.get_job(job1.job_id).failure_category == "internal_error"
+        assert check.get_job(job2.job_id).state == "SUCCEEDED"
+    finally:
+        check.close()
+
+
 def test_jobs_perform_no_repository_mutation_or_command_execution(
     service, route, git_repo_with_commit,
 ):

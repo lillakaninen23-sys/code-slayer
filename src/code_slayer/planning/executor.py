@@ -79,12 +79,36 @@ each claimed job it instead:
    fresh snapshot, `verify_live_runtime=True` (this module always runs
    from a background thread, never an HTTP request thread — the one
    place in this codebase a live Ollama probe belongs during job
-   execution). Any refusal (`ok=False`) durably fails the job via
-   `EngineeringPlanningService.fail_claimed_job()`, `failure_category=
-   "routing"` — no Planner factory call, no model call, ever.
-4. Only once revalidation passes does it call `planner_factory_for_
-   worker(job.worker_id, job.job_id)` and hand the result to
-   `execute_claimed_job()`.
+   execution). A live probe takes real wall-clock time, during which
+   production certificate authority can change — a SECOND, DB-only
+   pass (`verify_live_runtime=False`, no network) runs immediately
+   afterwards, right before a Planner is ever constructed
+   (`_revalidate_before_construction()`), closing exactly the gap the
+   first pass's own probe duration opened. Any refusal (`ok=False`,
+   from either pass) durably fails the job via `EngineeringPlanningService.
+   fail_claimed_job()`, `failure_category="routing"` — no Planner
+   factory call, no model call, ever.
+4. Only once BOTH revalidation passes succeed does it call
+   `planner_factory_for_worker(job.worker_id, job.job_id)` and hand the
+   result to `execute_claimed_job()`.
+
+### A claimed job is never left stranded RUNNING
+
+Every step above (routing-input resolution, both revalidation passes,
+Planner construction) runs inside `_prepare_planner()`, called from a
+`try`/`except` in `_run_one()` that is separate from — and INSIDE —
+the claim itself: an unexpected exception anywhere in that preparation
+is caught and durably terminalizes the job as `FAILED`/
+`internal_error` (`_run_one()`'s own inner `try`), exactly mirroring
+`EngineeringPlanningService.execute_claimed_job()`'s own handling of an
+exception during the turn itself, and using the exact same "type name
+only, never the raw exception text" convention. Before this existed, an
+exception raised after a successful `claim_job()` but before
+`execute_claimed_job()` was only caught by this method's OUTER
+`try`/`except` (logging only) — leaving `planning_jobs.state=RUNNING`
+under this process's own live `owner_pid` forever, un-reclaimable by
+`claimable_job_ids()`'s own liveness check until an actual process
+restart.
 
 ### Never a stale config/binding snapshot
 
@@ -226,6 +250,63 @@ class PlanningJobExecutor:
                 self._in_flight.add(job_id)
             self._pool.submit(self._run_one, job_id)
 
+    def _revalidate_before_construction(self, service, claimed, baseline_targets, role_targets):
+        """H.4 review finding: a live-runtime probe takes real wall-clock
+        time, during which production certificate authority can change
+        -- a claimed job's own `RUNNING` state blocks archive, but
+        nothing freezes certificate RECORDING against it. The first
+        pass below (`verify_live_runtime=True`) does the DB-only
+        eligibility recheck AND the live probe together; if that
+        passes, a SECOND, DB-only pass (`verify_live_runtime=False`,
+        no network, cheap) runs immediately afterwards, right before
+        this function returns -- closing exactly the gap the probe's
+        own duration opened. Never holds a SQLite write lock across
+        the network probe (`planning.routing.revalidate_route_binding()`'s
+        own docstring already establishes this discipline; this
+        function only adds the SECOND, post-probe check on top)."""
+        binding = route_binding_from_job(claimed)
+        revalidation = revalidate_route_binding(
+            service.production_conn(), binding,
+            baseline_targets=baseline_targets, role_targets=role_targets,
+            verify_live_runtime=True,
+        )
+        if revalidation.ok:
+            revalidation = revalidate_route_binding(
+                service.production_conn(), binding,
+                baseline_targets=baseline_targets, role_targets=role_targets,
+                verify_live_runtime=False,
+            )
+        return revalidation
+
+    def _prepare_planner(self, service, claimed):
+        """Everything between a successful claim and the actual
+        `execute_claimed_job()` call: resolve fresh routing inputs,
+        revalidate the route binding (twice -- see
+        `_revalidate_before_construction()`), and construct the
+        worker-bound Planner. Returns `(planner, None)` on success, or
+        `(None, (failure_category, failure_reason))` on any expected
+        refusal -- never raises for those. An UNEXPECTED exception
+        here (a bug, a transient config-load failure, ...) is the
+        caller's (`_run_one()`'s) responsibility to catch and
+        terminalize; this method itself does not swallow it, so a
+        claimed job is never left stranded `RUNNING` under this
+        process's own live ownership (H.4 review finding)."""
+        baseline_targets, role_targets, planner_factory_for_worker = self._routing_inputs()
+        revalidation = self._revalidate_before_construction(
+            service, claimed, baseline_targets, role_targets,
+        )
+        if not revalidation.ok:
+            return None, (JobFailureCategory.ROUTING.value, revalidation.failure_reason)
+        if planner_factory_for_worker is None:
+            # Revalidation passed against current config/eligibility,
+            # but this process has no worker-bound Planner factory
+            # configured at all (e.g. `load_persistent_config=False`
+            # dev/test wiring with no `planner_factory_for_worker`
+            # supplied) -- fail closed rather than guess.
+            return None, (JobFailureCategory.ROUTING.value, "planner_worker_not_configured")
+        planner: Planner = planner_factory_for_worker(claimed.worker_id, claimed.job_id)
+        return planner, None
+
     def _run_one(self, job_id: str) -> None:
         try:
             service = EngineeringPlanningService(
@@ -235,33 +316,39 @@ class PlanningJobExecutor:
                 claimed = service.claim_job(job_id)
                 if claimed is None:
                     return  # lost the race, already terminal, or owner still alive
-                baseline_targets, role_targets, planner_factory_for_worker = (
-                    self._routing_inputs()
-                )
-                binding = route_binding_from_job(claimed)
-                revalidation = revalidate_route_binding(
-                    service.production_conn(), binding,
-                    baseline_targets=baseline_targets, role_targets=role_targets,
-                    verify_live_runtime=True,
-                )
-                if not revalidation.ok:
+                # H.4 review finding: EVERYTHING from here to the actual
+                # `execute_claimed_job()` call must never leave `claimed`
+                # stranded `RUNNING` under this process's own live
+                # ownership -- an exception in routing/config resolution
+                # or Planner construction is caught HERE and converted
+                # into a durable terminal failure, exactly like
+                # `execute_claimed_job()` already does for an exception
+                # during the turn itself. Never the raw exception text --
+                # only its stable type name, matching `execute_claimed_
+                # job()`'s own `internal_error` convention.
+                try:
+                    planner, refusal = self._prepare_planner(service, claimed)
+                except Exception as exc:  # noqa: BLE001 -- must always reach a terminal job state
+                    logger.exception(
+                        "planning job dispatcher: post-claim preparation of %s failed", job_id,
+                    )
+                    try:
+                        service.fail_claimed_job(
+                            claimed, failure_category=JobFailureCategory.INTERNAL_ERROR.value,
+                            failure_reason=f"internal_error:{type(exc).__name__}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "planning job dispatcher: fail-closed finish of %s also failed",
+                            job_id,
+                        )
+                    return
+                if refusal is not None:
+                    failure_category, failure_reason = refusal
                     service.fail_claimed_job(
-                        claimed, failure_category=JobFailureCategory.ROUTING.value,
-                        failure_reason=revalidation.failure_reason,
+                        claimed, failure_category=failure_category, failure_reason=failure_reason,
                     )
                     return
-                if planner_factory_for_worker is None:
-                    # Revalidation passed against current config/eligibility,
-                    # but this process has no worker-bound Planner factory
-                    # configured at all (e.g. `load_persistent_config=False`
-                    # dev/test wiring with no `planner_factory_for_worker`
-                    # supplied) -- fail closed rather than guess.
-                    service.fail_claimed_job(
-                        claimed, failure_category=JobFailureCategory.ROUTING.value,
-                        failure_reason="planner_worker_not_configured",
-                    )
-                    return
-                planner: Planner = planner_factory_for_worker(claimed.worker_id, claimed.job_id)
                 service.execute_claimed_job(claimed, planner)
             finally:
                 service.close()

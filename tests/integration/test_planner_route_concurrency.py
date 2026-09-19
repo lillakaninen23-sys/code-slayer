@@ -14,10 +14,13 @@ invariant under test needs one.
 
 from __future__ import annotations
 
+import http.server
+import json
 import threading
 
 import pytest
 
+import code_slayer.planning.routing as routing_module
 from code_slayer.planning.executor import PlanningJobExecutor
 from code_slayer.planning.fake_planner import FakePlanner
 from code_slayer.planning.models import JobFailureCategory
@@ -66,20 +69,20 @@ def structured_response(**overrides) -> PlannerResponse:
     return PlannerResponse(PlannerOutcome.STRUCTURED, output=output, raw="{}")
 
 
-def _profile(worker_id: str):
+def _profile(worker_id: str, *, root: str = OLLAMA_ROOT):
     return runtime_profile_identity_from_config(
-        model_tag=f"{worker_id}-model", model_digest="sha256:abc", endpoint=f"{OLLAMA_ROOT}/v1",
+        model_tag=f"{worker_id}-model", model_digest="sha256:abc", endpoint=f"{root}/v1",
         runtime_version="0.16.1", effective_context_tokens=16384, temperature=0.0,
         normalizer_id=None, normalizer_version=None,
     )
 
 
-def _target(worker_id: str) -> BaselineCertificationTarget:
-    profile = _profile(worker_id)
+def _target(worker_id: str, *, root: str = OLLAMA_ROOT) -> BaselineCertificationTarget:
+    profile = _profile(worker_id, root=root)
     return BaselineCertificationTarget(
         worker_id=worker_id,
         expectation=LiveOllamaRuntimeExpectation(
-            ollama_root=OLLAMA_ROOT, model_tag=f"{worker_id}-model", model_digest="sha256:abc",
+            ollama_root=root, model_tag=f"{worker_id}-model", model_digest="sha256:abc",
             runtime_version="0.16.1", effective_context_tokens=16384, temperature=0.0,
             expected_runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
             normalizer_id=None, normalizer_version=None,
@@ -95,11 +98,11 @@ def _role_target(worker_id: str) -> RoleEvaluationTarget:
     )
 
 
-def _certify_eligible(conn, worker_id: str):
+def _certify_eligible(conn, worker_id: str, *, root: str = OLLAMA_ROOT):
     from code_slayer.store.workers_repo import WorkersRepo
 
     WorkersRepo(conn).register(worker_id=worker_id, kind="fake", network_class="local")
-    profile = _profile(worker_id)
+    profile = _profile(worker_id, root=root)
     security = record_baseline_certificate(
         conn, worker_id=worker_id, runtime_profile=profile,
         outcome=SecurityBaselineOutcome.PASS, evidence_ref=f"sec-ev-{worker_id}", reason="ok",
@@ -126,6 +129,52 @@ def state_root(tmp_path):
     root = tmp_path / "_codeslayer_state"
     root.mkdir()
     return root
+
+
+class _OllamaScript:
+    def __init__(self) -> None:
+        self.version = "0.16.1"
+        self.models = [{"name": "worker-a-model", "digest": "sha256:abc"}]
+
+
+def _make_ollama_handler(script: _OllamaScript) -> type:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _write(self, status: int, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if path == "/api/version":
+                self._write(200, json.dumps({"version": script.version}).encode())
+                return
+            if path == "/api/tags":
+                self._write(200, json.dumps({"models": script.models}).encode())
+                return
+            self._write(404, b"{}")
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    return Handler
+
+
+@pytest.fixture
+def ollama_server():
+    script = _OllamaScript()
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _make_ollama_handler(script))
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True,
+    )
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
 
 
 # -- create vs archive: both winner orders -----------------------------------
@@ -350,3 +399,117 @@ def test_bound_worker_ineligible_never_reroutes_to_a_different_eligible_worker(
     # archived worker-a (revalidation refused before construction) nor
     # a substituted worker-b (this job was never re-routed to it).
     assert worker_b_calls == []
+
+
+# -- certificate authority changes WHILE the live probe is in flight
+# (H.4 review finding: the final authority check must occur immediately
+# before Planner construction, not merely before the live probe) --------
+
+
+def test_certificate_change_during_live_probe_is_caught_before_construction(
+    git_repo_with_commit, state_root, ollama_server, monkeypatch,
+):
+    """Forces, via events (never a free-running race), the exact
+    interleaving under test: the executor's FIRST DB-only revalidation
+    pass already succeeded, its live probe is in flight, and a
+    genuinely concurrent connection commits a NEW Baseline Security
+    certificate for the same worker WHILE that probe is still running.
+    The probe itself succeeds (the runtime is genuinely reachable) --
+    but the SECOND, post-probe, DB-only revalidation pass
+    (`PlanningJobExecutor._revalidate_before_construction()`) must
+    still catch the now-stale authority and refuse before a Planner is
+    ever constructed or a model is ever called."""
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        _certify_eligible(svc.production_conn(), "worker-a", root=ollama_server)
+        selection = select_planner_route(
+            svc.production_conn(), baseline_targets=(_target("worker-a", root=ollama_server),),
+            role_targets=(_role_target("worker-a"),),
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        binding = selection.binding
+        job = svc.create_job(
+            original_request=REQUEST, route_binding=binding,
+            baseline_targets=(_target("worker-a", root=ollama_server),),
+            role_targets=(_role_target("worker-a"),),
+        )
+    finally:
+        svc.close()
+
+    probe_started = threading.Event()
+    cert_changed = threading.Event()
+    real_verify = routing_module.verify_ollama_runtime
+
+    def _synchronized_verify(expected):
+        probe_started.set()
+        assert cert_changed.wait(timeout=5)
+        return real_verify(expected)
+
+    monkeypatch.setattr(routing_module, "verify_ollama_runtime", _synchronized_verify)
+
+    def _change_certificate():
+        assert probe_started.wait(timeout=5)
+        changer = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+        try:
+            replacement = record_baseline_certificate(
+                changer.production_conn(), worker_id="worker-a",
+                runtime_profile=_profile("worker-a", root=ollama_server),
+                outcome=SecurityBaselineOutcome.PASS, evidence_ref="sec-ev-worker-a-NEW",
+                reason="re-certified-during-probe",
+            )
+            assert replacement.ok, replacement.reason
+            assert replacement.certificate.certificate_id != binding.security_certificate_id
+        finally:
+            changer.close()
+        cert_changed.set()
+
+    changer_thread = threading.Thread(target=_change_certificate)
+
+    factory_calls: list[tuple[str, str]] = []
+
+    def _planner_factory_for_worker(worker_id: str, job_id: str):
+        factory_calls.append((worker_id, job_id))
+        return FakePlanner([structured_response()])
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, planner_factory_for_worker=_planner_factory_for_worker,
+        baseline_targets=(_target("worker-a", root=ollama_server),),
+        role_targets=(_role_target("worker-a"),),
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    changer_thread.start()
+    try:
+        executor.start()
+        _wait_for_terminal(git_repo_with_commit, state_root, job.job_id)
+    finally:
+        executor.stop()
+        changer_thread.join(timeout=5)
+    assert not changer_thread.is_alive()
+
+    check = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        final = check.get_job(job.job_id)
+    finally:
+        check.close()
+
+    assert final.state == "FAILED"
+    assert final.failure_category == JobFailureCategory.ROUTING.value
+    assert final.failure_reason == "planner_route_binding_stale"
+    # The gap was closed before the Planner was ever constructed or
+    # called -- zero factory calls, zero model calls.
+    assert factory_calls == []
+
+
+def _wait_for_terminal(repo_path, state_root, job_id, timeout=10.0):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        check = EngineeringPlanningService(repo_path, state_root_override=state_root)
+        try:
+            if check.get_job(job_id).state in ("SUCCEEDED", "FAILED"):
+                return
+        finally:
+            check.close()
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not reach a terminal state within {timeout}s")

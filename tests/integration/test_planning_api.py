@@ -410,3 +410,83 @@ def test_planning_over_http_never_mutates_repository_or_executes(
     assert git(git_repo_with_commit, "rev-parse", "HEAD") == before_head
     assert git(git_repo_with_commit, "status", "--porcelain") == before_status
     runner.close()
+
+
+# -- H.4 review finding: the executor must observe config changed AFTER --
+# -- construction, never a stale snapshot captured at process start ------
+
+
+def test_executor_observes_persistent_config_changed_after_construction(
+    git_repo_with_commit, ollama_server, tmp_path,
+):
+    """No restart anywhere in this test. `ApplicationService`/
+    `PlanningJobExecutor` are constructed exactly once, from an initial
+    persistent config; a job is created and durably bound to it
+    (`output_token_budget=4096`); the config file is then changed
+    (`output_token_budget=9999`, deliberately with NO matching new
+    certificate) while the SAME process keeps running; the job is only
+    THEN let through to execution. If the executor's `bindings_factory`
+    resolved a stale startup snapshot, the job's own certified binding
+    (4096) would still match and it would SUCCEED. It must instead FAIL
+    -- a changed `output_token_budget` changes the role-evaluation
+    fingerprint eligibility is computed against, so with no matching
+    new certificate the worker becomes ineligible under the fresh
+    profile (`planner_worker_not_eligible:role_certificate_evaluation_
+    profile_mismatch`) -- externally observable proof the change was
+    actually seen fresh, not from a restart, not from the original
+    config file contents."""
+    from dataclasses import replace
+
+    from code_slayer.config.schema import CSLRConfig, OllamaServerConfig, WorkerRuntimeConfig
+    from code_slayer.config.store import save_config
+
+    config_path = tmp_path / "config.toml"
+    server_config = OllamaServerConfig(server_id="ollama-1", origin=ollama_server)
+    worker_config = WorkerRuntimeConfig(
+        worker_id=WORKER_ID, kind="openai_compatible", network_class="local",
+        ollama_server_id="ollama-1", model_tag="devstral:24b",
+        approved_model_digest="sha256:abc", approved_runtime_version="0.16.1",
+        effective_context_tokens=16384, temperature=0.0,
+        normalizer_id=None, normalizer_version=None,
+        output_token_budget=OUTPUT_TOKEN_BUDGET,
+        tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+        planner_policy_version=POLICY_VERSION,
+    )
+    save_config(
+        CSLRConfig(ollama_servers=(server_config,), workers=(worker_config,)), path=config_path,
+    )
+
+    planner = FakePlanner([structured_response()])
+    app = create_app(
+        git_repo_with_commit, config_path=config_path, load_persistent_config=True,
+        bindings=RuntimeBindings(
+            planner_factory_for_worker=lambda worker_id, job_id: planner,
+            planning_poll_interval_seconds=_FAST_POLL,
+        ),
+    )
+    _created_apps.append(app)
+    _seed_eligible_worker(app, ollama_server)  # certifies AT output_token_budget=4096
+    client = app.test_client()
+
+    created = client.post("/api/plans", json={"request": REQUEST})
+    assert created.status_code == 202
+    job = created.json
+    assert job["output_token_budget"] == OUTPUT_TOKEN_BUDGET
+
+    # Change persistent config AFTER ApplicationService/PlanningJobExecutor
+    # already exist -- no restart, no new ApplicationService/create_app
+    # call. A DIFFERENT output_token_budget with NO matching new
+    # certificate: fresh config resolution makes this job's own durable
+    # binding (4096) mismatch current config (9999) and refuse.
+    changed_worker_config = replace(worker_config, output_token_budget=9999)
+    save_config(
+        CSLRConfig(ollama_servers=(server_config,), workers=(changed_worker_config,)),
+        path=config_path,
+    )
+
+    finished = wait_for_job(client, job["job_id"])
+    assert finished["state"] == "FAILED"
+    assert finished["failure_category"] == "routing"
+    assert finished["failure_reason"] == (
+        "planner_worker_not_eligible:role_certificate_evaluation_profile_mismatch"
+    )

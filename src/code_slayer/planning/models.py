@@ -108,11 +108,19 @@ class JobFailureCategory(StrEnum):
     turn happened and failed."
 
     `ROUTING` — the durable Planner route binding could not be
-    (re)verified before a Planner was ever constructed/called; no
-    model or network contact of any kind happened. `failure_reason` is
-    one of `planning.routing.RevalidationOutcome`'s stable values
-    (optionally suffixed with a further stable detail code — see
-    `planning.routing.RevalidationResult.failure_reason`).
+    (re)verified before a Planner was ever constructed/called: no
+    Planner/model inference call ever occurred. This does NOT mean no
+    network contact of any kind happened — `planning.routing.
+    revalidate_route_binding()`'s own live-runtime-attestation step
+    (`verify_ollama_runtime()`) is a bounded, non-inference probe
+    (`/api/version`/`/api/tags`, never a completion request) that may
+    run and may itself be exactly what this category is reporting
+    (`planner_runtime_unreachable`/`planner_runtime_identity_
+    mismatch`) — never conflate that probe traffic with a model
+    inference call. `failure_reason` is one of `planning.routing.
+    RevalidationOutcome`'s stable values (optionally suffixed with a
+    further stable detail code — see `planning.routing.
+    RevalidationResult.failure_reason`).
     `PLANNER` — a real Planner turn was attempted and did not produce
     valid structured output. `failure_reason` is
     `f"malformed_planner_output:{category}"`, where `category` is
