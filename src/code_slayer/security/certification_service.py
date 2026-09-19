@@ -60,6 +60,7 @@ ENVIRONMENT_PRODUCTION = "PRODUCTION"
 
 PREFLIGHT_CHECKS = (
     "worker_registration",
+    "worker_lifecycle_active",
     "runtime_profile",
     "ollama_root",
     "ollama_reachable",
@@ -74,6 +75,7 @@ PREFLIGHT_CHECKS = (
 
 PLANNER_PREFLIGHT_CHECKS = (
     "worker_registration",
+    "worker_lifecycle_active",
     "runtime_profile",
     "role_target_configured",
     "policy_version_matches_canonical",
@@ -222,6 +224,18 @@ class CertificationService:
             for role in ProductionRole
         }
         eligibility = self._eligibility(worker_id, ProductionRole.PLANNER, target)
+        # H.3: an ARCHIVED worker never shows an actionable READY
+        # preflight/promotion here, even if a stale one exists from
+        # before it was archived -- the WebUI's existing
+        # certificationStartEnabled()/certificationPromoteEnabled()/
+        # certificationPlannerStartEnabled() already gate purely off
+        # these backend-authoritative booleans, so no new field is
+        # needed to disable those actions. The actual mutation
+        # boundaries (run_preflight()/start_baseline_run()/
+        # start_planner_certification()/promote_to_production()) each
+        # independently re-check lifecycle too -- this projection is a
+        # display convenience, never itself an authority boundary.
+        lifecycle_active = worker.lifecycle_state == "ACTIVE"
         ready = CertificationRunsRepo(self.validation_conn()).latest_ready(
             worker_id, kind=KIND_BASELINE,
         )
@@ -232,7 +246,7 @@ class CertificationService:
         planner_active = CertificationRunsRepo(self.validation_conn()).active_for_worker(
             worker_id, kind=KIND_PLANNER,
         )
-        planner_available = planner_ready is not None and not (
+        planner_available = lifecycle_active and planner_ready is not None and not (
             planner_active is not None and planner_active.state in ("QUEUED", "RUNNING")
         )
         return {
@@ -240,13 +254,15 @@ class CertificationService:
             "kind": worker.kind,
             "network_class": worker.network_class,
             "environment": ENVIRONMENT_VALIDATION,
+            "lifecycle_state": worker.lifecycle_state,
+            "lifecycle_changed_at": worker.lifecycle_changed_at,
             "runtime": runtime,
             "baseline_security": baseline,
             "roles": roles,
             "production_eligibility": eligibility,
-            "ready_for_certification": ready is not None,
-            "promotion_available": promotion.available,
-            "promotion_reason": promotion.reason,
+            "ready_for_certification": lifecycle_active and ready is not None,
+            "promotion_available": lifecycle_active and promotion.available,
+            "promotion_reason": promotion.reason if lifecycle_active else "worker_archived",
             "planner_ready_for_certification": planner_available,
             "future_actions": [
                 {
@@ -257,6 +273,8 @@ class CertificationService:
                     "reason": (
                         "ready_for_certification"
                         if role == ProductionRole.PLANNER and planner_available
+                        else "worker_archived"
+                        if role == ProductionRole.PLANNER and not lifecycle_active
                         else "planner_preflight_required"
                         if role == ProductionRole.PLANNER
                         else "live_role_certification_unavailable"
@@ -598,6 +616,11 @@ class CertificationService:
         if active is not None and active.state in ("QUEUED", "RUNNING"):
             raise CertificationConflict("certification_already_in_progress", active.run_id)
         checks.append(_check("worker_registration", True))
+        lifecycle_active = worker.lifecycle_state == "ACTIVE"
+        checks.append(_check(
+            "worker_lifecycle_active", lifecycle_active,
+            "" if lifecycle_active else "worker_archived",
+        ))
         target = self.target_for(worker_id)
         checks.append(_check(
             "runtime_profile", target is not None,
@@ -611,8 +634,15 @@ class CertificationService:
             "production_state_unmodified", True, "validation_workflow_does_not_select_production",
         ))
 
+        # H.3: an ARCHIVED worker never reaches the live-probe block
+        # below -- `worker_lifecycle_active` (and, when configured,
+        # `runtime_profile`) are the only checks it can possibly
+        # satisfy; every network-only check synthesizes `ok=False`/
+        # `"not_evaluated"` via `_ensure_named()` below, exactly like
+        # the existing `target is None` case already does. No live
+        # Ollama/model contact happens for an archived worker.
         expectation = None
-        if target is not None:
+        if target is not None and lifecycle_active:
             expectation = target.expectation
             checks.append(_check("ollama_root", True, expectation.normalized_ollama_root))
             try:
@@ -711,6 +741,13 @@ class CertificationService:
         worker = WorkersRepo(self.production_conn()).get(worker_id)
         if worker is None:
             raise KeyError(worker_id)
+        # H.3: re-checked fresh here, independent of whatever
+        # `worker_lifecycle_active` said in a possibly-stale READY
+        # preflight snapshot -- a worker can be archived after a READY
+        # preflight already exists, and this boundary must not trust
+        # that snapshot for lifecycle.
+        if worker.lifecycle_state != "ACTIVE":
+            raise CertificationBlocked("worker_archived")
         self._ensure_validation_worker(worker_id)
         repo = CertificationRunsRepo(self.validation_conn())
         now = utcnow_iso()
@@ -792,6 +829,11 @@ class CertificationService:
         if active is not None and active.state in ("QUEUED", "RUNNING"):
             raise CertificationConflict("certification_already_in_progress", active.run_id)
         checks.append(_check("worker_registration", True))
+        lifecycle_active = worker.lifecycle_state == "ACTIVE"
+        checks.append(_check(
+            "worker_lifecycle_active", lifecycle_active,
+            "" if lifecycle_active else "worker_archived",
+        ))
         target = self.target_for(worker_id)
         checks.append(_check(
             "runtime_profile", target is not None,
@@ -821,9 +863,11 @@ class CertificationService:
         ))
         production_before = self._production_fingerprint()
 
+        # H.3: same as run_preflight() -- an ARCHIVED worker never
+        # reaches this live-probe block.
         expectation = None
         fingerprint = None
-        if target is not None:
+        if target is not None and lifecycle_active:
             expectation = target.expectation
             try:
                 profile = runtime_profile_identity_from_config(
@@ -910,6 +954,11 @@ class CertificationService:
         worker = WorkersRepo(self.production_conn()).get(worker_id)
         if worker is None:
             raise KeyError(worker_id)
+        # H.3: re-checked fresh -- see start_baseline_run()'s own
+        # comment for why this must not rely on the READY preflight's
+        # own possibly-stale `worker_lifecycle_active` snapshot.
+        if worker.lifecycle_state != "ACTIVE":
+            raise CertificationBlocked("worker_archived")
         self._ensure_validation_worker(worker_id)
         repo = CertificationRunsRepo(self.validation_conn())
         now = utcnow_iso()
@@ -951,6 +1000,11 @@ class CertificationService:
         worker = WorkersRepo(self.production_conn()).get(worker_id)
         if worker is None:
             raise KeyError(worker_id)
+        # H.3: re-checked fresh at the promotion boundary too -- a
+        # worker can be archived between a VALIDATION PASS and the
+        # operator clicking promote.
+        if worker.lifecycle_state != "ACTIVE":
+            raise CertificationBlocked("worker_archived")
         target = self.target_for(worker_id)
         if target is None:
             raise CertificationBlocked("runtime_profile_not_configured")
@@ -1050,6 +1104,23 @@ class CertificationService:
                     reason="runtime_profile_not_configured",
                 )
             return
+        # H.3: re-read PRODUCTION lifecycle (the VALIDATION `workers`
+        # mirror is never authoritative for it -- see `workers.
+        # lifecycle`'s own docstring) immediately before any model
+        # call, closing the queued-before-archive race: if the worker
+        # was archived after this run was queued but before it was
+        # claimed here, refuse now -- no model call, no certificate.
+        production_worker = WorkersRepo(self.production_conn()).get(claimed.worker_id)
+        if production_worker is None or production_worker.lifecycle_state != "ACTIVE":
+            with transaction(self.validation_conn()):
+                repo.finish_in_transaction(
+                    claimed.run_id,
+                    state="INCOMPLETE",
+                    expected_generation=claimed.owner_generation,
+                    now=utcnow_iso(),
+                    reason="worker_archived",
+                )
+            return
         result = certify_live_baseline_security(
             self.validation_conn(),
             worker_id=claimed.worker_id,
@@ -1095,6 +1166,19 @@ class CertificationService:
                         if target is None
                         else "role_evaluation_not_configured"
                     ),
+                )
+            return
+        # H.3: same execution-time recheck as execute_claimed_run()
+        # above -- see that method's own comment.
+        production_worker = WorkersRepo(self.production_conn()).get(claimed.worker_id)
+        if production_worker is None or production_worker.lifecycle_state != "ACTIVE":
+            with transaction(self.validation_conn()):
+                repo.finish_in_transaction(
+                    claimed.run_id,
+                    state="INCOMPLETE",
+                    expected_generation=claimed.owner_generation,
+                    now=utcnow_iso(),
+                    reason="worker_archived",
                 )
             return
         result = certify_live_planner_role(
