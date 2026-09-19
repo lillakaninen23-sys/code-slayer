@@ -406,7 +406,8 @@ planning.routing.select_planner_route()
          fingerprint`/`role_evaluation_fingerprint`/
          `security_certificate_id`/`role_certificate_id`/
          `output_token_budget`/`tool_choice_enforcement`/
-         `planner_policy_version` — atomically re-verified, INSIDE the
+         `planner_policy_version`, plus schema v20's `planner_timeout_
+         seconds` (H.4.1) — atomically re-verified, INSIDE the
          same production `BEGIN IMMEDIATE` transaction that creates the
          plan/job row, against a lifecycle+eligibility recheck; NOT
          merely `worker.lifecycle_state == ACTIVE` alone)
@@ -416,15 +417,78 @@ planning.routing.select_planner_route()
         (claim -> planning.routing.revalidate_route_binding(),
          verify_live_runtime=True -> planner_factory_for_worker(worker_id,
          job_id) -> execute_claimed_job(), which now enforces the job's own
-         certified `output_token_budget` as WorkerRequest.max_output_tokens)
+         certified `output_token_budget` as WorkerRequest.max_output_tokens
+         and constructs the Planner adapter with the job's own certified
+         `planner_timeout_seconds` as OpenAICompatibleConfig.timeout)
 ```
 
 **No client authority.** `POST /api/plans`/`POST /api/plans/{plan_id}/
 replan` still accept only `{request}`/`{}` — the closed-set body parser
 (`api.routes.body()`) has no `worker_id`/`model`/`certificate_id`/
-`runtime_identity_fingerprint` key in its spec, so a client that
-supplies one fails closed with `invalid_fields` before routing is ever
-reached. The backend always selects the worker.
+`runtime_identity_fingerprint`/`planner_timeout_seconds` key in its
+spec, so a client that supplies one fails closed with `invalid_fields`
+before routing is ever reached. The backend always selects the worker
+and its Planner inference timeout.
+
+## Certified, durable Planner inference timeout (H.4.1)
+
+H.4's first live production planning job failed after ~31.8s with
+durable provenance `{"error": "adapter_error:transport_timeout",
+"failure_category": "TRANSPORT_ERROR", "outcome": "MALFORMED"}`,
+because `config.bindings.planner_for_worker()` constructed the
+production Planner's `OpenAICompatibleConfig` with no explicit
+`timeout` — silently inheriting `workers.openai_compatible_adapter`'s
+own hardcoded 30.0s default. H.4.1 makes the Planner INFERENCE request
+timeout (`OpenAICompatibleConfig.timeout` for `/v1/chat/completions`
+calls) server-owned, worker-specific, durable, and role-evaluation-
+bound, exactly like `output_token_budget`/`tool_choice_enforcement`
+already were:
+
+- **Distinct from the runtime-attestation probe timeout.** `config.
+  schema.WorkerRuntimeConfig.planner_timeout_seconds` (bounded `1.0`–
+  `1800.0`, default `30.0` for backwards config compatibility) is never
+  conflated with `security.live_certification.
+  LiveOllamaRuntimeExpectation.timeout`, which only bounds
+  `/api/version`/`/api/tags` runtime-attestation probe traffic.
+- **Role-evaluation identity spec v2.** `workers.role_qualification.
+  ROLE_EVALUATION_SPEC_VERSION` bumped `role-evaluation-spec-v1` ->
+  `role-evaluation-spec-v2`, adding the role-generic
+  `execution_timeout_seconds` field (`RoleEvaluationIdentity`/
+  `canonical_role_evaluation_spec()`). A v1-era stored
+  `role_evaluation_fingerprint` never matches a freshly computed v2
+  fingerprint — this intentionally makes any Planner role certificate
+  minted before this change stale once the new v2 profile is activated;
+  it remains durable historical evidence, never reinterpreted or
+  rewritten.
+- **Planner policy version v2.** `planning.planner_certification.
+  PLANNER_CERTIFICATION_POLICY_VERSION` bumped `planner-certification-
+  v1` -> `planner-certification-v2`. No certificate is automatically
+  minted or rewritten under the new version — a worker must undergo an
+  explicit fresh Planner certification under v2 before it can become
+  eligible again.
+- **Certification uses the configured timeout, not the probe's.**
+  `security.live_planner_certification.certify_live_planner_role()`
+  constructs its qualification `OpenAICompatibleConfig.timeout` from
+  the role target's own `planner_timeout_seconds`, records it onto
+  `planning.qualification.RuntimeContextProfile`/`AttemptProvenance`,
+  and refuses to mint a certificate (`planner_timeout_not_enforced`)
+  unless every qualification attempt's provenance shows that exact
+  timeout was used — mirroring the existing output-token-budget proof.
+- **Durable route binding.** `planning.routing.PlannerRouteBinding`
+  gained a ninth field, `planner_timeout_seconds`, included in the
+  exact-match comparison at both creation-time and execution-time
+  revalidation. A queued job never silently adopts a later timeout: if
+  current config/certification timeout changes, the job's own binding
+  goes `ROUTE_BINDING_STALE` and fails closed at execution — no Planner
+  factory or model call is ever made.
+- **Schema v20** (`store.migrations.0020_planner_timeout_binding`) adds
+  a nullable `planner_timeout_seconds REAL` column to `planning_jobs`,
+  extends the immutable-identity and complete-route-binding triggers to
+  cover it, and is purely additive — every pre-v20 row (including a
+  fully-bound schema-v19 row) reads back with `planner_timeout_seconds
+  = NULL`, never a guessed value; `planning.routing.
+  route_binding_from_job()` treats such a row as unbound, exactly like
+  a legacy pre-H.4 job with no `worker_id` at all.
 
 **No ranking yet.** There is no code-owned Planner strength score.
 Zero or multiple currently-eligible candidates both fail closed rather
@@ -521,3 +585,12 @@ See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
 - There is still no deliberate Planner routing *ranking* — zero or
   multiple currently-eligible candidates both fail closed (H.4); a
   later phase may introduce one.
+- ~~The production Planner adapter had no explicit inference timeout,
+  silently inheriting the transport's hardcoded 30.0s default~~ —
+  **closed by H.4.1.** See "Certified, durable Planner inference
+  timeout (H.4.1)" above. The currently deployed Planner role
+  certificate becomes stale once a v2 execution profile (with an
+  explicit `planner_timeout_seconds`) is activated for a worker; a
+  fresh Planner certification under `planner-certification-v2` is
+  required before production planning is eligible again for that
+  worker.
