@@ -192,6 +192,22 @@ Expected runtime identity is server-owned persistent config
 never HTTP input. `--runtime-factory` / `runtime_qwen_coder:create_runtime`
 remain emergency wiring only.
 
+**Administrative lifecycle (H.3).** Worker summary/detail also carry
+the DB-authoritative `lifecycle_state`/`lifecycle_changed_at`
+(`POST /api/runtime/workers/{id}/archive`/`.../reactivate`, above).
+An `ARCHIVED` worker remains fully visible here — never hidden — but
+its preflight (`worker_lifecycle_active`, checked before any live
+Ollama/model contact for either track), Baseline Security certification
+start, Baseline Security promotion to PRODUCTION, and Planner
+certification start are all blocked (`worker_archived`), and
+`ready_for_certification`/`promotion_available`/`planner_ready_for_
+certification` all report `false` even if a stale `READY` preflight
+exists from before archival — every mutation boundary re-checks
+lifecycle fresh, never trusting that snapshot. A Certification Center
+run already `QUEUED` when a worker is archived still finishes
+`INCOMPLETE`/`worker_archived` with no model call and no certificate,
+never silently proceeding.
+
 | Method / path | Returns |
 | --- | --- |
 | `GET /api/certification/workers` | `{environment: "VALIDATION", workers: [...]}` compact status: runtime `VERIFIED`/`MISMATCH`/`UNREACHABLE`/`UNKNOWN` from last durable preflight (never a live probe on GET), Baseline Security from **validation** certificates (`CERTIFIED`/`FAILED`/`NOT_CERTIFIED`), role certificates from production (`CERTIFIED`/`NOT_CERTIFIED`), production eligibility from `evaluate_production_eligibility` (`ELIGIBLE`/`BLOCKED` plus the evaluator's reason) |
@@ -296,13 +312,15 @@ exact fingerprint match).
 | `POST /api/system/restart` | `{ }` only. systemd --user restart of `codeslayer.service` |
 | `POST /api/system/update/check` | `{ }` only. Fail-closed git check: expected remotes only, dirty/divergent reported, never a deployment |
 | `POST /api/system/update/apply` | `{ }` only. Fast-forward only. Refuses dirty/divergent/unexpected remotes. `deployment_complete` is false until `GET /api/system` shows `process_commit == checkout_head` with `process_commit_source=VERIFIED` and a clean checkout after restart. `git merge` is not a completed deployment |
-| `GET /api/runtime` | Config-bound Ollama servers and workers. **Does not probe live.** Provenance labels are `CONFIG_BOUND` / `UNVERIFIED` |
+| `GET /api/runtime` | Config-bound Ollama servers and workers. **Does not probe live.** Provenance labels are `CONFIG_BOUND` / `UNVERIFIED`. Each worker also carries the durable administrative lifecycle (H.3, separate from runtime health): `lifecycle_state` (`ACTIVE`/`ARCHIVED`), `lifecycle_changed_at`, and the backend-authoritative `archive_available`/`archive_reason`/`reactivate_available`/`reactivate_reason` the WebUI gates its Archive/Reactivate buttons on. Archived workers remain listed, never hidden |
 | `POST /api/runtime/attest` | `{ }` only. Live-attests configured workers (`VERIFIED`/`MISMATCH`/`UNREACHABLE`/`OBSERVED`/`UNVERIFIED`) |
 | `POST /api/runtime/ollama-servers` | `{id, origin}` only. Tests the origin then saves it. Invalid origin: 400. Unreachable: 409, not saved |
 | `POST /api/runtime/ollama-servers/{id}/test` | `{ }` only. Live inventory (`LIVE_ATTESTED`) — observation, not identity approval |
 | `POST /api/runtime/workers` | `{worker_id, ollama_server_id, model_tag}` plus optional kind/network_class/context/temperature/normalizer. **Rejects digest/fingerprint/outcome/adapter/evidence_ref.** Preserves any already-approved identity |
 | `POST /api/runtime/workers/{id}/approve` | `{ }` only. Approves the live-attested digest/version. Mismatch against an existing approved identity returns `MISMATCH` and does not overwrite |
 | `POST /api/runtime/workers/{id}/approve-new-identity` | `{ }` only. Replaces the approved identity from live attestation. Does not transfer certificates |
+| `POST /api/runtime/workers/{id}/archive` | `{ }` only (H.3). Sets administrative lifecycle to `ARCHIVED` — blocks new production runs/resumes, Certification Center preflight/start/promotion, and production eligibility (`worker_archived`), never a delete: worker row, config, certificates, trust, permission grants, certification/runner history, and evidence blobs are all preserved untouched. Idempotent (already-`ARCHIVED` is a no-op success). Refuses with `409 worker_has_active_work` if the worker has a non-terminal production run or a `QUEUED`/`RUNNING` Certification Center run. Returns the current lifecycle projection |
+| `POST /api/runtime/workers/{id}/reactivate` | `{ }` only (H.3). Sets administrative lifecycle back to `ACTIVE`. Idempotent (already-`ACTIVE` is a no-op success). Issues no certificate and starts no work by itself — production eligibility is simply re-derived by the existing evaluator from whatever certificates/runtime identity are still on file. Restart/re-registration/config-reload/identity-approval/certification-run/certificate-promotion never implicitly reactivate an archived worker — only this endpoint does |
 | `GET /api/tailscale` | Node connectivity from `tailscale status --json` (`OBSERVED`) plus Serve mapping from `tailscale serve status --json`. **Host:** machine MagicDNS from `Self.DNSName` only (trailing dot stripped, exact hostname, never suffix/wildcard/IP). `host.accepted` is independent verification that this process would accept that Host header. **Intent:** `CONFIG_BOUND` `enabled` vs live Serve presence; drift is `alignment: MISMATCH` and is not silently rewritten. `serve_status=VERIFIED` is the exact CSLR-owned Serve topology: HTTPS :443, the machine MagicDNS host, handler `/`, configured loopback proxy, Funnel false, and no other proxy/host/handler/TCP forward. A matching proxy among extra forwards is `MISMATCH`, not `VERIFIED`. `remote_access` is `VERIFIED` only when the node is Connected **and** that exact topology is live **and** the Serve Host is accepted. That is network/Serve/Host-path evidence, **not** a claim that a browser same-origin WebUI request would succeed — Origin acceptance is a separate boundary (loopback HTTP vs MagicDNS HTTPS, above). Connected-without-Serve is `UNVERIFIED`. Wrong backend, extra forwarding, or Funnel is `MISMATCH`. Malformed/unavailable Serve status is `UNVERIFIED`/`ERROR`, never `VERIFIED` |
 | `POST /api/tailscale/enable` | `{ }` only. Fail-closed reconciliation. **Adopt** (no CLI) only when live evidence is the full usable path: node `Connected`, exact CSLR Serve topology (`serve_status=VERIFIED`), Funnel false, exact Host accepted, `remote_access=VERIFIED`. **Configure** with `tailscale serve --bg http://127.0.0.1:PORT` only when Serve is attested `not_configured` (`LIVE_ATTESTED`), the node is `Connected`, and the exact Host is already accepted. After that CLI, a fresh live read must satisfy the adopt predicate or the request is `409 tailscale_enable_unverified` and **config is unchanged**. Mixed topology (expected mapping plus extra handler/host/TCP/proxy), backend `MISMATCH`, Funnel, ERROR, UNVERIFIED, node not Connected, Host rejected, or `remote_access` not `VERIFIED` while a mapping exists: `409`, no mutation, config unchanged. Never Funnel. No `--yes` (serve-set does not prompt; `serve reset` does not register `--yes`; see admin/tailscale.py). Trusted Host discovery is live |
 | `POST /api/tailscale/disable` | `{ }` only. Attested `not_configured`: no CLI, persist `enabled=false`. Exact CSLR-owned topology (`serve_status=VERIFIED`, no Funnel): `tailscale serve reset`, then persist false only if a fresh read is attested absent. Expected mapping plus extra handler/host/TCP, mixed/ambiguous topology, backend `MISMATCH`, Funnel, ERROR, UNVERIFIED: `409`, no reset, config unchanged. Never resets an unexpected or mixed external Serve config |

@@ -403,3 +403,22 @@ See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
   Repository Intelligence against the *same* working tree at the same
   moment — evidence that safe parallelism here is not yet trivial, so
   the conservative default is kept rather than raised speculatively.
+- **Worker lifecycle gates (H.3) cannot currently attribute or enforce
+  anything here.** `api.service.RuntimeBindings.planner_factory` is
+  `Callable[[], object]` — unlike `adapter_factory: Callable[[str,
+  str], WorkerAdapter | None]`, it takes no `worker_id`/`role` at all —
+  and `PlanningJobExecutor` simply calls `self._planner_factory()`
+  (`planning.executor`). No durable `planning_jobs`/`engineering_plans`
+  row records which registered worker/model actually supplied the
+  Planner for that turn. H.3's administrative `ACTIVE`/`ARCHIVED`
+  worker lifecycle (`workers.lifecycle`) is therefore enforced only at
+  worker-addressed boundaries — `POST /api/runs`, `LocalWorkerRunner`,
+  `workers.production_eligibility.evaluate_production_eligibility()`,
+  and Certification Center — and deliberately does NOT guess a binding
+  here (not "the only Planner-certified worker," not "the first
+  configured worker," not inferred from model tag/adapter class/
+  Certification Center state). Before a lifecycle gate can be added to
+  `/api/plans`/`PlanningJobExecutor`, planner runtime identity must
+  first become an explicit, durably recorded part of planning-job
+  state — tracked as follow-up work for a future phase, out of H.3's
+  own scope.

@@ -629,6 +629,28 @@ def test_archive_refuses_while_a_certification_run_is_active(admin_app, runtime_
     assert worker["lifecycle_state"] == "ACTIVE"
 
 
+def test_identity_approval_preserves_archived_lifecycle(admin_app, runtime_server):
+    """H.3: approving/replacing a runtime identity is a config-bound
+    mutation entirely separate from administrative lifecycle -- it must
+    never implicitly reactivate an archived worker."""
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    _register_worker(client)
+    client.post("/api/runtime/workers/w1/approve", json={})
+
+    archived = client.post("/api/runtime/workers/w1/archive", json={})
+    assert archived.status_code == 200
+    assert archived.get_json()["lifecycle_state"] == "ARCHIVED"
+
+    replaced = client.post("/api/runtime/workers/w1/approve-new-identity", json={})
+    assert replaced.status_code == 200
+
+    still_archived = client.get("/api/runtime").get_json()
+    worker = next(w for w in still_archived["workers"] if w["worker_id"] == "w1")
+    assert worker["lifecycle_state"] == "ARCHIVED"
+
+
 def test_mismatch_without_replace_does_not_overwrite(admin_app, runtime_server):
     client, _app, config, _repo = admin_app
     script, origin = runtime_server
