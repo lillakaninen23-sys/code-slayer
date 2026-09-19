@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Low-impact/background variant of the repository's normal test path.
+#
+# Normal, full-speed path (unchanged):
+#   pytest -q
+#
+# This script (semantically equivalent to `.venv/bin/python -m pytest -q`,
+# just under reduced CPU/IO priority and a memory ceiling):
+#   ./scripts/test-background
+#
+# Resource controls are applied to the WHOLE pytest process tree via
+# `systemd-run --user --scope`, not just this shell -- pytest forks worker
+# processes and subprocesses for some of this repository's own tests, and
+# a plain `nice`/`ionice` prefix on this script alone would not follow them.
+#
+# Machine-independent by design: memory defaults are derived from THIS
+# machine's own physical RAM at launch time. Nothing here is tuned to any
+# specific developer's hardware -- see CSLR_TEST_MEMORY_HIGH/_MAX below to
+# override outright on any machine.
+#
+# Never parallelizes the suite (no pytest-xdist) -- only pacing/priority
+# changes; the same tests run in the same order as `pytest -q`.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd -- "${REPO_ROOT}"
+
+VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+
+# -- required tools -----------------------------------------------------
+
+if [ ! -x "${VENV_PYTHON}" ]; then
+  echo "test-background: ${VENV_PYTHON} not found or not executable." >&2
+  echo "  Set up the repository's normal dev environment first:" >&2
+  echo "    python3 -m venv .venv && . .venv/bin/activate && pip install -e \".[dev]\"" >&2
+  exit 1
+fi
+
+if ! command -v systemd-run >/dev/null 2>&1; then
+  echo "test-background: systemd-run is not available on this system." >&2
+  echo "  This low-impact mode requires systemd --user. Run the normal" >&2
+  echo "  test path instead:" >&2
+  echo "    ${VENV_PYTHON} -m pytest -q" >&2
+  exit 1
+fi
+
+if ! command -v nice >/dev/null 2>&1 || ! command -v ionice >/dev/null 2>&1; then
+  echo "test-background: both 'nice' and 'ionice' are required (coreutils/util-linux)." >&2
+  exit 1
+fi
+
+# -- CPU quota: a fixed, machine-independent cap (never scaled to the ---
+# -- number of logical CPUs this machine happens to have) ---------------
+
+CPU_QUOTA="${CSLR_TEST_CPU_QUOTA:-200%}"
+case "${CPU_QUOTA}" in
+  [0-9]*%) ;;
+  *)
+    echo "test-background: CSLR_TEST_CPU_QUOTA must look like '200%' (got '${CPU_QUOTA}')." >&2
+    exit 1
+    ;;
+esac
+
+# -- memory: explicit overrides always win outright. Otherwise derive ---
+# -- from THIS machine's physical RAM only -- never swap, never a ------
+# -- hardcoded machine's specs. Simple, deterministic, clamped. ---------
+
+_valid_mem() {
+  case "$1" in
+    [0-9]*[KMGT]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+MEMORY_HIGH="${CSLR_TEST_MEMORY_HIGH:-}"
+MEMORY_MAX="${CSLR_TEST_MEMORY_MAX:-}"
+
+if [ -n "${MEMORY_HIGH}" ] && ! _valid_mem "${MEMORY_HIGH}"; then
+  echo "test-background: CSLR_TEST_MEMORY_HIGH must look like '4G' (digits + K/M/G/T, got '${MEMORY_HIGH}')." >&2
+  exit 1
+fi
+if [ -n "${MEMORY_MAX}" ] && ! _valid_mem "${MEMORY_MAX}"; then
+  echo "test-background: CSLR_TEST_MEMORY_MAX must look like '6G' (digits + K/M/G/T, got '${MEMORY_MAX}')." >&2
+  exit 1
+fi
+
+if [ -z "${MEMORY_HIGH}" ] || [ -z "${MEMORY_MAX}" ]; then
+  # Physical RAM only, in KiB, straight from the kernel -- never swap,
+  # never a general hardware-detection subsystem, just this one value.
+  mem_total_kb="$(awk '/^MemTotal:/ { print $2; found=1 } END { if (!found) exit 1 }' /proc/meminfo 2>/dev/null || true)"
+  case "${mem_total_kb}" in
+    ''|*[!0-9]*)
+      echo "test-background: could not determine physical RAM from /proc/meminfo," >&2
+      echo "  and CSLR_TEST_MEMORY_HIGH/CSLR_TEST_MEMORY_MAX were not both set." >&2
+      echo "  Refusing to run with unrestricted memory -- set both explicitly, e.g.:" >&2
+      echo "    CSLR_TEST_MEMORY_HIGH=4G CSLR_TEST_MEMORY_MAX=6G ./scripts/test-background" >&2
+      exit 1
+      ;;
+  esac
+  mem_total_mb=$(( mem_total_kb / 1024 ))
+
+  if [ -z "${MEMORY_HIGH}" ]; then
+    high_mb=$(( mem_total_mb * 25 / 100 ))
+    # Clamp: MemoryHigh in [2G, 8G].
+    if [ "${high_mb}" -lt 2048 ]; then high_mb=2048; fi
+    if [ "${high_mb}" -gt 8192 ]; then high_mb=8192; fi
+    MEMORY_HIGH="${high_mb}M"
+  fi
+  if [ -z "${MEMORY_MAX}" ]; then
+    max_mb=$(( mem_total_mb * 40 / 100 ))
+    # Clamp: MemoryMax in [4G, 12G].
+    if [ "${max_mb}" -lt 4096 ]; then max_mb=4096; fi
+    if [ "${max_mb}" -gt 12288 ]; then max_mb=12288; fi
+    MEMORY_MAX="${max_mb}M"
+  fi
+fi
+
+echo "CSLR low-impact test mode"
+echo "CPUQuota: ${CPU_QUOTA}"
+echo "CPUWeight: 10"
+echo "IOWeight: 10"
+echo "MemoryHigh: ${MEMORY_HIGH}"
+echo "MemoryMax: ${MEMORY_MAX}"
+echo "nice: 15"
+echo "ionice: idle"
+echo
+
+# --scope runs the command directly (not as a detached unit) and, on
+# modern systemd, exits with the wrapped command's own exit status --
+# `exec` here additionally makes systemd-run's exit status THIS script's
+# own exit status, so pytest's real pass/fail is preserved exactly.
+# A failure to create the scope itself (no systemd --user manager, etc.)
+# is systemd-run's own non-zero exit -- never silently downgraded to a
+# plain, unrestricted pytest run.
+exec systemd-run --user --scope --quiet \
+  -p "CPUWeight=10" \
+  -p "IOWeight=10" \
+  -p "CPUQuota=${CPU_QUOTA}" \
+  -p "MemoryHigh=${MEMORY_HIGH}" \
+  -p "MemoryMax=${MEMORY_MAX}" \
+  -- nice -n 15 ionice -c 3 "${VENV_PYTHON}" -m pytest -q

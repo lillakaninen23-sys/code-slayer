@@ -121,6 +121,38 @@ this repository's own test suite ever touches a real user's
 `~/.local/share/codeslayer`, and no test ever runs against a real,
 non-temporary Git repository.
 
+### Running tests without hogging the machine
+
+The full suite is CPU/IO-heavy enough to make an interactive desktop
+(including gaming) sluggish while it runs. Two equivalent paths exist:
+
+```sh
+pytest -q                    # normal, full speed
+./scripts/test-background    # same tests, low-impact/background
+```
+
+`scripts/test-background` runs the identical suite
+(`.venv/bin/python -m pytest -q`) under `systemd-run --user --scope`
+with reduced CPU/IO priority and a memory ceiling, so it deliberately
+runs *slower* in exchange for staying out of the way of interactive use.
+It never parallelizes the suite (no `pytest-xdist`) — same tests, same
+order, just lower priority and resource-capped. CI and the normal
+`pytest -q` path are unaffected either way.
+
+Defaults are machine-independent: CPU is capped at a fixed `200%`
+(~2 cores) regardless of how many logical CPUs the machine has, and the
+memory ceiling is derived from *this* machine's own physical RAM at
+launch time (never swap, never another machine's specs). All of it can
+be overridden:
+
+```sh
+CSLR_TEST_CPU_QUOTA=150% ./scripts/test-background
+
+CSLR_TEST_MEMORY_HIGH=4G \
+CSLR_TEST_MEMORY_MAX=6G \
+./scripts/test-background
+```
+
 ## Package layout
 
 ```
