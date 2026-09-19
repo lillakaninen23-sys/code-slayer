@@ -518,16 +518,20 @@ export function renderJobStatus(job) {
   return `<p class="notice">${jobBadge(job.state)} Planning attempt finished.</p>`;
 }
 
-/** H.4: the backend-selected, durably-bound Planner routing authority
- * for one job -- worker_id/certificate ids/output budget/tool-choice
- * profile/policy version are bounded, non-secret provenance (never an
- * API key or raw runtime credential), safe to render directly. There
- * is deliberately no worker selector and no "change worker" control
- * anywhere in this view: the backend already made this decision, and
- * it is immutable for this job once made (see `planning.routing`'s own
- * module docstring). `job.worker_id` is null only for a job created
- * before this routing existed (schema v18 and earlier) -- rendered as
- * an explicit "unbound (legacy)" state, never blank/silently omitted. */
+/** H.4 (+ H.4.1 for the timeout field): the backend-selected, durably-
+ * bound Planner routing authority for one job -- worker_id/certificate
+ * ids/output budget/tool-choice profile/timeout/policy version are
+ * bounded, non-secret provenance (never an API key or raw runtime
+ * credential), safe to render directly. There is deliberately no
+ * worker selector and no "change worker" control anywhere in this
+ * view: the backend already made this decision, and it is immutable
+ * for this job once made (see `planning.routing`'s own module
+ * docstring). `job.worker_id` is null only for a job created before
+ * this routing existed (schema v18 and earlier) -- rendered as an
+ * explicit "unbound (legacy)" state, never blank/silently omitted.
+ * `job.planner_timeout_seconds` alone can ALSO be null for an
+ * otherwise-bound schema-v19 job (created before H.4.1) -- rendered as
+ * "—", never a guessed value. */
 export function renderPlannerRouteBinding(job) {
   if (!job) return "";
   if (!job.worker_id) {
@@ -566,6 +570,15 @@ export function renderPlannerRouteBinding(job) {
       <div class="plan-binding-item">
         <span class="plan-binding-label">Tool-choice enforcement</span>
         <strong>${escapeHTML(job.tool_choice_enforcement)}</strong>
+      </div>
+
+      <div class="plan-binding-item">
+        <span class="plan-binding-label">Planner timeout</span>
+        <strong>${
+          job.planner_timeout_seconds != null
+            ? `${escapeHTML(job.planner_timeout_seconds)} s`
+            : "—"
+        }</strong>
       </div>
     </div>
   `;

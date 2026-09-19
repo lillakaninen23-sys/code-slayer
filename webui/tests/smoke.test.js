@@ -303,6 +303,7 @@ test("a job's bound Planner worker and authority provenance are shown", () => {
     state: "SUCCEEDED", worker_id: "qwen3-coder-ctx16k",
     security_certificate_id: "abcdef1234567890", role_certificate_id: "1234567890abcdef",
     output_token_budget: 4096, tool_choice_enforcement: "ADVISORY_ONLY_UNVERIFIED",
+    planner_timeout_seconds: 120,
   };
   const html = renderPlannerRouteBinding(job);
   assert.match(html, /qwen3-coder-ctx16k/);
@@ -310,12 +311,25 @@ test("a job's bound Planner worker and authority provenance are shown", () => {
   assert.match(html, /4096/);
   assert.match(html, /ADVISORY_ONLY_UNVERIFIED/);
   assert.match(html, /abcdef1234567890|abcdef123456/); // truncated certificate id is acceptable
+  assert.match(html, /Planner timeout/);
+  assert.match(html, /120 s/);
 });
 
 test("a legacy job with no worker binding renders an explicit unbound state, never blank", () => {
   const html = renderPlannerRouteBinding({state: "SUCCEEDED", worker_id: null});
   assert.match(html, /Unbound/i);
   assert.equal(renderPlannerRouteBinding(null), "");
+});
+
+test("a schema-v19 job bound to a worker but with no durable timeout renders an em dash, never a guessed value", () => {
+  const html = renderPlannerRouteBinding({
+    state: "SUCCEEDED", worker_id: "qwen3-coder-ctx16k",
+    security_certificate_id: "abcdef1234567890", role_certificate_id: "1234567890abcdef",
+    output_token_budget: 4096, tool_choice_enforcement: "ADVISORY_ONLY_UNVERIFIED",
+    planner_timeout_seconds: null,
+  });
+  assert.match(html, /Planner timeout/);
+  assert.match(html, /—/);
 });
 
 test("planner route binding rendering escapes untrusted worker/certificate values", () => {
@@ -1164,7 +1178,10 @@ test("Models runtime UI keeps fetch out of app and admin views", async () => {
   assert.match(html, /name="temperature"/);
   assert.match(html, /name="normalizer_id"/);
   assert.match(html, /name="normalizer_version"/);
-  assert.doesNotMatch(html, /name="output_token_budget"|name="tool_choice_enforcement"|name="planner_policy_version"/);
+  assert.doesNotMatch(
+    html,
+    /name="output_token_budget"|name="tool_choice_enforcement"|name="planner_policy_version"|name="planner_timeout_seconds"/,
+  );
   const modelsStart = html.indexOf('id="models"');
   const modelsEnd = html.indexOf('id="intelligence"', modelsStart);
   assert.ok(modelsStart >= 0 && modelsEnd > modelsStart);
