@@ -150,7 +150,14 @@ class WorkerRuntimeConfig:
     normalizer_version: int | None
     output_token_budget: int = 4096
     tool_choice_enforcement: str = "ADVISORY_ONLY_UNVERIFIED"
-    planner_policy_version: str = "planner-certification-v1"
+    planner_policy_version: str = "planner-certification-v2"
+    # H.4.1: the actual Planner INFERENCE request timeout (`OpenAICompatibleConfig.
+    # timeout` for `/v1/chat/completions` calls) -- distinct from `security.
+    # live_certification.LiveOllamaRuntimeExpectation.timeout`, which bounds
+    # `/api/version`/`/api/tags` runtime-attestation probe traffic. Default
+    # preserves the adapter's prior hardcoded 30.0s behavior for existing config,
+    # never silently rewritten during migration.
+    planner_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if not self.worker_id or "/" in self.worker_id or " " in self.worker_id:
@@ -181,7 +188,7 @@ class WorkerRuntimeConfig:
             "approved_model_digest", "approved_runtime_version",
             "effective_context_tokens", "temperature", "normalizer_id",
             "normalizer_version", "output_token_budget", "tool_choice_enforcement",
-            "planner_policy_version",
+            "planner_policy_version", "planner_timeout_seconds",
         }
         _reject_unknown(raw, allowed, "worker")
         normalizer_id = None
@@ -234,8 +241,12 @@ class WorkerRuntimeConfig:
                 "worker.tool_choice_enforcement",
             ),
             planner_policy_version=_require_str(
-                raw.get("planner_policy_version", "planner-certification-v1"),
+                raw.get("planner_policy_version", "planner-certification-v2"),
                 "worker.planner_policy_version",
+            ),
+            planner_timeout_seconds=_require_float(
+                raw.get("planner_timeout_seconds", 30.0), "worker.planner_timeout_seconds",
+                minimum=1.0, maximum=1800.0,
             ),
         )
 

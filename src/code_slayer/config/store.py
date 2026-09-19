@@ -101,6 +101,7 @@ def _render_worker(worker: WorkerRuntimeConfig) -> list[str]:
         f"output_token_budget = {worker.output_token_budget}",
         f"tool_choice_enforcement = {_toml_str(worker.tool_choice_enforcement)}",
         f"planner_policy_version = {_toml_str(worker.planner_policy_version)}",
+        f"planner_timeout_seconds = {worker.planner_timeout_seconds}",
     ]
     if worker.approved_model_digest:
         lines.append(f"approved_model_digest = {_toml_str(worker.approved_model_digest)}")
