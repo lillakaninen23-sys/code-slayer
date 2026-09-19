@@ -21,6 +21,7 @@ import threading
 import pytest
 
 import code_slayer.planning.routing as routing_module
+from code_slayer.api.service import RuntimeBindings
 from code_slayer.planning.executor import PlanningJobExecutor
 from code_slayer.planning.fake_planner import FakePlanner
 from code_slayer.planning.models import JobFailureCategory
@@ -497,6 +498,115 @@ def test_certificate_change_during_live_probe_is_caught_before_construction(
     assert final.failure_reason == "planner_route_binding_stale"
     # The gap was closed before the Planner was ever constructed or
     # called -- zero factory calls, zero model calls.
+    assert factory_calls == []
+
+
+def test_config_change_during_live_probe_is_caught_by_second_snapshot(
+    git_repo_with_commit, state_root, ollama_server, monkeypatch,
+):
+    """H.4 review finding: the second (post-probe) revalidation pass
+    must not silently reuse the FIRST, pre-probe routing snapshot --
+    doing so catches a certificate change (proven by the sibling test
+    above) but misses a PERSISTENT CONFIG change landing in the same
+    window. Forces the exact sequence via events (never thread-
+    scheduling luck): the first `_routing_inputs()` call and its DB+
+    live-probe pass complete; a genuinely separate thread mutates the
+    SAME shared, mutable binding state `bindings_factory` reads fresh
+    on every call (mirroring how `ApplicationService._compose_bindings()`
+    re-reads the config FILE fresh on every call) strictly WHILE the
+    probe is blocked open; the probe then completes; the SECOND
+    `_routing_inputs()` call (inside `_revalidate_before_construction()`)
+    MUST observe the mutated state and its own final DB-only pass must
+    refuse -- before the Planner factory is ever called."""
+    svc = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        _certify_eligible(svc.production_conn(), "worker-a", root=ollama_server)
+        selection = select_planner_route(
+            svc.production_conn(), baseline_targets=(_target("worker-a", root=ollama_server),),
+            role_targets=(_role_target("worker-a"),),
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        binding = selection.binding
+        job = svc.create_job(
+            original_request=REQUEST, route_binding=binding,
+            baseline_targets=(_target("worker-a", root=ollama_server),),
+            role_targets=(_role_target("worker-a"),),
+        )
+    finally:
+        svc.close()
+
+    probe_started = threading.Event()
+    config_changed = threading.Event()
+    real_verify = routing_module.verify_ollama_runtime
+
+    def _synchronized_verify(expected):
+        probe_started.set()
+        assert config_changed.wait(timeout=5)
+        return real_verify(expected)
+
+    monkeypatch.setattr(routing_module, "verify_ollama_runtime", _synchronized_verify)
+
+    factory_calls: list[tuple[str, str]] = []
+
+    def _factory(worker_id: str, job_id: str):
+        factory_calls.append((worker_id, job_id))
+        return FakePlanner([structured_response()])
+
+    # A real, mutable shared object -- `bindings_factory` below reads
+    # `current["bindings"]` FRESH on every single call, exactly the way
+    # `ApplicationService._compose_bindings()` re-reads the config file
+    # fresh on every call. This is what makes the second, post-probe
+    # `_routing_inputs()` call genuinely see whatever a separate actor
+    # last wrote, rather than a hardcoded "return something different
+    # the second time" test double.
+    current = {
+        "bindings": RuntimeBindings(
+            baseline_certification_targets=(_target("worker-a", root=ollama_server),),
+            role_evaluation_targets=(_role_target("worker-a"),),
+            planner_factory_for_worker=_factory,
+        ),
+    }
+
+    def _bindings_factory():
+        return current["bindings"]
+
+    def _remove_worker_from_config():
+        assert probe_started.wait(timeout=5)
+        # worker-a removed from persistent config entirely -- an
+        # operator un-configuring it, never merely a certificate
+        # change (no certificate table is touched at all here).
+        current["bindings"] = RuntimeBindings(
+            baseline_certification_targets=(), role_evaluation_targets=(),
+            planner_factory_for_worker=_factory,
+        )
+        config_changed.set()
+
+    changer_thread = threading.Thread(target=_remove_worker_from_config)
+
+    executor = PlanningJobExecutor(
+        git_repo_with_commit, bindings_factory=_bindings_factory,
+        state_root_override=state_root, poll_interval_seconds=0.02,
+    )
+    changer_thread.start()
+    try:
+        executor.start()
+        _wait_for_terminal(git_repo_with_commit, state_root, job.job_id)
+    finally:
+        executor.stop()
+        changer_thread.join(timeout=5)
+    assert not changer_thread.is_alive()
+
+    check = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        final = check.get_job(job.job_id)
+    finally:
+        check.close()
+
+    assert final.state == "FAILED"
+    assert final.failure_category == JobFailureCategory.ROUTING.value
+    assert final.failure_reason == "planner_worker_not_configured"
+    # The mutated config was actually observed -- zero factory calls,
+    # zero model calls.
     assert factory_calls == []
 
 

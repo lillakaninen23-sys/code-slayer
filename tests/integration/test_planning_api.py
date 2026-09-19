@@ -419,28 +419,49 @@ def test_planning_over_http_never_mutates_repository_or_executes(
 def test_executor_observes_persistent_config_changed_after_construction(
     git_repo_with_commit, ollama_server, tmp_path,
 ):
-    """No restart anywhere in this test. `ApplicationService`/
-    `PlanningJobExecutor` are constructed exactly once, from an initial
-    persistent config; a job is created and durably bound to it
-    (`output_token_budget=4096`); the config file is then changed
-    (`output_token_budget=9999`, deliberately with NO matching new
-    certificate) while the SAME process keeps running; the job is only
-    THEN let through to execution. If the executor's `bindings_factory`
-    resolved a stale startup snapshot, the job's own certified binding
-    (4096) would still match and it would SUCCEED. It must instead FAIL
-    -- a changed `output_token_budget` changes the role-evaluation
+    """No restart anywhere in this test, and no dependence on winning a
+    scheduler race. Structure (H.4 review finding -- the original
+    version of this test was race-prone: `ApplicationService.
+    create_plan()` calls `executor.notify()` before the POST even
+    returns, so the executor could consume the OLD config before
+    `save_config()` below ever ran):
+
+    1. `ApplicationService`/`PlanningJobExecutor` are constructed with a
+       deliberately huge poll interval, so nothing EVER wakes the
+       dispatcher's poll loop on its own within this test's lifetime --
+       only an explicit `notify()` call can.
+    2. `start()`'s own immediate startup discovery pass runs BEFORE any
+       job exists at all, and finds nothing.
+    3. The job is created directly and durably through
+       `EngineeringPlanningService.create_job()` against the SAME
+       underlying database the app's executor watches --
+       deliberately bypassing `ApplicationService.create_plan()`, whose
+       own `executor.notify()` is exactly the race this test must not
+       depend on.
+    4. Persistent config is changed (`output_token_budget=4096` ->
+       `9999`, deliberately with NO matching new certificate) --
+       nothing could possibly have consumed it yet; the executor has
+       not been woken since `start()`'s own pre-job discovery pass.
+    5. Only THEN is the executor explicitly `notify()`d.
+
+    If the executor's `bindings_factory` resolved a stale snapshot from
+    construction time, the job's own certified binding (4096) would
+    still match current config and it would SUCCEED. It must instead
+    FAIL -- a changed `output_token_budget` changes the role-evaluation
     fingerprint eligibility is computed against, so with no matching
     new certificate the worker becomes ineligible under the fresh
-    profile (`planner_worker_not_eligible:role_certificate_evaluation_
-    profile_mismatch`) -- externally observable proof the change was
-    actually seen fresh, not from a restart, not from the original
-    config file contents."""
+    profile -- externally observable proof the change was actually
+    seen fresh."""
     from dataclasses import replace
 
     from code_slayer.config.schema import CSLRConfig, OllamaServerConfig, WorkerRuntimeConfig
     from code_slayer.config.store import save_config
+    from code_slayer.planning.routing import RoutingOutcome, select_planner_route
+    from code_slayer.planning.service import EngineeringPlanningService
 
     config_path = tmp_path / "config.toml"
+    state_root = tmp_path / "_codeslayer_state"
+    state_root.mkdir()
     server_config = OllamaServerConfig(server_id="ollama-1", origin=ollama_server)
     worker_config = WorkerRuntimeConfig(
         worker_id=WORKER_ID, kind="openai_compatible", network_class="local",
@@ -458,33 +479,52 @@ def test_executor_observes_persistent_config_changed_after_construction(
 
     planner = FakePlanner([structured_response()])
     app = create_app(
-        git_repo_with_commit, config_path=config_path, load_persistent_config=True,
+        git_repo_with_commit, state_root=state_root,
+        config_path=config_path, load_persistent_config=True,
         bindings=RuntimeBindings(
             planner_factory_for_worker=lambda worker_id, job_id: planner,
-            planning_poll_interval_seconds=_FAST_POLL,
+            # Deliberately enormous -- the poll loop must never fire on
+            # its own within this test; only the explicit notify()
+            # below may wake it.
+            planning_poll_interval_seconds=3600.0,
         ),
     )
     _created_apps.append(app)
     _seed_eligible_worker(app, ollama_server)  # certifies AT output_token_budget=4096
-    client = app.test_client()
 
-    created = client.post("/api/plans", json={"request": REQUEST})
-    assert created.status_code == 202
-    job = created.json
-    assert job["output_token_budget"] == OUTPUT_TOKEN_BUDGET
+    service = app.extensions["codeslayer"]
+    direct = EngineeringPlanningService(git_repo_with_commit, state_root_override=state_root)
+    try:
+        selection = select_planner_route(
+            direct.production_conn(),
+            baseline_targets=service.bindings.baseline_certification_targets,
+            role_targets=service.bindings.role_evaluation_targets,
+        )
+        assert selection.outcome == RoutingOutcome.SELECTED
+        job = direct.create_job(
+            original_request=REQUEST, route_binding=selection.binding,
+            baseline_targets=service.bindings.baseline_certification_targets,
+            role_targets=service.bindings.role_evaluation_targets,
+        )
+    finally:
+        direct.close()
+    assert job.output_token_budget == OUTPUT_TOKEN_BUDGET
+    assert job.state == "QUEUED"  # durably accepted; the executor has not been woken at all yet
 
-    # Change persistent config AFTER ApplicationService/PlanningJobExecutor
-    # already exist -- no restart, no new ApplicationService/create_app
-    # call. A DIFFERENT output_token_budget with NO matching new
-    # certificate: fresh config resolution makes this job's own durable
-    # binding (4096) mismatch current config (9999) and refuse.
+    # Change persistent config -- nothing could possibly have consumed
+    # it yet (no notify() has been sent since app construction's own
+    # pre-job discovery pass, which found no job at all).
     changed_worker_config = replace(worker_config, output_token_budget=9999)
     save_config(
         CSLRConfig(ollama_servers=(server_config,), workers=(changed_worker_config,)),
         path=config_path,
     )
 
-    finished = wait_for_job(client, job["job_id"])
+    # Only now does the dispatcher get any signal to act at all.
+    service._planning_executor.notify()
+
+    client = app.test_client()
+    finished = wait_for_job(client, job.job_id)
     assert finished["state"] == "FAILED"
     assert finished["failure_category"] == "routing"
     assert finished["failure_reason"] == (

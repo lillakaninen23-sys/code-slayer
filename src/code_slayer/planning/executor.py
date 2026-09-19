@@ -79,17 +79,23 @@ each claimed job it instead:
    fresh snapshot, `verify_live_runtime=True` (this module always runs
    from a background thread, never an HTTP request thread — the one
    place in this codebase a live Ollama probe belongs during job
-   execution). A live probe takes real wall-clock time, during which
-   production certificate authority can change — a SECOND, DB-only
-   pass (`verify_live_runtime=False`, no network) runs immediately
-   afterwards, right before a Planner is ever constructed
-   (`_revalidate_before_construction()`), closing exactly the gap the
-   first pass's own probe duration opened. Any refusal (`ok=False`,
-   from either pass) durably fails the job via `EngineeringPlanningService.
-   fail_claimed_job()`, `failure_category="routing"` — no Planner
-   factory call, no model call, ever.
-4. Only once BOTH revalidation passes succeed does it call
-   `planner_factory_for_worker(job.worker_id, job.job_id)` and hand the
+   execution).
+4. A live probe takes real wall-clock time, during which EITHER
+   production certificate authority OR persistent config itself can
+   change. If the first pass passed, `_revalidate_before_construction()`
+   resolves routing inputs a SECOND time — `_routing_inputs()` again,
+   never merely reusing the first snapshot — and runs a FINAL, DB-only
+   pass (`verify_live_runtime=False`, no network) against THAT fresh
+   snapshot. Reusing the pre-probe snapshot here would catch a
+   certificate change but silently miss a persistent-config change (a
+   different `output_token_budget`/worker removal/...) landing in the
+   same window — exactly what re-resolving closes. Any refusal
+   (`ok=False`, from either pass) durably fails the job via
+   `EngineeringPlanningService.fail_claimed_job()`, `failure_category=
+   "routing"` — no Planner factory call, no model call, ever.
+5. Only once BOTH revalidation passes succeed does it call
+   `planner_factory_for_worker(job.worker_id, job.job_id)` — taken from
+   the SECOND (post-probe) snapshot, never the first — and hand the
    result to `execute_claimed_job()`.
 
 ### A claimed job is never left stranded RUNNING
@@ -250,50 +256,67 @@ class PlanningJobExecutor:
                 self._in_flight.add(job_id)
             self._pool.submit(self._run_one, job_id)
 
-    def _revalidate_before_construction(self, service, claimed, baseline_targets, role_targets):
+    def _revalidate_before_construction(self, service, claimed):
         """H.4 review finding: a live-runtime probe takes real wall-clock
-        time, during which production certificate authority can change
-        -- a claimed job's own `RUNNING` state blocks archive, but
-        nothing freezes certificate RECORDING against it. The first
-        pass below (`verify_live_runtime=True`) does the DB-only
-        eligibility recheck AND the live probe together; if that
-        passes, a SECOND, DB-only pass (`verify_live_runtime=False`,
-        no network, cheap) runs immediately afterwards, right before
-        this function returns -- closing exactly the gap the probe's
-        own duration opened. Never holds a SQLite write lock across
-        the network probe (`planning.routing.revalidate_route_binding()`'s
-        own docstring already establishes this discipline; this
-        function only adds the SECOND, post-probe check on top)."""
+        time, during which EITHER production certificate authority OR
+        persistent config itself can change -- a claimed job's own
+        `RUNNING` state blocks archive, but nothing freezes certificate
+        recording or a config save against it. The first pass below
+        (`verify_live_runtime=True`, against the routing inputs already
+        resolved by the caller) does the DB-only eligibility recheck
+        AND the live probe together. If that passes, this function
+        resolves routing inputs a SECOND time -- `self._routing_inputs()`
+        again, not merely reusing the first snapshot -- and runs a
+        FINAL, DB-only pass (`verify_live_runtime=False`, no network)
+        against THAT fresh snapshot, immediately before returning.
+        Reusing the pre-probe snapshot for this final check would catch
+        a certificate change but silently miss a persistent-config
+        change (a different `output_token_budget`/worker removal/...)
+        that landed during the same window -- exactly what this second
+        `_routing_inputs()` call closes. Never holds a SQLite write
+        lock across either network probe (`planning.routing.
+        revalidate_route_binding()`'s own docstring already establishes
+        this discipline).
+
+        Returns `(revalidation_result, planner_factory_for_worker)`.
+        The factory is the SECOND (post-probe) snapshot's own factory —
+        never the first/pre-probe snapshot's, even where the two would
+        coincidentally be equal — and is meaningful only when
+        `revalidation_result.ok`."""
         binding = route_binding_from_job(claimed)
-        revalidation = revalidate_route_binding(
+        initial_baseline, initial_roles, _initial_factory = self._routing_inputs()
+        first = revalidate_route_binding(
             service.production_conn(), binding,
-            baseline_targets=baseline_targets, role_targets=role_targets,
+            baseline_targets=initial_baseline, role_targets=initial_roles,
             verify_live_runtime=True,
         )
-        if revalidation.ok:
-            revalidation = revalidate_route_binding(
-                service.production_conn(), binding,
-                baseline_targets=baseline_targets, role_targets=role_targets,
-                verify_live_runtime=False,
-            )
-        return revalidation
+        if not first.ok:
+            return first, None
+
+        final_baseline, final_roles, final_factory = self._routing_inputs()
+        second = revalidate_route_binding(
+            service.production_conn(), binding,
+            baseline_targets=final_baseline, role_targets=final_roles,
+            verify_live_runtime=False,
+        )
+        return second, final_factory
 
     def _prepare_planner(self, service, claimed):
         """Everything between a successful claim and the actual
-        `execute_claimed_job()` call: resolve fresh routing inputs,
-        revalidate the route binding (twice -- see
-        `_revalidate_before_construction()`), and construct the
-        worker-bound Planner. Returns `(planner, None)` on success, or
-        `(None, (failure_category, failure_reason))` on any expected
-        refusal -- never raises for those. An UNEXPECTED exception
-        here (a bug, a transient config-load failure, ...) is the
-        caller's (`_run_one()`'s) responsibility to catch and
-        terminalize; this method itself does not swallow it, so a
-        claimed job is never left stranded `RUNNING` under this
-        process's own live ownership (H.4 review finding)."""
-        baseline_targets, role_targets, planner_factory_for_worker = self._routing_inputs()
-        revalidation = self._revalidate_before_construction(
-            service, claimed, baseline_targets, role_targets,
+        `execute_claimed_job()` call: revalidate the route binding
+        against two independently-resolved, fresh routing snapshots
+        (see `_revalidate_before_construction()`), and construct the
+        worker-bound Planner from the SECOND (post-probe) snapshot.
+        Returns `(planner, None)` on success, or `(None,
+        (failure_category, failure_reason))` on any expected refusal —
+        never raises for those. An UNEXPECTED exception here (a bug, a
+        transient config-load failure, ...) is the caller's
+        (`_run_one()`'s) responsibility to catch and terminalize; this
+        method itself does not swallow it, so a claimed job is never
+        left stranded `RUNNING` under this process's own live ownership
+        (H.4 review finding)."""
+        revalidation, planner_factory_for_worker = self._revalidate_before_construction(
+            service, claimed,
         )
         if not revalidation.ok:
             return None, (JobFailureCategory.ROUTING.value, revalidation.failure_reason)
