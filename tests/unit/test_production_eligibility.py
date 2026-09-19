@@ -917,6 +917,30 @@ def test_archived_worker_reason_precedes_security_fail(db_conn, registered_worke
     assert decision == EligibilityDecision(False, "worker_archived")
 
 
+def test_archived_worker_reason_precedes_incomplete_runtime_profile(db_conn, registered_worker):
+    """H.3 review finding #5: lifecycle is checked immediately after
+    basic input TYPE/shape validation, BEFORE the deeper `runtime_
+    profile`/`role_evaluation` completeness checks -- an archived
+    worker must never appear to deny for some OTHER reason (like an
+    incomplete/stale profile) just because the request happened to also
+    be incomplete. `test_incompletely_specified_runtime_profile_is_
+    denied` proves the `insufficient_runtime_profile_identity` reason
+    for the SAME weak profile on an ACTIVE worker -- this proves
+    `worker_archived` wins once archived, for a structurally valid
+    (correctly-typed) but otherwise incomplete request."""
+    archive_worker(db_conn, worker_id=registered_worker)
+    weak_profile = RuntimeProfileIdentity(model_tag="devstral:24b")
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=weak_profile,
+        role_evaluation=_role_eval(_full_profile()),
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert decision == EligibilityDecision(False, "worker_archived")
+
+
 def test_reactivated_worker_with_still_current_certificates_is_eligible_again(
     db_conn, registered_worker, profile,
 ):

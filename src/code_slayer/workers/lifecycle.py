@@ -148,16 +148,18 @@ class LifecycleTransitionResult:
     changed: bool
 
 
-def _active_runner_block_reason(conn: sqlite3.Connection, worker_id: str) -> str | None:
-    """`None` if no ordinary `runner_runs` row for `worker_id` is in a
-    status this module treats as genuinely active (see the module
-    docstring). Otherwise the blocking run's own status, for a
-    caller's diagnostic use only -- never itself the returned refusal
-    reason (that is always the stable `worker_has_active_work`)."""
-    for run in RunnerRepo(conn).list_for_worker(worker_id):
-        if run.status in _BLOCKING_NON_TERMINAL_RUNNER_STATUSES:
-            return run.status
-    return None
+def _worker_has_active_runner_work(conn: sqlite3.Connection, worker_id: str) -> bool:
+    """`True` if any ordinary `runner_runs` row for `worker_id` is
+    currently in a status this module treats as genuinely active (see
+    the module docstring's "Active ordinary-runner policy"). Uses
+    `RunnerRepo.has_status_for_worker_in_transaction()` -- a dedicated,
+    uncapped existence query -- rather than `list_for_worker()`'s own
+    history-page `LIMIT`, which could hide an old blocking run behind
+    more than that many newer historical (COMPLETED/FAILED/etc.) rows
+    and let archive incorrectly succeed."""
+    return RunnerRepo(conn).has_status_for_worker_in_transaction(
+        worker_id, statuses=_BLOCKING_NON_TERMINAL_RUNNER_STATUSES,
+    )
 
 
 def archive_worker(conn: sqlite3.Connection, *, worker_id: str) -> LifecycleTransitionResult:
@@ -174,8 +176,7 @@ def archive_worker(conn: sqlite3.Connection, *, worker_id: str) -> LifecycleTran
         if current is None:
             return LifecycleTransitionResult(False, "unknown_worker", None, False)
         if current.lifecycle_state == WorkerLifecycleState.ACTIVE:
-            blocking = _active_runner_block_reason(conn, worker_id)
-            if blocking is not None:
+            if _worker_has_active_runner_work(conn, worker_id):
                 return LifecycleTransitionResult(
                     False, "worker_has_active_work", current, False,
                 )

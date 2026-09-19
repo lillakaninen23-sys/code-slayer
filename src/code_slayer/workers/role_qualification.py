@@ -125,7 +125,7 @@ from code_slayer.audit.writer import AuditWriter
 from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.models import WorkerRoleCertificate
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
-from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 from code_slayer.workers.security_baseline import (
     RuntimeProfileIdentity,
     require_sha256_hex,
@@ -336,6 +336,7 @@ def record_role_certificate(
     reason: str,
     role_evaluation: RoleEvaluationIdentity | None = None,
     now_fn=utcnow_iso,
+    require_active_worker: bool = False,
 ) -> RoleCertificationResult:
     """Durably record one role-qualification certification decision —
     the ONLY way a `worker_role_certificates` row is ever created. Never
@@ -357,7 +358,18 @@ def record_role_certificate(
     decision is well-formed enough to durably trust as evidence. Models
     never self-certify: this function has no notion of a model's own
     claim about itself, only whatever the caller (a code-owned
-    certification boundary) already verified."""
+    certification boundary) already verified.
+
+    `require_active_worker` (H.3 review finding): when `True`, this
+    function additionally requires `worker_id` to be administratively
+    `ACTIVE` -- reloaded and checked INSIDE this same `BEGIN IMMEDIATE`
+    transaction, atomically with the INSERT below, denying
+    `worker_archived` otherwise with nothing written. Pass `True` only
+    when `conn` is the PRODUCTION connection (every role certificate
+    this function has ever recorded already lands directly in
+    PRODUCTION -- see `security.live_planner_certification`'s own
+    module docstring). Defaults to `False` so every existing caller's
+    behavior is unchanged."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_certificate_request")
     if not isinstance(role, ProductionRole):
@@ -410,8 +422,11 @@ def record_role_certificate(
             return _deny("malformed_certificate_request")
 
     with transaction(conn):
-        if WorkersRepo(conn).get(worker_id) is None:
+        worker = WorkersRepo(conn).get(worker_id)
+        if worker is None:
             return _deny("unknown_worker")
+        if require_active_worker and worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+            return _deny("worker_archived")
         certificate_id = uuid.uuid4().hex
         issued_at = now_fn()
         certificate = RoleCertificatesRepo(conn).record_in_transaction(

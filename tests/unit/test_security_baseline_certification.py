@@ -19,6 +19,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
 )
 from code_slayer.store.db import connect, migrate
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.security_baseline import (
     BASELINE_VERSION,
@@ -268,6 +269,54 @@ def test_malformed_runtime_profile_type_is_refused(db_conn, registered_worker):
         reason="ok",
     )
     assert result == SecurityCertificationResult(False, "malformed_certificate_request")
+
+
+# -- require_active_worker (H.3 review finding) ------------------------------
+
+
+def test_require_active_worker_denies_archived_worker_and_writes_nothing(
+    db_conn, registered_worker, profile,
+):
+    archived = archive_worker(db_conn, worker_id=registered_worker)
+    assert archived.ok and archived.changed
+
+    result = record_baseline_certificate(
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="ev",
+        reason="ok",
+        require_active_worker=True,
+    )
+    assert result == SecurityCertificationResult(False, "worker_archived")
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+
+
+def test_require_active_worker_allows_active_worker(db_conn, registered_worker, profile):
+    result = record_baseline_certificate(
+        db_conn,
+        worker_id=registered_worker,
+        runtime_profile=profile,
+        outcome=SecurityBaselineOutcome.PASS,
+        evidence_ref="ev",
+        reason="ok",
+        require_active_worker=True,
+    )
+    assert result.ok
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) != []
+
+
+def test_require_active_worker_defaults_false_and_is_unaffected_by_archive(
+    db_conn, registered_worker, profile,
+):
+    """Every existing caller (no `require_active_worker` argument) keeps
+    recording against an archived worker exactly as before -- this flag
+    is opt-in, never a silent behavior change for VALIDATION recording
+    or any other caller that never asked for it."""
+    archive_worker(db_conn, worker_id=registered_worker)
+    result = _pass(db_conn, registered_worker, profile)
+    assert result.ok
 
 
 # -- persistence round-trip -----------------------------------------------

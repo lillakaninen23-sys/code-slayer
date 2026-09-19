@@ -315,6 +315,7 @@ def certify_planner_from_qualification(
     early_stopped: bool,
     blobs_dir: Path | str,
     now_fn=None,
+    require_active_worker: bool = False,
 ) -> RoleCertificationResult:
     """Decide whether a completed Planner qualification run
     (`planning.qualification.run_corrected_planner_case()`'s own return
@@ -329,7 +330,12 @@ def certify_planner_from_qualification(
     recomputed runtime-identity and role-evaluation fingerprints
     matching the certificate. Never mutates `planning`'s own state and
     never re-invokes the planner itself; this function performs no
-    inference of its own."""
+    inference of its own.
+
+    `require_active_worker` is forwarded, unchanged, to
+    `workers.role_qualification.record_role_certificate()` -- see that
+    function's own docstring for the atomicity guarantee. `False` by
+    default so every existing caller's behavior is unchanged."""
     if not isinstance(results, tuple) or not results:
         return _deny("empty_qualification_evidence")
     if not all(isinstance(result, QualificationAttemptResult) for result in results):
@@ -382,5 +388,6 @@ def certify_planner_from_qualification(
         evidence_ref=evidence_ref,
         reason=reason,
         role_evaluation=role_evaluation,
+        require_active_worker=require_active_worker,
         **kwargs,
     )

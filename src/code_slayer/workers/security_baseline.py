@@ -180,7 +180,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
 )
 from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.models import WorkerBaselineSecurityCertificate
-from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 
 # The fixed, code-owned identifier of the baseline security check
 # taxonomy/policy this module currently implements -- mirrors
@@ -723,6 +723,7 @@ def record_baseline_certificate(
     hard_disqualifiers: tuple[HardDisqualifierCategory, ...] = (),
     now_fn=utcnow_iso,
     promoted_from_validation_certificate_id: str | None = None,
+    require_active_worker: bool = False,
 ) -> SecurityCertificationResult:
     """Durably record one Baseline Security evaluation result — the ONLY
     way a `worker_baseline_security_certificates` row is ever created.
@@ -757,7 +758,22 @@ def record_baseline_certificate(
     VALIDATION certificate — see migration 0017's own docstring. A
     collision surfaces here as `sqlite3.IntegrityError`, propagated
     uncaught: this function never resolves that conflict itself, exactly
-    as it never resolves any other `sqlite3.IntegrityError`."""
+    as it never resolves any other `sqlite3.IntegrityError`.
+
+    `require_active_worker` (H.3 review finding): when `True`, this
+    function additionally requires `worker_id` to be administratively
+    `ACTIVE` -- reloaded and checked INSIDE this same `BEGIN IMMEDIATE`
+    transaction, atomically with the INSERT below, denying
+    `worker_archived` otherwise with nothing written. `conn` decides
+    which lifecycle this checks: pass `True` only when `conn` is the
+    PRODUCTION connection and this call is recording authority against
+    PRODUCTION (e.g. `security.production_promotion`, a PRODUCTION
+    Planner role certificate) -- never for a VALIDATION recording,
+    whose mirrored `workers` row is not authoritative for real
+    production lifecycle (see `workers.lifecycle`'s own module
+    docstring on why the two databases are never atomically joined).
+    Defaults to `False` so every existing caller's behavior is
+    unchanged."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_certificate_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
@@ -788,8 +804,11 @@ def record_baseline_certificate(
         return _deny("malformed_certificate_request")
 
     with transaction(conn):
-        if WorkersRepo(conn).get(worker_id) is None:
+        worker = WorkersRepo(conn).get(worker_id)
+        if worker is None:
             return _deny("unknown_worker")
+        if require_active_worker and worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+            return _deny("worker_archived")
         certificate_id = uuid.uuid4().hex
         issued_at = now_fn()
         certificate = BaselineSecurityCertificatesRepo(conn).record_in_transaction(

@@ -461,9 +461,15 @@ def test_certification_boundary_has_no_override_parameter_for_its_own_decision()
     certificate happens ONLY through this function's own strict policy
     -- there is no parameter letting a caller assert the outcome,
     classification, or role directly (those are always derived from
-    `results` inside the function)."""
+    `results` inside the function). `require_active_worker` (H.3 review
+    finding) is not such an override -- it is a lifecycle AUTHORIZATION
+    gate forwarded unchanged to `record_role_certificate()`, never a way
+    to assert this function's own outcome/classification/role decision."""
     params = set(inspect.signature(certify_planner_from_qualification).parameters)
-    assert params == {"conn", "worker_id", "results", "early_stopped", "blobs_dir", "now_fn"}
+    assert params == {
+        "conn", "worker_id", "results", "early_stopped", "blobs_dir", "now_fn",
+        "require_active_worker",
+    }
     assert "outcome" not in params
     assert "classification" not in params
     assert "role" not in params

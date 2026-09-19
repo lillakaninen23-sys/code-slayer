@@ -21,8 +21,10 @@ from code_slayer.security.live_certification import LiveOllamaRuntimeExpectation
 from code_slayer.security.live_planner_certification import (
     certify_live_planner_role,
 )
+from code_slayer.store import db as db_module
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker
 from code_slayer.workers.production_eligibility import evaluate_production_eligibility
 from code_slayer.workers.role_qualification import (
     ProductionRole,
@@ -392,6 +394,90 @@ def test_pass_creates_exactly_one_planner_role_certificate(
     assert after["grants"] == before["grants"] == 0
     # Exactly the fixed live suite -- four tasks, one repetition each.
     assert script.completion_posts == 4
+
+
+# -- H.3 review finding #4: atomic recheck at the final PRODUCTION write ----
+
+
+def test_certify_refuses_when_archive_wins_the_final_write_race(
+    production_conn, blobs_dir, runtime_server, tmp_path, monkeypatch,
+):
+    """The PRODUCTION Planner role certificate write goes directly
+    through `certify_planner_from_qualification()` ->
+    `record_role_certificate(..., require_active_worker=True)`, which
+    rechecks lifecycle ACTIVE atomically inside the SAME `BEGIN
+    IMMEDIATE` transaction as the INSERT. Monkeypatches `record_role_
+    certificate` (as imported into `planning.planner_certification`) to
+    pause right before the real call, deterministically forcing
+    `archive_worker()` to commit -- on a genuinely separate connection
+    -- in the gap between the (real, model-calling) qualification run
+    and the write. No sequential "archive before calling" test could
+    exercise this: `certify_live_planner_role()`'s OWN earlier
+    eligibility precheck already refuses `worker_archived` before ever
+    reaching the qualification suite, so only a real race landing AFTER
+    that precheck but BEFORE the write proves this specific boundary."""
+    import code_slayer.planning.planner_certification as planner_certification_module
+
+    script, root = runtime_server
+    _seed_production_baseline_pass(production_conn, root)
+
+    about_to_write = threading.Event()
+    archive_committed = threading.Event()
+    real_record = planner_certification_module.record_role_certificate
+
+    def _synchronized_record(*args, **kwargs):
+        about_to_write.set()
+        assert archive_committed.wait(timeout=5)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(
+        planner_certification_module, "record_role_certificate", _synchronized_record,
+    )
+
+    production_path = tmp_path / "state.db"
+    assert production_path.exists()
+
+    certify_result: dict[str, object] = {}
+    archive_result: dict[str, object] = {}
+
+    def _run_certify():
+        conn = db_module.connect(production_path)
+        try:
+            certify_result["value"] = certify_live_planner_role(
+                conn,
+                worker_id=WORKER,
+                blobs_dir=blobs_dir,
+                expected=_expected(root),
+                output_token_budget=OUTPUT_TOKEN_BUDGET,
+                tool_choice_enforcement=TOOL_CHOICE_ENFORCEMENT,
+                policy_version=POLICY_VERSION,
+            )
+        finally:
+            conn.close()
+
+    def _run_archive():
+        assert about_to_write.wait(timeout=5)
+        conn = db_module.connect(production_path)
+        try:
+            archive_result["value"] = archive_worker(conn, worker_id=WORKER)
+        finally:
+            conn.close()
+        archive_committed.set()
+
+    threads = [threading.Thread(target=_run_certify), threading.Thread(target=_run_archive)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+
+    result = certify_result["value"]
+    assert result.ok is False
+    assert result.reason == "worker_archived"
+    assert RoleCertificatesRepo(production_conn).list_for_worker_role(WORKER, "PLANNER") == []
+
+    archived = archive_result["value"]
+    assert archived.ok and archived.changed
 
 
 def test_certificate_binds_exact_runtime_and_role_evaluation_fingerprint(

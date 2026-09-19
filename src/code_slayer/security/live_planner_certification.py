@@ -766,12 +766,19 @@ def certify_live_planner_role(
             role_evaluation_fingerprint=role_evaluation.role_evaluation_fingerprint,
         )
 
+    # H.3 review finding: recheck lifecycle atomically at the SAME
+    # PRODUCTION `BEGIN IMMEDIATE` transaction that records the
+    # certificate authority -- `require_active_worker=True` closes the
+    # gap between this (potentially slow, real-model-call) qualification
+    # run and the write, so an archive that races past every earlier
+    # check still cannot mint a PRODUCTION Planner role certificate.
     recorded: RoleCertificationResult = certify_planner_from_qualification(
         production_conn,
         worker_id=worker_id,
         results=tuple(combined_results),
         early_stopped=any_early_stopped,
         blobs_dir=blobs_dir,
+        require_active_worker=True,
     )
     if not recorded.ok or recorded.certificate is None:
         return _deny(

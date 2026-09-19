@@ -26,11 +26,13 @@ from code_slayer.security.live_certification import (
     LiveOllamaRuntimeExpectation,
     certify_live_baseline_security,
 )
+from code_slayer.store import db as db_module
 from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
 )
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker
 from code_slayer.workers.production_eligibility import evaluate_production_eligibility
 from code_slayer.workers.role_qualification import (
     ProductionRole,
@@ -321,6 +323,82 @@ def test_pass_path_records_exactly_one_certificate(
     assert script.completion_posts == len(mandatory_cases())
     manager = WorkerTrustManager(db_conn)
     assert manager.current_trust(registered_worker, "coder", "read_file") == TrustLevel.LOCKED
+
+
+# -- production_conn: second lifecycle recheck (H.3 review finding) --------
+
+
+def test_production_conn_recheck_refuses_write_when_archived_in_production(
+    db_conn, registered_worker, blobs_dir, runtime_server, tmp_path,
+):
+    """`conn` here is VALIDATION -- `production_conn` is a genuinely
+    separate database, so this is the closest-to-the-write, best-effort
+    (non-atomic) recheck the module docstring describes, not a joined
+    transaction. The evaluation itself still runs (real evidence is
+    forensically produced), but no certificate is written once the
+    recheck finds PRODUCTION archived."""
+    script, root = runtime_server
+    production_conn = db_module.connect(tmp_path / "production.db")
+    db_module.migrate(production_conn)
+    WorkersRepo(production_conn).register(
+        worker_id=registered_worker, kind="fake", network_class="local",
+    )
+    archived = archive_worker(production_conn, worker_id=registered_worker)
+    assert archived.ok and archived.changed
+
+    before = _counts(db_conn, registered_worker)
+    result = certify_live_baseline_security(
+        db_conn,
+        worker_id=registered_worker,
+        blobs_dir=blobs_dir,
+        expected=_expected(root),
+        production_conn=production_conn,
+    )
+    after = _counts(db_conn, registered_worker)
+
+    assert result.ok is False
+    assert result.reason == "worker_archived"
+    assert result.certificate_id is None
+    assert after == before
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker) == []
+    # The evaluation itself was real -- only the write is refused.
+    assert script.completion_posts == len(mandatory_cases())
+    production_conn.close()
+
+
+def test_production_conn_recheck_allows_write_when_active_in_production(
+    db_conn, registered_worker, blobs_dir, runtime_server, tmp_path,
+):
+    script, root = runtime_server
+    production_conn = db_module.connect(tmp_path / "production.db")
+    db_module.migrate(production_conn)
+    WorkersRepo(production_conn).register(
+        worker_id=registered_worker, kind="fake", network_class="local",
+    )
+
+    result = certify_live_baseline_security(
+        db_conn,
+        worker_id=registered_worker,
+        blobs_dir=blobs_dir,
+        expected=_expected(root),
+        production_conn=production_conn,
+    )
+    assert result.ok
+    assert result.outcome == SecurityBaselineOutcome.PASS
+    assert len(BaselineSecurityCertificatesRepo(db_conn).list_for_worker(registered_worker)) == 1
+    production_conn.close()
+
+
+def test_no_production_conn_is_unaffected_by_production_archive(
+    db_conn, registered_worker, blobs_dir, runtime_server,
+):
+    """Default (`production_conn=None`) behavior is byte-for-byte
+    unchanged -- every existing caller of this function keeps recording
+    exactly as before this fix."""
+    script, root = runtime_server
+    result = _certify(db_conn, registered_worker, blobs_dir, root)
+    assert result.ok
+    assert result.outcome == SecurityBaselineOutcome.PASS
 
 
 def test_unassessable_aggregate_fail_records_fail_certificate(

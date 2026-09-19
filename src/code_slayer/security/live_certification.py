@@ -428,6 +428,7 @@ def certify_live_baseline_security(
     blobs_dir: Path | str,
     expected: LiveOllamaRuntimeExpectation,
     now_fn=utcnow_iso,
+    production_conn: sqlite3.Connection | None = None,
 ) -> LiveSecurityCertificationResult:
     """Verify a live Ollama runtime, run the Baseline Security harness
     through a bound `SecurityEvaluationAdapter`, reread durable
@@ -437,7 +438,28 @@ def certify_live_baseline_security(
     PASS, FAIL, and HARD_DISQUALIFIED are all recorded when the
     evaluation completed and evidence verifies. Preflight, probe,
     binding, or evidence-verification failures record nothing.
-    """
+
+    `production_conn` (H.3 review finding, optional): `conn` here is
+    ordinarily the VALIDATION connection (`security.certification_
+    service.CertificationService.execute_claimed_run()` is the one real
+    caller) -- a SEPARATE SQLite database from PRODUCTION, so this
+    recorder can never atomically join a PRODUCTION lifecycle check
+    into the SAME transaction as its own VALIDATION write the way
+    `security.production_promotion`/a PRODUCTION Planner certificate
+    can (`record_baseline_certificate`'s own `require_active_worker`).
+    When given, this function rechecks PRODUCTION lifecycle ACTIVE
+    immediately before the certificate write below -- the closest this
+    boundary can practically get to atomic, closing the gap between the
+    earlier (possibly long-running, real-model-call) evaluation and the
+    write itself. This is a best-effort, non-atomic precondition,
+    exactly like `workers.lifecycle`'s own documented Certification
+    Center precondition; the recorded VALIDATION row is evidence, never
+    PRODUCTION authority by itself -- that boundary is enforced
+    separately and atomically at `promote_baseline_security_to_
+    production()`'s own final write. Never passed as `require_active_
+    worker=True` into `record_baseline_certificate(conn, ...)` here --
+    `conn` is VALIDATION, whose mirrored `workers` row is never
+    authoritative for real PRODUCTION lifecycle."""
     if not isinstance(expected, LiveOllamaRuntimeExpectation):
         return _deny("malformed_live_certification_request")
     if not isinstance(worker_id, str) or not worker_id:
@@ -573,6 +595,17 @@ def certify_live_baseline_security(
             outcome=outcome,
             hard_disqualifiers=hard,
         )
+
+    if production_conn is not None:
+        production_worker = WorkersRepo(production_conn).get(worker_id)
+        if production_worker is None or production_worker.lifecycle_state != "ACTIVE":
+            return _deny(
+                "worker_archived",
+                runtime_identity_fingerprint=fingerprint,
+                evaluation_evidence_ref=evidence_ref,
+                outcome=outcome,
+                hard_disqualifiers=hard,
+            )
 
     recorded = record_baseline_certificate(
         conn,

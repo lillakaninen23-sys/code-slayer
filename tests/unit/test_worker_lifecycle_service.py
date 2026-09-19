@@ -160,6 +160,29 @@ def test_archive_refuses_when_any_run_among_several_is_blocking(db_conn, registe
     assert result.reason == "worker_has_active_work"
 
 
+def test_archive_refuses_with_blocking_run_hidden_behind_200_newer_rows(db_conn, registered):
+    """H.3 review finding: the active-work check must never use
+    `RunnerRepo.list_for_worker()`'s own history-page `LIMIT` (200) as
+    authority -- an old blocking run could be hidden behind more than
+    that many newer historical rows and archive would incorrectly
+    succeed. Seeds one old RUNNING row, then 250 newer terminal rows,
+    and proves archive still refuses and lifecycle stays ACTIVE."""
+    _seed_run(db_conn, run_id="run-old-running", worker_id=registered, status="RUNNING")
+    for i in range(250):
+        _seed_run(db_conn, run_id=f"run-newer-{i:04d}", worker_id=registered, status="COMPLETED")
+
+    # Sanity: the capped history view really does hide the old row.
+    recent = RunnerRepo(db_conn).list_for_worker(registered)
+    assert len(recent) == 200
+    assert "run-old-running" not in {r.run_id for r in recent}
+
+    result = archive_worker(db_conn, worker_id=registered)
+    assert result.ok is False
+    assert result.reason == "worker_has_active_work"
+    assert WorkersRepo(db_conn).get(registered).lifecycle_state == WorkerLifecycleState.ACTIVE
+    assert _audit_rows(db_conn, "WORKER_ARCHIVED") == []
+
+
 def test_archiving_already_archived_worker_skips_active_work_check(db_conn, registered):
     """Archiving a worker that is already ARCHIVED is a no-op
     regardless of runner state -- there is nothing new to authorize,

@@ -271,6 +271,25 @@ def evaluate_production_eligibility(
         or not expected_role_policy_version.strip()
     ):
         return _deny("malformed_eligibility_request")
+
+    # H.3: administrative lifecycle is checked immediately after basic
+    # input TYPE/shape validation, before any deeper profile-
+    # completeness or certificate evaluation -- an ARCHIVED worker is
+    # blocked regardless of how stale or incomplete the REST of the
+    # request is, exactly like a hard Security disqualifier (checked
+    # before either certificate is even looked up). This never mutates
+    # or invalidates certificates (see `workers.lifecycle`'s own module
+    # docstring for why archiving never touches this table). Ordering
+    # this before `insufficient_runtime_profile_identity`/
+    # `insufficient_role_evaluation_identity` below matters: an
+    # archived worker with an otherwise stale/incomplete request must
+    # never appear to deny for some OTHER reason.
+    worker = WorkersRepo(conn).get(worker_id)
+    if worker is None:
+        return _deny("unknown_worker")
+    if worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+        return _deny("worker_archived")
+
     if not runtime_profile.is_verified_current or not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
     if not role_evaluation.is_fully_specified:
@@ -284,18 +303,6 @@ def evaluate_production_eligibility(
         != runtime_profile.runtime_identity_fingerprint
     ):
         return _deny("role_evaluation_runtime_identity_mismatch")
-
-    worker = WorkersRepo(conn).get(worker_id)
-    if worker is None:
-        return _deny("unknown_worker")
-    # H.3: administrative lifecycle takes precedence over both security
-    # and role eligibility -- checked before either certificate is even
-    # looked up, exactly like a hard Security disqualifier. An archived
-    # worker is blocked regardless of how strong its certificates are;
-    # this never mutates or invalidates them (see `workers.lifecycle`'s
-    # own module docstring for why archiving never touches this table).
-    if worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
-        return _deny("worker_archived")
 
     security_certificates = BaselineSecurityCertificatesRepo(conn).list_for_worker(worker_id)
     if not security_certificates:

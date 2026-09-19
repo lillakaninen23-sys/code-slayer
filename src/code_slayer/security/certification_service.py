@@ -1110,6 +1110,13 @@ class CertificationService:
         # call, closing the queued-before-archive race: if the worker
         # was archived after this run was queued but before it was
         # claimed here, refuse now -- no model call, no certificate.
+        # This is the FIRST of two lifecycle boundaries (H.3 review
+        # finding): `certify_live_baseline_security()` below is also
+        # given `production_conn` and rechecks lifecycle a SECOND time,
+        # immediately before its own certificate write, closing the gap
+        # this first check alone cannot -- the model/evaluation work in
+        # between can run long enough for an archive to land after this
+        # point but before the write.
         production_worker = WorkersRepo(self.production_conn()).get(claimed.worker_id)
         if production_worker is None or production_worker.lifecycle_state != "ACTIVE":
             with transaction(self.validation_conn()):
@@ -1126,6 +1133,7 @@ class CertificationService:
             worker_id=claimed.worker_id,
             blobs_dir=self.validation_paths()["blobs"],
             expected=target.expectation,
+            production_conn=self.production_conn(),
         )
         if result.ok and result.outcome is not None:
             state = result.outcome.value

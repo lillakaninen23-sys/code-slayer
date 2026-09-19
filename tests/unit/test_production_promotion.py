@@ -30,6 +30,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
 )
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker
 from code_slayer.workers.security_baseline import (
     SecurityBaselineOutcome,
     runtime_profile_identity_from_config,
@@ -731,6 +732,124 @@ def test_two_concurrent_promotions_of_the_same_identity_produce_exactly_one_cert
     assert len(rows) == 1
     assert rows[0].certificate_id == results[0].production_certificate_id
     assert rows[0].outcome == "PASS"
+
+
+def test_promotion_final_write_refuses_when_archive_wins_the_race(
+    validation_conn, production_conn, registered_worker,
+    validation_blobs_dir, production_blobs_dir, runtime_server, tmp_path, monkeypatch,
+):
+    """H.3 review finding #4 (Baseline promotion): the final PRODUCTION
+    certificate write (`record_baseline_certificate(...,
+    require_active_worker=True)`) must recheck lifecycle ACTIVE
+    atomically, inside the SAME `BEGIN IMMEDIATE` transaction as the
+    INSERT -- the boundary the sequential pre-checks above it (all of
+    which already passed by this point) cannot close on their own.
+    Monkeypatches `record_baseline_certificate` (mirroring this file's
+    own established `verify_ollama_runtime` synchronization pattern) to
+    signal an event right before calling the real function, then wait
+    on a second event -- deterministically forcing `archive_worker()`
+    to commit, on a genuinely separate connection, in the exact gap
+    between promotion's last check and its write."""
+    script, root = runtime_server
+    _certify_validation_pass(validation_conn, registered_worker, validation_blobs_dir, root)
+
+    about_to_write = threading.Event()
+    archive_committed = threading.Event()
+    real_record = production_promotion.record_baseline_certificate
+
+    def _synchronized_record(*args, **kwargs):
+        about_to_write.set()
+        assert archive_committed.wait(timeout=5)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(production_promotion, "record_baseline_certificate", _synchronized_record)
+
+    validation_path = tmp_path / "state.db"
+    production_path = tmp_path / "production.db"
+    assert validation_path.exists()
+    assert production_path.exists()
+
+    promotion_result: dict[str, object] = {}
+    archive_result: dict[str, object] = {}
+
+    def _run_promotion():
+        v_conn = db_module.connect(validation_path)
+        p_conn = db_module.connect(production_path)
+        try:
+            promotion_result["value"] = promote_baseline_security_to_production(
+                v_conn,
+                p_conn,
+                worker_id=registered_worker,
+                validation_blobs_dir=validation_blobs_dir,
+                production_blobs_dir=production_blobs_dir,
+                expected=_expected(root),
+            )
+        finally:
+            v_conn.close()
+            p_conn.close()
+
+    def _run_archive():
+        assert about_to_write.wait(timeout=5)
+        archive_conn = db_module.connect(production_path)
+        try:
+            archive_result["value"] = archive_worker(archive_conn, worker_id=registered_worker)
+        finally:
+            archive_conn.close()
+        archive_committed.set()
+
+    threads = [threading.Thread(target=_run_promotion), threading.Thread(target=_run_archive)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+
+    result = promotion_result["value"]
+    assert result.ok is False
+    assert result.reason == "worker_archived"
+    assert _production_rows(production_conn, registered_worker) == []
+
+    archived = archive_result["value"]
+    assert archived.ok and archived.changed
+    assert WorkersRepo(production_conn).get(registered_worker).lifecycle_state == "ARCHIVED"
+
+
+def test_promotion_final_write_succeeds_when_it_wins_the_race(
+    validation_conn, production_conn, registered_worker,
+    validation_blobs_dir, production_blobs_dir, runtime_server, tmp_path, monkeypatch,
+):
+    """The deterministic mirror image: if promotion's write transaction
+    commits before archive's own transaction begins, promotion succeeds
+    normally -- archive may then subsequently succeed too (the
+    certificate remains historical/current evidence; eligibility from
+    that point on is `worker_archived`), which is the acceptable,
+    deterministic ordering the module docstring describes."""
+    script, root = runtime_server
+    _certify_validation_pass(validation_conn, registered_worker, validation_blobs_dir, root)
+
+    validation_path = tmp_path / "state.db"
+    production_path = tmp_path / "production.db"
+    v_conn = db_module.connect(validation_path)
+    p_conn = db_module.connect(production_path)
+
+    result = promote_baseline_security_to_production(
+        v_conn,
+        p_conn,
+        worker_id=registered_worker,
+        validation_blobs_dir=validation_blobs_dir,
+        production_blobs_dir=production_blobs_dir,
+        expected=_expected(root),
+    )
+    v_conn.close()
+    p_conn.close()
+    assert result.ok
+    assert result.reason == "promoted_to_production"
+    assert len(_production_rows(production_conn, registered_worker)) == 1
+
+    archived = archive_worker(production_conn, worker_id=registered_worker)
+    assert archived.ok and archived.changed
+    # The certificate promotion already committed remains on record.
+    assert len(_production_rows(production_conn, registered_worker)) == 1
 
     promotion_audit_count = production_conn.execute(
         "SELECT count(*) AS c FROM audit_events "

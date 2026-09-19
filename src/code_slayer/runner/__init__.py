@@ -9,9 +9,11 @@ full composition and its documented boundaries/limitations.
 """
 
 from code_slayer.runner.local_worker_runner import (
+    ClaimOutcome,
+    ClaimResult,
     LocalWorkerRunner,
     RunResult,
     RunStatus,
 )
 
-__all__ = ["LocalWorkerRunner", "RunResult", "RunStatus"]
+__all__ = ["ClaimOutcome", "ClaimResult", "LocalWorkerRunner", "RunResult", "RunStatus"]

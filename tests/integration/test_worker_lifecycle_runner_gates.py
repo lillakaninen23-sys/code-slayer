@@ -32,9 +32,11 @@ genuinely in flight.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from code_slayer.runner import LocalWorkerRunner, RunStatus
+from code_slayer.runner import ClaimOutcome, LocalWorkerRunner, RunStatus
 from code_slayer.store.runner_repo import RunnerRepo
 from code_slayer.store.workers_repo import WorkersRepo
 from code_slayer.workers.conformance import run_conformance_suite
@@ -303,7 +305,8 @@ def test_resume_running_with_adapter_refuses_when_archived_via_direct_bypass(run
     another thread/process (it cannot, and does not attempt to)."""
     ready = _ready_run(runner)
     claimed = runner._claim_for_execution(ready.run_id)
-    assert claimed is not None and claimed.status == RunStatus.RUNNING.value
+    assert claimed.outcome == ClaimOutcome.CLAIMED
+    assert claimed.run.status == RunStatus.RUNNING.value
     worker, changed = WorkersRepo(runner._control_conn).archive(WORKER_ID)
     assert changed and worker.lifecycle_state == "ARCHIVED"
     adapter = FakeWorkerAdapter([])
@@ -336,3 +339,151 @@ def test_runner_reactivate_worker_pass_through(runner):
     result = runner.reactivate_worker(WORKER_ID)
     assert result.ok and result.changed
     assert WorkersRepo(runner._control_conn).get(WORKER_ID).lifecycle_state == "ACTIVE"
+
+
+# -- real concurrency: two DB connections/threads, both winner orders -------
+#
+# Each racer below opens its OWN `LocalWorkerRunner` (own connection) in
+# the thread that uses it -- Python's `sqlite3` connections are not
+# thread-safe across threads by default, and this also mirrors the real
+# deployment shape (two separate processes/requests, never one shared
+# in-process connection). Both instances resolve to the exact same
+# on-disk control database because they are constructed against the
+# same `git_repo_with_commit` path under the same (autouse, per-test)
+# `CODESLAYER_STATE_ROOT`. Every assertion below branches on WHICH side
+# actually won the race (rather than asserting a hardcoded order), so
+# the test is correct regardless of real OS thread-scheduling
+# nondeterminism, while `threading.Barrier` maximizes how often the
+# race is actually exercised in either direction across runs.
+
+
+def test_start_vs_archive_concurrency_both_winner_orders(git_repo_with_commit):
+    """H.3 review finding #1: `start()`'s authoritative lifecycle check
+    must live INSIDE the same `BEGIN IMMEDIATE` transaction that creates
+    the new `runner_runs` row, so it is genuinely serialized against a
+    concurrent `archive_worker()` call. Proves both orders are safe:
+    if archive wins, `start()` creates nothing; if `start()` wins,
+    `archive_worker()` sees the new row as active work and refuses."""
+    setup = LocalWorkerRunner(git_repo_with_commit)
+    setup.register_worker(worker_id=WORKER_ID, kind="fake", network_class="local")
+    setup.close()
+
+    barrier = threading.Barrier(2)
+    results: dict[str, object] = {}
+
+    def _start():
+        r = LocalWorkerRunner(git_repo_with_commit)
+        try:
+            barrier.wait(timeout=5)
+            results["start"] = r.start(
+                original_prompt=PROMPT, worker_id=WORKER_ID, role=ROLE,
+                prompt_analyst=_simple_analyst(),
+            )
+        finally:
+            r.close()
+
+    def _archive():
+        r = LocalWorkerRunner(git_repo_with_commit)
+        try:
+            barrier.wait(timeout=5)
+            results["archive"] = r.archive_worker(WORKER_ID)
+        finally:
+            r.close()
+
+    threads = [threading.Thread(target=_start), threading.Thread(target=_archive)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+
+    start_result = results["start"]
+    archive_result = results["archive"]
+
+    verify = LocalWorkerRunner(git_repo_with_commit)
+    try:
+        rows = RunnerRepo(verify._control_conn).list_for_worker(WORKER_ID)
+        worker = WorkersRepo(verify._control_conn).get(WORKER_ID)
+        if start_result.status == RunStatus.FAILED and start_result.reason == "worker_archived":
+            # archive won first: start() created NOTHING durable.
+            assert rows == []
+            assert archive_result.ok and archive_result.changed
+            assert worker.lifecycle_state == "ARCHIVED"
+        else:
+            # start() won first: a real run row exists, and archive
+            # saw it as active work and refused (never both winning).
+            assert start_result.status != RunStatus.FAILED
+            assert len(rows) == 1
+            assert archive_result.ok is False
+            assert archive_result.changed is False
+            assert archive_result.reason == "worker_has_active_work"
+            assert worker.lifecycle_state == "ACTIVE"
+    finally:
+        verify.close()
+
+
+def test_ready_claim_vs_archive_concurrency_both_winner_orders(runner):
+    """H.3 review finding #2: `_claim_for_execution()`'s `READY ->
+    RUNNING` transaction is the sole authority for whether a claim may
+    cross an archive. Races the claim itself (not a full `resume()` ->
+    real execution -> terminal completion) against `archive_worker()`:
+    a full end-to-end `resume()` call finishes the whole synchronous
+    turn (through to COMPLETED) before returning, so racing it against
+    archive would make "archive must see active work" depend on exactly
+    when archive's own transaction happens to land relative to that
+    already-finished turn -- genuinely flaky, not what this invariant
+    claims. `_claim_for_execution()` alone brackets exactly the one
+    atomic transaction this fix adds, so both outcomes are deterministic
+    invariants regardless of scheduling: if the claim wins, the run is
+    left RUNNING and archive (checking the SAME connection's durable
+    state) sees it as active work and refuses; if archive wins, the
+    claim itself returns `WORKER_ARCHIVED` and writes nothing -- proving
+    no model/adapter call is even possible in that losing path, since
+    `_claim_for_execution()` never takes or invokes one."""
+    ready = _ready_run(runner)
+    assert ready.status == RunStatus.READY
+    repo_root = runner._primary.repo_root
+
+    barrier = threading.Barrier(2)
+    results: dict[str, object] = {}
+
+    def _claim():
+        r = LocalWorkerRunner(repo_root)
+        try:
+            barrier.wait(timeout=5)
+            results["claim"] = r._claim_for_execution(ready.run_id)
+        finally:
+            r.close()
+
+    def _archive():
+        r = LocalWorkerRunner(repo_root)
+        try:
+            barrier.wait(timeout=5)
+            results["archive"] = r.archive_worker(WORKER_ID)
+        finally:
+            r.close()
+
+    threads = [threading.Thread(target=_claim), threading.Thread(target=_archive)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+
+    claim = results["claim"]
+    archive_result = results["archive"]
+    row = RunnerRepo(runner._control_conn).get(ready.run_id)
+
+    if claim.outcome == ClaimOutcome.CLAIMED:
+        # claim won first: archive must see genuinely active work.
+        assert row.status == RunStatus.RUNNING.value
+        assert claim.run.status == RunStatus.RUNNING.value
+        assert archive_result.ok is False
+        assert archive_result.changed is False
+        assert archive_result.reason == "worker_has_active_work"
+    else:
+        # archive won first: the claim itself refused, nothing written.
+        assert claim.outcome == ClaimOutcome.WORKER_ARCHIVED
+        assert claim.run is None
+        assert row.status == RunStatus.READY.value
+        assert archive_result.ok and archive_result.changed

@@ -288,6 +288,33 @@ _TERMINAL_STATUSES_NO_NEW_WORK = frozenset({
 })
 
 
+class ClaimOutcome(StrEnum):
+    """H.3 review finding: `_claim_for_execution()`'s typed result --
+    a plain `RunnerRun | None` could not distinguish "not READY /
+    already claimed by someone else" from "READY, but the worker is
+    ARCHIVED" (both used to collapse to `None`), and the second case
+    must never be silently treated as the first: a caller that needs to
+    surface `worker_archived` (e.g. `resume()`) could not, and a caller
+    that didn't check risked masking a real refusal as an ordinary
+    race."""
+
+    CLAIMED = "claimed"
+    NOT_READY = "not_ready"
+    WORKER_ARCHIVED = "worker_archived"
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """`run` is set only when `outcome is ClaimOutcome.CLAIMED` --
+    the freshly-RUNNING row. Otherwise `None`: neither refusal case
+    mutates anything, so there is no new row state for a caller to
+    read here (a caller that wants the CURRENT durable state after a
+    refusal re-reads it itself, exactly as before this type existed)."""
+
+    outcome: ClaimOutcome
+    run: RunnerRun | None = None
+
+
 @dataclass(frozen=True)
 class RunResult:
     """A structured result suitable for a future CLI/WebUI — never
@@ -433,21 +460,35 @@ class LocalWorkerRunner:
         regardless."""
         if not isinstance(original_prompt, str):
             raise TypeError("original_prompt must be a str")
-        # H.3: an ARCHIVED worker never gets a new production run at
-        # all -- checked before any row is created, mirroring how an
-        # unknown run_id in `resume()` returns a result with nothing
-        # durable behind it. Unknown `worker_id` is unchanged: this
-        # method has never validated worker existence itself (that is
-        # `api.service.ApplicationService.start()`'s own existing
-        # `unknown_worker` check, before it ever calls here) and still
-        # does not -- only a REGISTERED, ARCHIVED worker is refused.
-        existing_worker = WorkersRepo(self._control_conn).get(worker_id)
-        if existing_worker is not None and existing_worker.lifecycle_state != "ACTIVE":
-            return RunResult(run_id="", status=RunStatus.FAILED, reason="worker_archived")
         run_id = uuid.uuid4().hex
         now = utcnow_iso()
         store = ContentStore(self._control_conn, self._control_blobs_dir)
         with transaction(self._control_conn):
+            # H.3 review finding: the AUTHORITATIVE lifecycle check lives
+            # INSIDE this same `BEGIN IMMEDIATE` transaction that creates
+            # the new runner row -- a check performed before opening this
+            # transaction (as an earlier revision did) is not atomic with
+            # `archive_worker()`'s own `BEGIN IMMEDIATE` transaction
+            # (`workers.lifecycle`), so the two can interleave:
+            # `start()` reads ACTIVE, `archive_worker()` commits ARCHIVED
+            # (seeing no active run yet), then `start()` proceeds to
+            # create an ANALYZING row for an already-archived worker.
+            # Checked here, inside this transaction, the two calls are
+            # genuinely serialized by SQLite's own write lock: whichever
+            # commits first is authoritative for the other -- if
+            # `archive_worker()` wins, it never sees this run (nothing
+            # has been written yet) but this call sees ARCHIVED and
+            # creates nothing; if `start()` wins, `archive_worker()`
+            # subsequently sees this new ANALYZING row as active work and
+            # refuses. Unknown `worker_id` is unchanged: this method has
+            # never validated worker existence itself (that is `api.
+            # service.ApplicationService.start()`'s own existing
+            # `unknown_worker` check, before it ever calls here) and
+            # still does not -- only a REGISTERED, ARCHIVED worker is
+            # refused.
+            existing_worker = WorkersRepo(self._control_conn).get(worker_id)
+            if existing_worker is not None and existing_worker.lifecycle_state != "ACTIVE":
+                return RunResult(run_id="", status=RunStatus.FAILED, reason="worker_archived")
             prompt_blob = store.put(
                 original_prompt.encode("utf-8"), media_type="text/plain",
                 source_kind="original_prompt", exportable=False,
@@ -545,19 +586,32 @@ class LocalWorkerRunner:
         H.3: an ARCHIVED worker never reaches worker/model execution
         through `resume()`, on ANY durable status a run can be found
         in. A terminal run is always returned unchanged regardless of
-        lifecycle (see the check above). For every non-terminal status,
-        the gate below is placed exactly where that status's own
-        handling would otherwise invoke the worker (`adapter is not
-        None` is, precisely and only, the caller's own signal that
-        this call might reach execution — `_evaluate_gate()`/
-        `_proceed_to_execution()`/`_recover_mid_turn()` are all
-        themselves no-ops for inference purposes when `adapter is
-        None`) — never a single blanket check applied uniformly before
-        branching, so `ANALYZING` (which never touches `adapter` at
-        all) is untouched by this gate. Refusing here never mutates the
-        run: no status/reason is written, so a legitimate later
-        `resume()` after reactivation can still continue exactly where
-        this one left off."""
+        lifecycle (see the check above). `ANALYZING` never touches
+        `adapter` at all and is untouched by any lifecycle gate.
+
+        For `BLOCKED_ON_QUESTIONS`/`RUNNING`, an `adapter is not None`
+        pre-check is a fast-path optimization only (skipping real work
+        — gate re-evaluation, execution-plane recovery — the call would
+        otherwise do for an archived worker) — never this codebase's
+        sole authority for the invariant; see `workers.lifecycle`'s own
+        module docstring for why a non-atomic precondition here is
+        acceptable given what it protects downstream.
+
+        For `READY`, by contrast, lifecycle is authoritative exactly at
+        `_claim_for_execution()`'s own atomic `READY -> RUNNING`
+        transaction (H.3 review finding) — the ONE place this call
+        actually commits to execution — not at any pre-check before it:
+        a caller-side `adapter is not None and self._worker_archived(
+        ...)` check performed before that transaction is never atomic
+        with a concurrent `archive_worker()` call and so cannot, by
+        itself, prevent a claim from crossing an archive landing in the
+        gap. `adapter is None` still reaches no inference either way —
+        a `WORKER_ARCHIVED` claim result in that case is reported as an
+        unchanged run, never surfaced as the `worker_archived` refusal
+        reason, since no execution was ever attempted. Refusing here
+        never mutates the run: no status/reason is written, so a
+        legitimate later `resume()` after reactivation can still
+        continue exactly where this one left off."""
         run = RunnerRepo(self._control_conn).get_or_none(run_id)
         if run is None:
             return RunResult(run_id=run_id, status=RunStatus.FAILED, reason="unknown_run")
@@ -580,13 +634,27 @@ class LocalWorkerRunner:
             )
 
         if run.status == RunStatus.READY.value:
-            if adapter is not None and self._worker_archived(run.worker_id):
-                return self._to_result(run, reason_override="worker_archived")
-            claimed = self._claim_for_execution(run_id)
-            if claimed is None:
+            # H.3 review finding: the READY -> RUNNING claim boundary
+            # (`_claim_for_execution()`) is the SOLE, atomic authority
+            # for whether a REAL execution attempt may cross ARCHIVED --
+            # no `adapter is not None` pre-check gates entry to the
+            # claim itself. But `adapter is None` still means no
+            # execution was ever intended (a plain status read/page
+            # load): a `WORKER_ARCHIVED` result in that case is
+            # reported exactly as before this fix -- the run is
+            # returned unchanged, with no `worker_archived` reason
+            # surfaced -- never treated as a refusal of something that
+            # was never attempted. Only when `adapter is not None` does
+            # `WORKER_ARCHIVED` become the returned refusal reason.
+            claim = self._claim_for_execution(run_id)
+            if claim.outcome == ClaimOutcome.NOT_READY:
+                return self._to_result(RunnerRepo(self._control_conn).get(run_id))
+            if claim.outcome == ClaimOutcome.WORKER_ARCHIVED:
+                if adapter is not None:
+                    return self._to_result(run, reason_override="worker_archived")
                 return self._to_result(RunnerRepo(self._control_conn).get(run_id))
             self._audit(run_id, EventType.RUN_RESUMED, {"from_status": run.status})
-            return self._proceed_to_execution(claimed, adapter, cloud_escalation)
+            return self._proceed_to_execution(claim.run, adapter, cloud_escalation)
 
         if run.status == RunStatus.RUNNING.value:
             if adapter is not None and self._worker_archived(run.worker_id):
@@ -669,10 +737,12 @@ class LocalWorkerRunner:
             )
         if adapter is None:
             return self._to_result(updated)
-        claimed = self._claim_for_execution(run.run_id)
-        if claimed is None:
+        claim = self._claim_for_execution(run.run_id)
+        if claim.outcome == ClaimOutcome.NOT_READY:
             return self._to_result(RunnerRepo(self._control_conn).get(run.run_id))
-        return self._proceed_to_execution(claimed, adapter, cloud_escalation)
+        if claim.outcome == ClaimOutcome.WORKER_ARCHIVED:
+            return self._to_result(updated, reason_override="worker_archived")
+        return self._proceed_to_execution(claim.run, adapter, cloud_escalation)
 
     def _load_durable_human_resolutions(self, run_id: str) -> tuple[_HumanResolution, ...]:
         """Every distinct ambiguity this run has a durable human/
@@ -823,19 +893,36 @@ class LocalWorkerRunner:
 
     # -- concurrency-safe claim ---------------------------------------------
 
-    def _claim_for_execution(self, run_id: str) -> RunnerRun | None:
+    def _claim_for_execution(self, run_id: str) -> ClaimResult:
         """Atomically transition `READY -> RUNNING` inside one `BEGIN
-        IMMEDIATE` transaction. `None` if the run was not (or no longer)
-        `READY` — a concurrent caller already claimed it, or it moved on
-        its own. RUNNING recovery additionally requires a fresh Phase-6
-        lease epoch; it must never reconstruct the active owner's handle."""
+        IMMEDIATE` transaction -- the ONE place this codebase actually
+        commits to worker execution, so it is also the ONE place the
+        H.3 worker-lifecycle gate must be authoritative (H.3 review
+        finding): a caller-side `adapter is not None` pre-check
+        performed before this method is never atomic with a concurrent
+        `archive_worker()` transaction, so it cannot by itself prevent
+        the claim below from crossing an archive that lands in the
+        gap. This transaction instead reloads BOTH the run and its
+        worker and checks, in order: the run still exists and is still
+        `READY` (a concurrent caller may already have claimed it, or it
+        moved on its own) — `NOT_READY` otherwise; then the worker still
+        exists and is `ACTIVE` — `WORKER_ARCHIVED` otherwise, with
+        NOTHING written (no claim, no audit event). Only once both hold
+        does the `READY -> RUNNING` write happen, in the SAME commit as
+        both checks. RUNNING recovery additionally requires a fresh
+        Phase-6 lease epoch; it must never reconstruct the active
+        owner's handle."""
         with transaction(self._control_conn):
             current = RunnerRepo(self._control_conn).get_or_none(run_id)
             if current is None or current.status != RunStatus.READY.value:
-                return None
-            return RunnerRepo(self._control_conn).update_in_transaction(
+                return ClaimResult(ClaimOutcome.NOT_READY)
+            worker = WorkersRepo(self._control_conn).get(current.worker_id)
+            if worker is None or worker.lifecycle_state != "ACTIVE":
+                return ClaimResult(ClaimOutcome.WORKER_ARCHIVED)
+            claimed = RunnerRepo(self._control_conn).update_in_transaction(
                 run_id, updated_at=utcnow_iso(), status=RunStatus.RUNNING.value,
             )
+            return ClaimResult(ClaimOutcome.CLAIMED, claimed)
 
     # -- execution plane ----------------------------------------------------
 

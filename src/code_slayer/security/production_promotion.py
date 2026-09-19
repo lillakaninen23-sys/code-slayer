@@ -537,6 +537,19 @@ def promote_baseline_security_to_production(
     # the OTHER concurrent request just committed, never treated as an
     # unexplained error.
     try:
+        # H.3 review finding: `require_active_worker=True` rechecks
+        # PRODUCTION lifecycle ACTIVE atomically, inside the SAME
+        # `BEGIN IMMEDIATE` transaction that records this PRODUCTION
+        # certificate -- closing the gap between the promotion checks
+        # above (including this function's own re-probes/re-reads) and
+        # the write itself. If archive wins before this transaction,
+        # promotion refuses `worker_archived` below; if this transaction
+        # wins first, archive may subsequently succeed and the
+        # certificate remains historical/current evidence, with
+        # eligibility becoming `worker_archived` from that point on --
+        # a deterministic, acceptable ordering (see the module
+        # docstring for why true cross-request atomicity is only needed
+        # at this one boundary, not earlier).
         recorded = record_baseline_certificate(
             production_conn,
             worker_id=worker_id,
@@ -547,6 +560,7 @@ def promote_baseline_security_to_production(
             hard_disqualifiers=(),
             now_fn=now_fn,
             promoted_from_validation_certificate_id=certificate.certificate_id,
+            require_active_worker=True,
         )
     except sqlite3.IntegrityError:
         winner = BaselineSecurityCertificatesRepo(

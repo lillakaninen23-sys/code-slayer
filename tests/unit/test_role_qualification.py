@@ -18,6 +18,7 @@ import pytest
 from code_slayer.audit.verify import verify_chain
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker
 from code_slayer.workers.promotion import promote_from_conformance
 from code_slayer.workers.role_qualification import (
     ProductionRole,
@@ -144,6 +145,48 @@ def test_certificate_for_unregistered_worker_is_refused(db_conn, profile):
     assert RoleCertificatesRepo(db_conn).list_for_worker_role(
         "never-registered", ProductionRole.PLANNER.value,
     ) == []
+
+
+# -- require_active_worker (H.3 review finding) ------------------------------
+
+
+def test_require_active_worker_denies_archived_worker_and_writes_nothing(
+    db_conn, registered_worker, profile,
+):
+    archived = archive_worker(db_conn, worker_id=registered_worker)
+    assert archived.ok and archived.changed
+
+    result = record_role_certificate(
+        db_conn, worker_id=registered_worker, role=ProductionRole.PLANNER,
+        runtime_profile=profile, policy_version="v1", outcome=RoleQualificationOutcome.PASS,
+        classification="PASS_FIRST_TRY", evidence_ref="ev", reason="ok",
+        require_active_worker=True,
+    )
+    assert result == RoleCertificationResult(False, "worker_archived")
+    assert RoleCertificatesRepo(db_conn).list_for_worker_role(
+        registered_worker, ProductionRole.PLANNER.value,
+    ) == []
+
+
+def test_require_active_worker_allows_active_worker(db_conn, registered_worker, profile):
+    result = record_role_certificate(
+        db_conn, worker_id=registered_worker, role=ProductionRole.PLANNER,
+        runtime_profile=profile, policy_version="v1", outcome=RoleQualificationOutcome.PASS,
+        classification="PASS_FIRST_TRY", evidence_ref="ev", reason="ok",
+        require_active_worker=True,
+    )
+    assert result.ok
+
+
+def test_require_active_worker_defaults_false_and_is_unaffected_by_archive(
+    db_conn, registered_worker, profile,
+):
+    archive_worker(db_conn, worker_id=registered_worker)
+    result = _record(
+        db_conn, registered_worker, ProductionRole.PLANNER, profile,
+        RoleQualificationOutcome.PASS,
+    )
+    assert result.ok
 
 
 # -- append-only schema -------------------------------------------------
