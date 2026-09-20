@@ -204,3 +204,39 @@ class EventType(StrEnum):
     # to attribute it to (see JOB_WORKTREE_CREATED above).
     WORKER_ARCHIVED = "WORKER_ARCHIVED"
     WORKER_REACTIVATED = "WORKER_REACTIVATED"
+    # Autonomous Engineering Loop V1: an independent Security-role verdict
+    # on a coding job's final diff/command-history/dependency changes
+    # (`code_slayer.coding.security_gate`) -- a SEPARATE dimension from
+    # SECURITY_BASELINE_CERTIFICATE_RECORDED (the mandatory, role-
+    # independent worker floor) and ROLE_QUALIFICATION_CERTIFICATE_RECORDED
+    # (Planner-style role certification): this is a per-job code-change
+    # review, never a worker/model certificate, and never itself grants or
+    # revokes either. Covers PASS/FAIL/HUMAN_REQUIRED alike via its own
+    # payload fields; never a worker/model's own self-report.
+    CODING_SECURITY_REVIEW_DECIDED = "CODING_SECURITY_REVIEW_DECIDED"
+    # A Coder/Repairer turn's actual, git-verified working-tree changes
+    # included at least one path outside the job's authorized scope
+    # (`code_slayer.coding.mutation_guard`) -- fails the job closed and is
+    # itself persisted evidence, never silently discarded/"cleaned up"
+    # then reported as an ordinary success.
+    CODING_UNAUTHORIZED_MUTATION_DETECTED = "CODING_UNAUTHORIZED_MUTATION_DETECTED"
+    # A new `coding_jobs` identity row was durably created
+    # (`code_slayer.coding.pipeline.run_coding_job()`) -- always recorded
+    # with `task_id=None` (like JOB_WORKTREE_CREATED above): the
+    # coding-job identity row is written to the CONTROL-PLANE connection,
+    # which has no `tasks` row for the job yet (that comes later, in a
+    # separate execution-plane database once workspace preflight
+    # succeeds) -- `audit_events.task_id` has a real foreign key to
+    # `tasks`, so this is never attributed to a task_id.
+    CODING_JOB_CREATED = "CODING_JOB_CREATED"
+    # A coding job durably reached a state with a real, recorded reason
+    # -- generic, job-level "why" evidence (`code_slayer.coding.pipeline.
+    # _set_state()`), covering every terminal/blocking outcome uniformly
+    # (workspace/lease/diff failures, unauthorized mutation, stale
+    # candidate evidence, repair exhaustion, security block,
+    # READY_FOR_HUMAN_MERGE) rather than requiring each call site to
+    # separately remember to emit its own event. Always recorded with
+    # `task_id=None`, same as CODING_JOB_CREATED above, and always
+    # alongside a durable `coding_jobs.final_reason` write -- never the
+    # only place this reason is recorded.
+    CODING_JOB_TERMINATED = "CODING_JOB_TERMINATED"

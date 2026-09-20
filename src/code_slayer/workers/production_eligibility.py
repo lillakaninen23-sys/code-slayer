@@ -149,14 +149,22 @@ this package must not import (`workers` sits below `planning` in this
 codebase's dependency direction), so the caller — which already knows
 which role it is asking about — supplies the current version for it.
 
+## Engineering roles (ROLE-CERTIFICATION-V1)
+
+For CODER / REVIEWER / REPAIRER / SECURITY, a passing certificate pair
+additionally requires `blobs_dir`: both evidence documents are reread,
+bindings and outcomes are checked, and evaluation/issuance timestamps
+must be ordered and less than 30 days old. No evidence-store argument
+means no engineering production eligibility. Planner historical behavior
+and evidence readers are unchanged. `coding.routing` selects engineering
+workers from current approved configuration and revalidates at execution.
+
 ## Not yet implemented (disclosed gaps)
 
 This module does not itself select, rank, or route to any worker — it
 only answers a single yes/no eligibility question for one already-named
-`(worker_id, role, runtime_profile)`. A real router, and a registry that
-maps each `ProductionRole` to its own current policy version
-automatically (so a caller need not already know it), remain future
-work.
+`(worker_id, role, runtime_profile)`. Measured comparative strength ranking remains future work; the
+Planner and engineering routers fail closed on ambiguous eligible sets.
 """
 
 from __future__ import annotations
@@ -167,8 +175,14 @@ from dataclasses import dataclass
 from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
 )
+from code_slayer.store.db import utcnow_iso
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
+from code_slayer.workers.engineering_roles import (
+    ENGINEERING_ROLES,
+    RoleEvidenceError,
+    verify_engineering_certificates,
+)
 from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleEvaluationIdentity,
@@ -248,6 +262,8 @@ def evaluate_production_eligibility(
     runtime_profile: RuntimeProfileIdentity,
     role_evaluation: RoleEvaluationIdentity,
     expected_role_policy_version: str,
+    blobs_dir=None,
+    now_fn=utcnow_iso,
 ) -> EligibilityDecision:
     """The one production-eligibility gate a future router should query
     instead of deciding trust/qualification/security for itself. See the
@@ -307,10 +323,15 @@ def evaluate_production_eligibility(
     security_certificates = BaselineSecurityCertificatesRepo(conn).list_for_worker(worker_id)
     if not security_certificates:
         return _deny("no_baseline_security_certificate")
-    security_certificate = _matching_security_certificate(
-        security_certificates,
-        runtime_profile,
-    )
+    try:
+        security_certificate = _matching_security_certificate(
+            security_certificates,
+            runtime_profile,
+        )
+    except (TypeError, ValueError):
+        if role not in ENGINEERING_ROLES:
+            raise
+        return _deny("malformed_baseline_security_certificate")
     if security_certificate is None:
         return _deny("baseline_security_certificate_profile_mismatch")
     if security_certificate.baseline_version != BASELINE_VERSION:
@@ -339,11 +360,16 @@ def evaluate_production_eligibility(
             "no_role_certificate",
             security_certificate_id=security_certificate.certificate_id,
         )
-    role_certificate = _matching_role_certificate(
-        role_certificates,
-        runtime_profile,
-        role_evaluation,
-    )
+    try:
+        role_certificate = _matching_role_certificate(
+            role_certificates,
+            runtime_profile,
+            role_evaluation,
+        )
+    except (TypeError, ValueError):
+        if role not in ENGINEERING_ROLES:
+            raise
+        return _deny("malformed_role_certificate")
     if role_certificate is None:
         # Distinguish common-runtime mismatch from evaluation-profile
         # mismatch so a Planner budget change cannot be confused with a
@@ -370,6 +396,17 @@ def evaluate_production_eligibility(
             security_certificate_id=security_certificate.certificate_id,
             role_certificate_id=role_certificate.certificate_id,
         )
+
+    if role in ENGINEERING_ROLES:
+        try:
+            verify_engineering_certificates(
+                conn, blobs_dir, role_certificate, security_certificate, now_fn(),
+            )
+        except RoleEvidenceError as exc:
+            return _deny(
+                exc.reason, security_certificate_id=security_certificate.certificate_id,
+                role_certificate_id=role_certificate.certificate_id,
+            )
 
     return EligibilityDecision(
         True,

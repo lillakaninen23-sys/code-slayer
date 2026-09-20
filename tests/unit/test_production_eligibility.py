@@ -582,6 +582,8 @@ def test_evaluate_production_eligibility_accepts_no_role_verdict_parameter():
         "runtime_profile",
         "role_evaluation",
         "expected_role_policy_version",
+        "blobs_dir",
+        "now_fn",
     }
 
 
