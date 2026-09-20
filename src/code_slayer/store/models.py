@@ -516,3 +516,37 @@ class CertificationRunRow:
     owner_pid: int | None
     owner_pid_started_at: str | None
     owner_generation: int
+
+
+@dataclass(frozen=True)
+class CodingJobRow:
+    """One durable Autonomous Engineering Loop job record
+    (`store.migrations.0021_coding_jobs`) -- `code_slayer.coding.
+    jobs_repo.CodingJobsRepo`'s own row shape. Mirrors `PlanningJobRow`'s
+    "identity locked at creation, lifecycle/outcome fields evolve" split;
+    see that migration's module comment for why rich per-attempt evidence
+    (review/security findings, tool calls, repair reasoning) lives in
+    `audit_events` (addressable via `task_id`) rather than duplicated
+    here. `state` is `code_slayer.coding.pipeline_types.CodingJobState`'s
+    own string vocabulary."""
+
+    job_id: str
+    plan_id: str
+    repo_id: str
+    primary_worktree_id: str
+    created_at: str
+    updated_at: str
+    original_prompt_hash: str
+    base_revision: str
+    max_repair_attempts: int
+    state: str
+    execution_worktree_id: str | None
+    job_worktree_path: str | None
+    task_id: str | None
+    repair_attempts: int
+    review_verdict: str | None
+    review_evidence_ref: str | None
+    security_verdict: str | None
+    security_evidence_ref: str | None
+    final_reason: str | None
+    finished_at: str | None
