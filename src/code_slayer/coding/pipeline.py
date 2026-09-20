@@ -546,7 +546,9 @@ def run_coding_job(
                 CodingJobState.HUMAN_REQUIRED if security.verdict == SecurityVerdict.HUMAN_REQUIRED
                 else CodingJobState.BLOCKED
             )
-            LeaseManager(exec_conn).release(lease)
+            _best_effort_fail_task(
+                exec_conn, machine, job_id, TaskState.READY_FOR_CHECKPOINT, lease,
+            )
             lease = None
             _set_state(
                 control_conn, job_id, final_job_state, reason=f"security:{security.verdict.value}",
@@ -574,7 +576,9 @@ def run_coding_job(
         current_fingerprint = diff_fingerprint(recheck_diff)
         identity_check = verify_candidate_identity(review, security, current_fingerprint)
         if not identity_check.ok:
-            LeaseManager(exec_conn).release(lease)
+            _best_effort_fail_task(
+                exec_conn, machine, job_id, TaskState.READY_FOR_CHECKPOINT, lease,
+            )
             lease = None
             _set_state(
                 control_conn, job_id, CodingJobState.BLOCKED, reason=identity_check.reason,
@@ -603,8 +607,6 @@ def run_coding_job(
         completion_result = None
         if checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED:
             completion_result = advance_checkpointed_completion(exec_conn, job_id, lease)
-        LeaseManager(exec_conn).release(lease)
-        lease = None
 
         checkpoint_ok = checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED
         completion_ok = (
@@ -619,6 +621,20 @@ def run_coding_job(
                 f"completion_not_confirmed:{completion_result.outcome.value}:"
                 f"{completion_result.reason}"
             )
+            # Not yet released above (unlike every other failure branch in
+            # this function): the lease is still needed here to attempt
+            # the cleanup transition below. `checkpoint_ok=False` means
+            # the task is still at READY_FOR_CHECKPOINT (checkpoint
+            # creation never succeeded); `checkpoint_ok=True` (only
+            # completion failed) means it already really did advance to
+            # CHECKPOINTED -- a real, durable checkpoint exists, but the
+            # task itself is still failed closed here, matching this
+            # function's own established FAILED-on-terminal-block pattern.
+            stuck_at = (
+                TaskState.READY_FOR_CHECKPOINT if not checkpoint_ok else TaskState.CHECKPOINTED
+            )
+            _best_effort_fail_task(exec_conn, machine, job_id, stuck_at, lease)
+            lease = None
             _set_state(
                 control_conn, job_id, CodingJobState.BLOCKED, reason=reason,
                 finished_at=utcnow_iso(), security_verdict=security.verdict.value,
@@ -630,6 +646,8 @@ def run_coding_job(
                 repair_attempts=repair_attempts,
             )
 
+        LeaseManager(exec_conn).release(lease)
+        lease = None
         _set_state(
             control_conn, job_id, CodingJobState.READY_FOR_HUMAN_MERGE,
             reason="security_pass_checkpoint_and_completion_confirmed",
@@ -654,3 +672,42 @@ def _failed_request(from_state: TaskState = TaskState.IMPLEMENTING):
         expected_state=from_state, to_state=TaskState.FAILED,
         reason="coding_pipeline_failure", failure_decision=True,
     )
+
+
+def _best_effort_fail_task(
+    exec_conn: sqlite3.Connection, machine: TaskStateMachine, job_id: str,
+    expected_state: TaskState, lease,
+) -> None:
+    """Transition the underlying task to `FAILED` after a terminal
+    BLOCKED/HUMAN_REQUIRED coding-job outcome that `finalization.service.
+    Finalizer` itself never records (Security FAIL/HUMAN_REQUIRED, a
+    candidate-identity mismatch, or a checkpoint/completion advance that
+    did not succeed) -- so it can never again be read, by anything that
+    consults `core.states.TaskState` alone (e.g. a future dispatcher or
+    admin tool), as still checkpoint-eligible. Without this, `coding_
+    jobs.state` correctly shows the block, but the execution-plane task
+    itself was left sitting at `READY_FOR_CHECKPOINT`/`CHECKPOINTED`
+    with no lease held -- inert today only because `finalization.
+    dispatcher.TaskLifecycleExecutor` is documented as scoped
+    exclusively to the PRIMARY repository's own control-plane database
+    and structurally cannot open a job worktree's separate one.
+
+    Best-effort and exception-contained, mirroring `finalization.
+    service._record_finalizer_failure()`'s own "never let this
+    containment attempt itself crash the caller" posture: if the task is
+    not actually in `expected_state` any more (a genuine anomaly this
+    function does not try to diagnose further), the transition is simply
+    skipped rather than raised -- `coding_jobs.state`, set by the caller
+    immediately after this returns, remains the authoritative record of
+    this outcome either way. Always releases `lease`, on every path."""
+    from code_slayer.core.transitions import StateMachineError
+
+    try:
+        with transaction(exec_conn):
+            machine.transition_in_transaction(
+                job_id, request=_failed_request(from_state=expected_state),
+                actor_id="coding-pipeline",
+            )
+            LeaseManager(exec_conn).release_in_transaction(lease)
+    except StateMachineError:
+        LeaseManager(exec_conn).release(lease)

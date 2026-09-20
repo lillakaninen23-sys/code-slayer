@@ -25,7 +25,12 @@ import pytest
 
 from code_slayer.coding.pipeline import CodingJobConfig, run_coding_job
 from code_slayer.coding.pipeline_types import CodingJobState
-from code_slayer.planning.models import EngineeringPlanContent, PlannedChange
+from code_slayer.planning.models import (
+    AffectedFile,
+    AffectedFileAction,
+    EngineeringPlanContent,
+    PlannedChange,
+)
 from code_slayer.planning.provenance import store_plan_content
 from code_slayer.repo import identity
 from code_slayer.store import location
@@ -59,6 +64,25 @@ class ScriptedAdapter:
         if not queue:
             raise WorkerAdapterError(f"no_scripted_response_for_role:{request.role}")
         return queue.pop(0)
+
+
+def _task_state(result) -> str:
+    """Independently read the underlying `tasks.state` for a finished
+    job's own execution-plane task -- opens the isolated job worktree's
+    own database directly (never trusts anything in-process), exactly
+    the "actual git/DB state is authoritative" discipline this whole
+    branch is built on."""
+    job_worktree = Path(result.job_worktree_path)
+    job_identity = identity.resolve(job_worktree)
+    exec_conn = connect(location.db_path(job_identity.repo_id, job_identity.worktree_id))
+    try:
+        row = exec_conn.execute(
+            "SELECT state FROM tasks WHERE task_id = ?", (result.task_id,),
+        ).fetchone()
+    finally:
+        exec_conn.close()
+    assert row is not None
+    return row["state"]
 
 
 def _working_tree_snapshot(root):
@@ -141,6 +165,18 @@ def _ready_plan(
         )
     content = EngineeringPlanContent(
         goal=goal, planned_changes=(PlannedChange(description="add hello doc", paths=paths),),
+        # The real, evidence-validated authorization source
+        # `coding.handoff.validate_mutation_scope()` now reads --
+        # `planned_changes[].paths` above is kept only as an unrelated,
+        # unvalidated field real Planner output also carries, never the
+        # scope-authorization source (see that function's own docstring).
+        affected_files=tuple(
+            AffectedFile(
+                path=path, action=AffectedFileAction.CREATE, reason="add hello doc",
+                exists_in_repository=False,
+            )
+            for path in paths
+        ),
     )
     blob = store_plan_content(ContentStore(conn, blobs_dir), content)
     with transaction(conn):
@@ -261,6 +297,11 @@ def test_security_fail_blocks_readiness_even_after_review_and_verification_pass(
     assert result.final_state == CodingJobState.BLOCKED
     assert result.security.verdict.value == "FAIL"
     assert "security:FAIL" in result.reason
+    # Fix 2 state-consistency: coding_jobs.state=BLOCKED cannot coexist
+    # with the underlying TaskState still sitting at READY_FOR_CHECKPOINT
+    # (checkpoint-eligible again via any future caller with a fresh
+    # lease) -- it must have been transitioned to FAILED too.
+    assert _task_state(result) == "FAILED"
 
 
 def test_reviewer_changes_required_drives_exactly_one_bounded_repair_round(
@@ -476,6 +517,11 @@ def test_checkpoint_not_created_never_reaches_ready_for_human_merge(
     ).fetchone()
     assert row["state"] == "BLOCKED"
     assert row["final_reason"] == result.reason
+    # Fix 2 state-consistency: the underlying task -- which never
+    # actually left READY_FOR_CHECKPOINT, since checkpoint creation was
+    # faked to be denied -- must have been transitioned to FAILED too,
+    # never left checkpoint-eligible.
+    assert _task_state(result) == "FAILED"
 
 
 def test_completion_not_confirmed_never_reaches_ready_for_human_merge(
@@ -503,6 +549,14 @@ def test_completion_not_confirmed_never_reaches_ready_for_human_merge(
     assert result.final_state == CodingJobState.BLOCKED, result.reason
     assert "completion_not_confirmed" in result.reason
     assert "DENIED" in result.reason
+    # Fix 2 state-consistency: the real checkpoint DID get created here
+    # (only completion was faked to fail), so the task actually reached
+    # CHECKPOINTED before this branch ran -- it must still have been
+    # transitioned onward to FAILED, never left sitting at CHECKPOINTED
+    # (which `finalization.dispatcher.TaskLifecycleExecutor` would
+    # otherwise treat as eligible for a bare completion retry with no
+    # awareness this job was ever blocked).
+    assert _task_state(result) == "FAILED"
 
 
 def test_matching_candidate_reaches_ready_for_human_merge(db_conn, tmp_path, ready_repo):
@@ -546,6 +600,10 @@ def test_stale_candidate_after_review_and_security_pass_blocks_readiness(
     assert result.final_state == CodingJobState.BLOCKED, result.reason
     assert "stale_evidence" in result.reason
     assert calls["n"] >= 3
+    # Fix 2 state-consistency: same requirement as the Security-FAIL case
+    # above -- a stale-candidate BLOCK must not leave the underlying task
+    # sitting at READY_FOR_CHECKPOINT.
+    assert _task_state(result) == "FAILED"
 
 
 def test_set_state_persists_final_reason_and_emits_a_terminated_audit_event(db_conn):
