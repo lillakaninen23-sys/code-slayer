@@ -536,6 +536,14 @@ def runtime_test_ollama_server(server_id):
 
 @api.post("/runtime/workers")
 def runtime_register_worker():
+    # H.4.1: output_token_budget/tool_choice_enforcement/planner_policy_version/
+    # planner_timeout_seconds are the same server-owned role/execution fields
+    # WorkerRuntimeConfig already persists -- optional here exactly like the
+    # other config fields below; omitted on an update means "preserve the
+    # worker's existing persisted value", never "reset to a dataclass
+    # default" (see AdminFacade.register_worker()). Never accepts
+    # digest/runtime-identity/certificate/outcome/evidence fields -- those
+    # remain out of this closed set entirely.
     data = json_object(
         {
             "worker_id": str,
@@ -547,6 +555,10 @@ def runtime_register_worker():
             "temperature": float,
             "normalizer_id": str,
             "normalizer_version": int,
+            "output_token_budget": int,
+            "tool_choice_enforcement": str,
+            "planner_policy_version": str,
+            "planner_timeout_seconds": float,
         },
         ("worker_id", "ollama_server_id", "model_tag"),
     )

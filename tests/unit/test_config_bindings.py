@@ -140,7 +140,7 @@ def test_planner_for_worker_uses_the_workers_configured_timeout_not_the_adapter_
         root = f"http://127.0.0.1:{httpd.server_port}"
         config = CSLRConfig(
             ollama_servers=(OllamaServerConfig(server_id="local", origin=root),),
-            workers=(_worker(worker_id="w1", planner_timeout_seconds=0.3),),
+            workers=(_worker(worker_id="w1", planner_timeout_seconds=1.0),),
         )
         planner = planner_for_worker(config, "w1", "job-1")
         start = time.monotonic()
@@ -180,7 +180,7 @@ def test_planner_for_worker_timeout_scales_with_configured_value():
         httpd.server_close()
         thread.join(timeout=5)
 
-    assert elapsed >= 1.4  # close to the configured 1.5s, never the short 0.3s above
+    assert elapsed >= 1.4  # close to the configured 1.5s, never the short 1.0s above
     assert elapsed < 5.0  # and still nowhere near the adapter's 30.0s default
     assert response.outcome == PlannerOutcome.MALFORMED
     assert response.failure_category == PlannerFailureCategory.TRANSPORT_ERROR

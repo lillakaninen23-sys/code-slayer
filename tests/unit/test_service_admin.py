@@ -493,6 +493,310 @@ def test_add_test_register_approve_identity(admin_app, runtime_server):
     assert any(item["worker_id"] == "w1" for item in workers)
 
 
+# -- H.4.1: register_worker() accepts + preserves role/execution config ------
+
+
+def test_register_worker_new_worker_uses_schema_defaults_for_omitted_role_execution_fields(
+    admin_app, runtime_server,
+):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={"worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+    assert response.status_code == 200
+    worker = next(w for w in response.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["output_token_budget"] == {"value": 4096, "source": "CONFIG_BOUND"}
+    assert worker["tool_choice_enforcement"] == {
+        "value": "ADVISORY_ONLY_UNVERIFIED", "source": "CONFIG_BOUND",
+    }
+    assert worker["planner_policy_version"] == {
+        "value": "planner-certification-v2", "source": "CONFIG_BOUND",
+    }
+    assert worker["planner_timeout_seconds"] == {"value": 30.0, "source": "CONFIG_BOUND"}
+
+
+def test_register_worker_accepts_explicit_planner_timeout_seconds(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 60.0,
+        },
+    )
+    assert response.status_code == 200
+    worker = next(w for w in response.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["planner_timeout_seconds"]["value"] == 60.0
+
+
+def test_register_worker_accepts_integer_json_value_for_planner_timeout_seconds(
+    admin_app, runtime_server,
+):
+    """json_object()'s float type already coerces a JSON integer -- proves
+    that holds end to end through register_worker()."""
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 60,
+        },
+    )
+    assert response.status_code == 200
+    worker = next(w for w in response.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["planner_timeout_seconds"]["value"] == 60.0
+
+
+@pytest.mark.parametrize("bad_value", [0.0, -1.0, 0.999, 1800.001, 5000.0])
+def test_register_worker_rejects_planner_timeout_seconds_out_of_range(
+    admin_app, runtime_server, bad_value,
+):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": bad_value,
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_config"
+
+
+def test_register_worker_rejects_bool_planner_timeout_seconds(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_input"
+
+
+def test_register_worker_rejects_string_planner_timeout_seconds(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": "60.0",
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_input"
+
+
+def test_register_worker_still_rejects_unknown_fields(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    response = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "runtime_identity_fingerprint": "abc",
+        },
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "invalid_fields"
+
+
+def test_register_worker_still_rejects_digest_and_identity_fields(admin_app, runtime_server):
+    """Regression: the larger accepted-field set must not accidentally
+    open a path for client-supplied identity/certificate claims."""
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    for bad_field, value in (
+        ("digest", "sha256:evil"),
+        ("approved_model_digest", "sha256:evil"),
+        ("runtime_identity_fingerprint", "abc"),
+        ("role_evaluation_fingerprint", "abc"),
+        ("certificate_id", "cert-1"),
+        ("outcome", "PASS"),
+        ("evidence_ref", "abc"),
+    ):
+        response = client.post(
+            "/api/runtime/workers",
+            json={
+                "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+                bad_field: value,
+            },
+        )
+        assert response.status_code == 400, bad_field
+        assert response.get_json()["error"]["code"] == "invalid_fields"
+
+
+def test_register_worker_update_preserves_every_omitted_field_at_non_default_values(
+    admin_app, runtime_server,
+):
+    """H.4.1 fix: an update that supplies only worker_id/ollama_server_id/
+    model_tag must preserve every other field's current persisted value
+    exactly -- never silently collapse back to a schema default."""
+    client, _app, config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    created = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "effective_context_tokens": 8192,
+            "temperature": 0.5,
+            "normalizer_id": "qwen_textual_tool_v1",
+            "normalizer_version": 1,
+            "output_token_budget": 2048,
+            "tool_choice_enforcement": "REQUIRED",
+            "planner_policy_version": "planner-certification-v2",
+            "planner_timeout_seconds": 90.0,
+        },
+    )
+    assert created.status_code == 200
+
+    updated = client.post(
+        "/api/runtime/workers",
+        json={"worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+    assert updated.status_code == 200
+    worker = next(w for w in updated.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["effective_context_tokens"]["value"] == 8192
+    assert worker["temperature"]["value"] == 0.5
+    assert worker["normalizer_id"]["value"] == "qwen_textual_tool_v1"
+    assert worker["normalizer_version"]["value"] == 1
+    assert worker["output_token_budget"]["value"] == 2048
+    assert worker["tool_choice_enforcement"]["value"] == "REQUIRED"
+    assert worker["planner_policy_version"]["value"] == "planner-certification-v2"
+    assert worker["planner_timeout_seconds"]["value"] == 90.0
+
+    loaded = load_config(path=config)
+    saved = loaded.worker_by_id("w1")
+    assert saved.effective_context_tokens == 8192
+    assert saved.temperature == 0.5
+    assert saved.normalizer_id == "qwen_textual_tool_v1"
+    assert saved.normalizer_version == 1
+    assert saved.output_token_budget == 2048
+    assert saved.tool_choice_enforcement == "REQUIRED"
+    assert saved.planner_policy_version == "planner-certification-v2"
+    assert saved.planner_timeout_seconds == 90.0
+
+
+def test_register_worker_update_changing_one_field_preserves_the_rest(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "output_token_budget": 2048, "tool_choice_enforcement": "REQUIRED",
+            "planner_timeout_seconds": 90.0,
+        },
+    )
+    updated = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 60.0,
+        },
+    )
+    assert updated.status_code == 200
+    worker = next(w for w in updated.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["planner_timeout_seconds"]["value"] == 60.0
+    assert worker["output_token_budget"]["value"] == 2048
+    assert worker["tool_choice_enforcement"]["value"] == "REQUIRED"
+
+
+def test_register_worker_timeout_60_survives_a_later_unrelated_update(admin_app, runtime_server):
+    """The exact H.4.1 identity-stability scenario: a worker configured at
+    planner_timeout_seconds=60.0 must never regress to the 30.0 schema
+    default merely because a LATER, unrelated update omits the field."""
+    client, _app, config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 60.0,
+        },
+    )
+    later = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "temperature": 0.1,
+        },
+    )
+    assert later.status_code == 200
+    worker = next(w for w in later.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["planner_timeout_seconds"]["value"] == 60.0
+    assert worker["temperature"]["value"] == 0.1
+    loaded = load_config(path=config)
+    assert loaded.worker_by_id("w1").planner_timeout_seconds == 60.0
+
+
+def test_register_worker_update_never_erases_approved_identity(admin_app, runtime_server):
+    client, _app, config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    client.post(
+        "/api/runtime/workers",
+        json={"worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+    approved = client.post("/api/runtime/workers/w1/approve", json={})
+    assert approved.status_code == 200
+
+    updated = client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 45.0,
+        },
+    )
+    assert updated.status_code == 200
+    worker = next(w for w in updated.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["identity_approved"] is True
+    assert worker["approved_model_digest"]["value"] == "sha256:abc"
+    loaded = load_config(path=config)
+    assert loaded.worker_by_id("w1").approved_model_digest == "sha256:abc"
+    assert loaded.worker_by_id("w1").planner_timeout_seconds == 45.0
+
+
+def test_runtime_projection_exposes_planner_role_execution_config(admin_app, runtime_server):
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    client.post(
+        "/api/runtime/workers",
+        json={
+            "worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1",
+            "planner_timeout_seconds": 45.0,
+        },
+    )
+    response = client.get("/api/runtime")
+    assert response.status_code == 200
+    worker = next(w for w in response.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["planner_timeout_seconds"] == {"value": 45.0, "source": "CONFIG_BOUND"}
+    assert worker["output_token_budget"]["source"] == "CONFIG_BOUND"
+    assert worker["tool_choice_enforcement"]["source"] == "CONFIG_BOUND"
+    assert worker["planner_policy_version"]["source"] == "CONFIG_BOUND"
+
+
 # -- H.3: archive/reactivate admin routes ------------------------------------
 
 

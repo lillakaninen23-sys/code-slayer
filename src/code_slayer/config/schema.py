@@ -174,6 +174,34 @@ class WorkerRuntimeConfig:
             raise ConfigError(
                 "approved_model_digest and approved_runtime_version must both be set or both empty"
             )
+        # H.4.1 admin-API extension: these four role/execution fields were
+        # previously validated only inside from_mapping() (the TOML-parsing
+        # path) -- moved here so every constructor (including a direct
+        # WorkerRuntimeConfig(...) call from api.admin.AdminFacade.
+        # register_worker()) enforces the same bounds, never a second,
+        # divergent validation path.
+        if isinstance(self.output_token_budget, bool) or not isinstance(
+            self.output_token_budget, int,
+        ):
+            raise ConfigError("worker.output_token_budget must be an integer")
+        if not 1 <= self.output_token_budget <= 1_000_000:
+            raise ConfigError("worker.output_token_budget is out of range")
+        if (
+            not isinstance(self.tool_choice_enforcement, str)
+            or not self.tool_choice_enforcement.strip()
+        ):
+            raise ConfigError("worker.tool_choice_enforcement must be a non-empty string")
+        if (
+            not isinstance(self.planner_policy_version, str)
+            or not self.planner_policy_version.strip()
+        ):
+            raise ConfigError("worker.planner_policy_version must be a non-empty string")
+        if isinstance(self.planner_timeout_seconds, bool) or not isinstance(
+            self.planner_timeout_seconds, (int, float),
+        ):
+            raise ConfigError("worker.planner_timeout_seconds must be a number")
+        if not 1.0 <= float(self.planner_timeout_seconds) <= 1800.0:
+            raise ConfigError("worker.planner_timeout_seconds is out of range")
 
     @property
     def identity_approved(self) -> bool:

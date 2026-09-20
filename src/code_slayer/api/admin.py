@@ -159,6 +159,23 @@ class AdminFacade:
                 "normalizer_version": {
                     "value": worker.normalizer_version, "source": "CONFIG_BOUND",
                 },
+                # H.4.1: server-owned role/execution config, observational
+                # only -- lets an operator verify what they just saved
+                # through register_worker(). Never live-inferred/certified
+                # here; a live Planner turn/certification run is the only
+                # thing that ever proves these were actually enforced.
+                "output_token_budget": {
+                    "value": worker.output_token_budget, "source": "CONFIG_BOUND",
+                },
+                "tool_choice_enforcement": {
+                    "value": worker.tool_choice_enforcement, "source": "CONFIG_BOUND",
+                },
+                "planner_policy_version": {
+                    "value": worker.planner_policy_version, "source": "CONFIG_BOUND",
+                },
+                "planner_timeout_seconds": {
+                    "value": worker.planner_timeout_seconds, "source": "CONFIG_BOUND",
+                },
                 "identity_approved": worker.identity_approved,
                 "attestation": attestation,
                 **self._lifecycle_view(worker.worker_id),
@@ -277,12 +294,52 @@ class AdminFacade:
         }
 
     def register_worker(self, data: dict) -> dict:
+        """Register a NEW worker, or update an EXISTING one, through the
+        one supported admin path. For a NEW worker, any optional field
+        `data` omits uses `WorkerRuntimeConfig`'s own schema default. For
+        an EXISTING worker, any optional field `data` omits PRESERVES that
+        worker's current persisted value -- it is never silently reset to
+        a dataclass default (H.4.1 fix: `planner_timeout_seconds`/
+        `output_token_budget`/`tool_choice_enforcement`/`planner_policy_
+        version` -- and, for consistency, `effective_context_tokens`/
+        `temperature`/`normalizer_id`/`normalizer_version` -- previously
+        collapsed to their defaults on every re-registration, which is
+        exactly how the earlier v1->v2 planner_policy_version alignment
+        only worked by coincidence, since every other live value already
+        happened to equal its default).
+
+        `approved_model_digest`/`approved_runtime_version` are never
+        client-suppliable here (the closed-set route spec has no such
+        keys) and are always carried forward from the existing worker,
+        unchanged -- runtime identity approval remains exclusively
+        `approve_worker_identity()`'s own job.
+
+        Distinguishing "field omitted" (preserve) from an explicit
+        request to clear `normalizer_id`/`normalizer_version` is not
+        needed here: the closed-set route spec types both as plain
+        `str`/`int`, so JSON `null` (or an empty string) for either was
+        already rejected before reaching this method, both before and
+        after this change -- there has never been a supported way to
+        submit an explicit "clear normalizer" request distinct from
+        omitting the keys, so preserving on omission introduces no new
+        ambiguity."""
         cfg = self._app.persistent_config()
         if cfg.server_by_id(data["ollama_server_id"]) is None:
             raise APIError("not_found", "Ollama server is not configured.", 404)
         existing = cfg.worker_by_id(data["worker_id"])
         digest = existing.approved_model_digest if existing else None
         version = existing.approved_runtime_version if existing else None
+
+        def _optional(key: str, default):
+            """`data[key]` if the caller supplied it; otherwise the
+            EXISTING worker's own current value when updating, or
+            `default` (the schema default) when registering new."""
+            if key in data:
+                return data[key]
+            if existing is not None:
+                return getattr(existing, key)
+            return default
+
         try:
             worker = WorkerRuntimeConfig(
                 worker_id=data["worker_id"],
@@ -292,14 +349,18 @@ class AdminFacade:
                 model_tag=data["model_tag"],
                 approved_model_digest=digest,
                 approved_runtime_version=version,
-                effective_context_tokens=int(data.get("effective_context_tokens", 16384)),
-                temperature=float(data.get("temperature", 0.0)),
-                normalizer_id=data.get("normalizer_id") or None,
-                normalizer_version=(
-                    int(data["normalizer_version"])
-                    if data.get("normalizer_version") is not None
-                    else None
+                effective_context_tokens=_optional("effective_context_tokens", 16384),
+                temperature=_optional("temperature", 0.0),
+                normalizer_id=_optional("normalizer_id", None),
+                normalizer_version=_optional("normalizer_version", None),
+                output_token_budget=_optional("output_token_budget", 4096),
+                tool_choice_enforcement=_optional(
+                    "tool_choice_enforcement", "ADVISORY_ONLY_UNVERIFIED",
                 ),
+                planner_policy_version=_optional(
+                    "planner_policy_version", "planner-certification-v2",
+                ),
+                planner_timeout_seconds=_optional("planner_timeout_seconds", 30.0),
             )
         except ConfigError as exc:
             raise APIError("invalid_config", str(exc), 400) from None
