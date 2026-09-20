@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from code_slayer.coding.handoff import validate_planner_handoff
+from code_slayer.coding.handoff import validate_mutation_scope, validate_planner_handoff
 from code_slayer.coding.pipeline_types import PipelineContractError
 from code_slayer.planning.models import EngineeringPlanContent, PlannedChange
 from code_slayer.planning.provenance import store_plan_content
@@ -123,3 +123,56 @@ def test_ready_plan_with_no_planned_changes_is_rejected(db_conn, blobs_dir):
 def test_not_a_plan_row_is_rejected(db_conn, blobs_dir):
     with pytest.raises(PipelineContractError, match="insufficient_coder_scope:not_a_plan_row"):
         validate_planner_handoff(db_conn, blobs_dir, {"state": "READY"})
+
+
+def _content(*paths_per_change: tuple[str, ...]) -> EngineeringPlanContent:
+    return EngineeringPlanContent(
+        goal="do it",
+        planned_changes=tuple(
+            PlannedChange(description=f"change {i}", paths=paths)
+            for i, paths in enumerate(paths_per_change)
+        ),
+    )
+
+
+def test_validate_mutation_scope_accepts_exact_planner_authorized_paths():
+    content = _content(("src/foo.py",), ("tests/test_foo.py",))
+    validate_mutation_scope(content, ("src/foo.py", "tests/test_foo.py"))  # no raise
+
+
+def test_validate_mutation_scope_accepts_a_narrower_subset():
+    """Planner approves src/foo.py and tests/test_foo.py; caller supplies
+    only src/foo.py -- an acceptable narrower scope."""
+    content = _content(("src/foo.py",), ("tests/test_foo.py",))
+    validate_mutation_scope(content, ("src/foo.py",))  # no raise
+
+
+def test_validate_mutation_scope_rejects_a_broader_prefix():
+    """Planner approves src/foo.py; caller supplies ('.',) -- reject
+    fail-closed, exactly this fix's own worked example."""
+    content = _content(("src/foo.py",),)
+    with pytest.raises(
+        PipelineContractError, match="insufficient_coder_scope:scope_exceeds_planner_authorization",
+    ):
+        validate_mutation_scope(content, (".",))
+
+
+def test_validate_mutation_scope_rejects_any_path_not_planner_authorized():
+    content = _content(("src/foo.py",),)
+    with pytest.raises(
+        PipelineContractError, match="insufficient_coder_scope:scope_exceeds_planner_authorization",
+    ):
+        validate_mutation_scope(content, ("src/foo.py", "src/bar.py"))
+
+
+def test_validate_mutation_scope_fails_closed_when_plan_names_no_paths_at_all():
+    """A READY plan can have non-empty `planned_changes` whose entries
+    never named an explicit path (`PlannedChange.paths` defaults to
+    `()`) -- with no safe path authorization to derive scope from, EVERY
+    request must fail closed, never silently accepted as "no
+    restriction"."""
+    content = _content((), ())
+    with pytest.raises(
+        PipelineContractError, match="insufficient_coder_scope:scope_exceeds_planner_authorization",
+    ):
+        validate_mutation_scope(content, ("anything.py",))

@@ -1,6 +1,7 @@
 """`coding.pipeline_types`: closed-field model-facing parsers (mirroring
 `coding.contracts.parse_coder_model_result()`'s exact fail-closed
-posture) and the pure verdict-blocking gates.
+posture), the pure verdict-blocking gates, and the candidate-identity
+staleness check.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from code_slayer.coding.pipeline_types import (
     parse_security_model_result,
     review_blocks_progress,
     security_blocks_progress,
+    verify_candidate_identity,
 )
 
 
@@ -93,3 +95,46 @@ def test_diff_fingerprint_is_deterministic_and_content_sensitive():
     c = diff_fingerprint("diff --git a b\n+goodbye\n")
     assert a == b
     assert a != c
+
+
+def _review(fp: str) -> ReviewResult:
+    return ReviewResult(ReviewVerdict.PASS, "looks fine", (), fp)
+
+
+def _security(fp: str) -> SecurityResult:
+    return SecurityResult(SecurityVerdict.PASS, "no issues", (), fp)
+
+
+def test_verify_candidate_identity_passes_when_all_three_fingerprints_match():
+    fp = diff_fingerprint("candidate A")
+    result = verify_candidate_identity(_review(fp), _security(fp), fp)
+    assert result.ok
+    assert result.reason == "candidate_identity_confirmed"
+
+
+def test_verify_candidate_identity_fails_closed_when_review_is_stale():
+    """candidate A -> Reviewer PASS(A) -> candidate changes to B ->
+    Reviewer PASS(A) cannot authorize B."""
+    fp_a = diff_fingerprint("candidate A")
+    fp_b = diff_fingerprint("candidate B")
+    result = verify_candidate_identity(_review(fp_a), _security(fp_b), fp_b)
+    assert not result.ok
+    assert "stale_evidence:review_fingerprint_mismatch" in result.reason
+
+
+def test_verify_candidate_identity_fails_closed_when_security_is_stale():
+    """candidate A -> Security PASS(A) -> candidate changes to B ->
+    Security PASS(A) cannot authorize B."""
+    fp_a = diff_fingerprint("candidate A")
+    fp_b = diff_fingerprint("candidate B")
+    result = verify_candidate_identity(_review(fp_b), _security(fp_a), fp_b)
+    assert not result.ok
+    assert "stale_evidence:security_fingerprint_mismatch" in result.reason
+
+
+def test_verify_candidate_identity_fails_closed_on_missing_current_fingerprint():
+    fp = diff_fingerprint("candidate A")
+    for bad in (None, "", 123):
+        result = verify_candidate_identity(_review(fp), _security(fp), bad)
+        assert not result.ok
+        assert result.reason == "stale_evidence:missing_current_fingerprint"

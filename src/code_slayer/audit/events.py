@@ -229,3 +229,14 @@ class EventType(StrEnum):
     # succeeds) -- `audit_events.task_id` has a real foreign key to
     # `tasks`, so this is never attributed to a task_id.
     CODING_JOB_CREATED = "CODING_JOB_CREATED"
+    # A coding job durably reached a state with a real, recorded reason
+    # -- generic, job-level "why" evidence (`code_slayer.coding.pipeline.
+    # _set_state()`), covering every terminal/blocking outcome uniformly
+    # (workspace/lease/diff failures, unauthorized mutation, stale
+    # candidate evidence, repair exhaustion, security block,
+    # READY_FOR_HUMAN_MERGE) rather than requiring each call site to
+    # separately remember to emit its own event. Always recorded with
+    # `task_id=None`, same as CODING_JOB_CREATED above, and always
+    # alongside a durable `coding_jobs.final_reason` write -- never the
+    # only place this reason is recorded.
+    CODING_JOB_TERMINATED = "CODING_JOB_TERMINATED"

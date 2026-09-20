@@ -24,9 +24,22 @@ never a partial reconstruction); the diff a Reviewer/Security turn is
 shown is independently computed from real git state (`coding.
 mutation_guard`), never a model's own description of "what I changed";
 staleness (a later mutation invalidating an earlier verdict) is enforced
-by a content fingerprint the orchestrator computes and compares itself,
-never trusted from the model; and whether a verdict actually blocks
-progress is a pure, code-owned decision (`review_blocks_progress()`/
+two ways: structurally, `policy.engine.PolicyEngine` only ever allows a
+mutation capability while `core.states.TaskState` is `IMPLEMENTING`/
+`REPAIRING` -- by the time Reviewer/Security run, the task has already
+moved past both, so no further Coder mutation is even possible; and
+explicitly, `verify_candidate_identity()` below -- called by `coding.
+pipeline.run_coding_job()` immediately before it will ever checkpoint --
+recomputes the current candidate's diff fingerprint fresh from
+authoritative git state (`coding.mutation_guard.compute_diff_text()`)
+and requires it to exactly equal the fingerprint each of the latest
+Reviewer PASS and Security PASS was actually bound to, failing closed on
+any mismatch. Neither mechanism trusts a fingerprint the model itself
+supplied -- `ReviewResult.diff_fingerprint`/`SecurityResult.
+diff_fingerprint` are always computed by this package's own code (see
+`coding.reviewer`/`coding.security_gate`), never parsed from a model
+response. Whether a verdict actually blocks progress is, separately, a
+pure, code-owned decision (`review_blocks_progress()`/
 `security_blocks_progress()` below), never something the model's own
 text can assert its way around.
 """
@@ -220,6 +233,58 @@ def security_blocks_progress(result: SecurityResult) -> bool:
     `HUMAN_REQUIRED` is never silently treated as an implicit PASS
     (fail-closed on ambiguity, per `AGENTS.md`)."""
     return result.verdict != SecurityVerdict.PASS
+
+
+# --------------------------------------------------------------------------
+# Candidate identity: the explicit stale-evidence defense-in-depth check
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CandidateIdentityCheck:
+    """The outcome of `verify_candidate_identity()` -- `ok=False` with a
+    stable `reason` covers every mismatch/malformation this module knows
+    how to name, matching this codebase's own `PolicyResult`/`LeaseResult`
+    "never a bare bool" convention."""
+
+    ok: bool
+    reason: str
+
+
+def verify_candidate_identity(
+    review: ReviewResult, security: SecurityResult, current_fingerprint: str,
+) -> CandidateIdentityCheck:
+    """The explicit defense-in-depth check this module's own docstring
+    describes: `current_fingerprint` (recomputed by the caller, fresh,
+    from authoritative git state -- see `coding.mutation_guard.
+    compute_diff_text()`/`diff_fingerprint()` -- immediately before it
+    will ever authorize a checkpoint) must exactly equal BOTH the
+    fingerprint the latest Reviewer PASS was actually bound to and the
+    fingerprint the latest Security PASS was actually bound to. Fails
+    closed (`ok=False`) on any mismatch, or on a missing/empty/non-string
+    `current_fingerprint` -- never guesses, never treats an ambiguous
+    identity as a match. A verdict about one candidate can never
+    authorize readiness for a different one, and this is the one place
+    that claim is actually checked, not merely documented."""
+    if not isinstance(current_fingerprint, str) or not current_fingerprint:
+        return CandidateIdentityCheck(False, "stale_evidence:missing_current_fingerprint")
+    if not isinstance(review.diff_fingerprint, str) or not review.diff_fingerprint:
+        return CandidateIdentityCheck(False, "stale_evidence:missing_review_fingerprint")
+    if not isinstance(security.diff_fingerprint, str) or not security.diff_fingerprint:
+        return CandidateIdentityCheck(False, "stale_evidence:missing_security_fingerprint")
+    if review.diff_fingerprint != current_fingerprint:
+        return CandidateIdentityCheck(
+            False,
+            "stale_evidence:review_fingerprint_mismatch:"
+            f"{review.diff_fingerprint}!={current_fingerprint}",
+        )
+    if security.diff_fingerprint != current_fingerprint:
+        return CandidateIdentityCheck(
+            False,
+            "stale_evidence:security_fingerprint_mismatch:"
+            f"{security.diff_fingerprint}!={current_fingerprint}",
+        )
+    return CandidateIdentityCheck(True, "candidate_identity_confirmed")
 
 
 # --------------------------------------------------------------------------

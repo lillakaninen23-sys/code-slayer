@@ -39,7 +39,7 @@ from code_slayer.coding.contracts import (
     CoderToolSchemaIdentity,
     CoderWorktreeIdentity,
 )
-from code_slayer.coding.handoff import validate_planner_handoff
+from code_slayer.coding.handoff import validate_mutation_scope, validate_planner_handoff
 from code_slayer.coding.mutation_guard import (
     DiffUnavailableError,
     compute_diff_text,
@@ -53,6 +53,7 @@ from code_slayer.coding.pipeline_types import (
     SecurityResult,
     SecurityVerdict,
     diff_fingerprint,
+    verify_candidate_identity,
 )
 from code_slayer.coding.reviewer import ReviewerTurnError, run_reviewer_turn
 from code_slayer.coding.security_gate import SecurityTurnError, run_security_turn
@@ -61,6 +62,7 @@ from code_slayer.coding.workspace import WorkspacePreflightError, prepare_coder_
 from code_slayer.core import TaskState, TaskStateMachine
 from code_slayer.finalization.lifecycle import (
     CheckpointAdvanceOutcome,
+    CompletionAdvanceOutcome,
     advance_checkpointed_completion,
     advance_ready_for_checkpoint,
 )
@@ -139,10 +141,29 @@ def _set_state(
     control_conn: sqlite3.Connection, job_id: str, state: CodingJobState, *, reason: str = "",
     **fields,
 ) -> None:
+    """Durably write `state` (and, when `reason` is given, `final_reason`
+    -- previously silently dropped, never actually persisted) through
+    `CodingJobsRepo`'s own closed-set field validation, never a raw SQL
+    write of our own. Also records `CODING_JOB_TERMINATED`, a single
+    generic job-level audit event, whenever a real `reason` is supplied --
+    every current call site that passes one is a terminal-or-blocking
+    outcome, so this closes the "critical evidence is not only held in
+    process memory" gap uniformly, rather than requiring every call site
+    to separately remember to audit itself. A call with no `reason`
+    (ordinary in-flight progress) writes no event and never overwrites a
+    previously-recorded `final_reason` with an empty string."""
+    if reason:
+        fields = {**fields, "final_reason": reason}
     with transaction(control_conn):
         CodingJobsRepo(control_conn).update_in_transaction(
             job_id, updated_at=utcnow_iso(), state=state.value, **fields,
         )
+        if reason:
+            AuditWriter(control_conn).append(
+                task_id=None, event_type=EventType.CODING_JOB_TERMINATED, actor_type="system",
+                actor_id="coding-pipeline",
+                payload={"job_id": job_id, "state": state.value, "reason": reason},
+            )
 
 
 def run_coding_job(
@@ -171,6 +192,7 @@ def run_coding_job(
 
     try:
         validated_plan = validate_planner_handoff(control_conn, control_blobs_dir, plan)
+        validate_mutation_scope(validated_plan.content, allowed_scope)
     except PipelineContractError as exc:
         # No coding_jobs row is created at all for an insufficient handoff
         # -- nothing durable or irreversible was ever attempted, matching
@@ -537,24 +559,86 @@ def run_coding_job(
                 repair_attempts=repair_attempts,
             )
 
+        # Explicit defense-in-depth candidate-identity check (Fix 3):
+        # recompute the current candidate's diff fingerprint fresh, from
+        # authoritative git state, immediately before this function will
+        # ever authorize a checkpoint, and require it to exactly match
+        # both the Reviewer-PASS and Security-PASS fingerprints. Never
+        # trusted from either model's own claim -- both `review.
+        # diff_fingerprint`/`security.diff_fingerprint` were already
+        # computed by this package's own code, not parsed from a
+        # response. See `coding.pipeline_types.verify_candidate_identity`.
+        recheck_diff = compute_diff_text(
+            handle.path, base_revision=handle.base_revision, tmp_dir=handle.tmp_dir,
+        )
+        current_fingerprint = diff_fingerprint(recheck_diff)
+        identity_check = verify_candidate_identity(review, security, current_fingerprint)
+        if not identity_check.ok:
+            LeaseManager(exec_conn).release(lease)
+            lease = None
+            _set_state(
+                control_conn, job_id, CodingJobState.BLOCKED, reason=identity_check.reason,
+                finished_at=utcnow_iso(), security_verdict=security.verdict.value,
+                security_evidence_ref=security.diff_fingerprint,
+            )
+            return CodingJobResult(
+                job_id, CodingJobState.BLOCKED, identity_check.reason, task_id=job_id,
+                job_worktree_path=str(handle.path), review=review, security=security,
+                repair_attempts=repair_attempts,
+            )
+
+        # Fix 1: READY_FOR_HUMAN_MERGE requires the REAL, inspected outcome
+        # of both the checkpoint and the completion advance -- never
+        # asserted merely because Security passed. Every non-success
+        # CheckpointAdvanceOutcome/CompletionAdvanceOutcome (DENIED,
+        # FAILED, NOT_READY, STALE_LEASE, UNKNOWN, CONTAINED_EXCEPTION)
+        # fails the job closed to BLOCKED instead, with the exact outcome
+        # and reason preserved -- matching this same function's own
+        # BLOCKED usage for every other environment/policy-shaped failure
+        # (workspace preflight, lease unavailable, unauthorized mutation).
         LeaseManager(exec_conn).renew(lease)
         checkpoint_result = advance_ready_for_checkpoint(
             exec_conn, job_id, lease, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir,
         )
+        completion_result = None
         if checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED:
-            advance_checkpointed_completion(exec_conn, job_id, lease)
+            completion_result = advance_checkpointed_completion(exec_conn, job_id, lease)
         LeaseManager(exec_conn).release(lease)
         lease = None
+
+        checkpoint_ok = checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED
+        completion_ok = (
+            completion_result is not None
+            and completion_result.outcome == CompletionAdvanceOutcome.COMPLETED
+        )
+        if not (checkpoint_ok and completion_ok):
+            reason = (
+                f"checkpoint_not_created:{checkpoint_result.outcome.value}:"
+                f"{checkpoint_result.reason}"
+                if not checkpoint_ok else
+                f"completion_not_confirmed:{completion_result.outcome.value}:"
+                f"{completion_result.reason}"
+            )
+            _set_state(
+                control_conn, job_id, CodingJobState.BLOCKED, reason=reason,
+                finished_at=utcnow_iso(), security_verdict=security.verdict.value,
+                security_evidence_ref=security.diff_fingerprint,
+            )
+            return CodingJobResult(
+                job_id, CodingJobState.BLOCKED, reason, task_id=job_id,
+                job_worktree_path=str(handle.path), review=review, security=security,
+                repair_attempts=repair_attempts,
+            )
+
         _set_state(
             control_conn, job_id, CodingJobState.READY_FOR_HUMAN_MERGE,
-            reason="security_pass_checkpoint_created"
-            if checkpoint_result.outcome == CheckpointAdvanceOutcome.CREATED
-            else f"checkpoint_not_confirmed:{checkpoint_result.outcome.value}",
+            reason="security_pass_checkpoint_and_completion_confirmed",
             finished_at=utcnow_iso(), security_verdict=security.verdict.value,
             security_evidence_ref=security.diff_fingerprint,
         )
         return CodingJobResult(
-            job_id, CodingJobState.READY_FOR_HUMAN_MERGE, "security_pass_checkpoint_created",
+            job_id, CodingJobState.READY_FOR_HUMAN_MERGE,
+            "security_pass_checkpoint_and_completion_confirmed",
             task_id=job_id, job_worktree_path=str(handle.path), review=review, security=security,
             repair_attempts=repair_attempts,
         )
