@@ -465,6 +465,81 @@ def test_primary_checkout_is_never_mutated(db_conn, tmp_path, ready_repo):
     assert _working_tree_snapshot(ready_repo) == before_snapshot
 
 
+def test_coder_read_file_then_write_file_uses_returned_hash(db_conn, tmp_path, ready_repo):
+    """Production run_coder_turn() must return authorized read content +
+    expected_hash, and the same turn must be able to write_file with it."""
+
+    class ReadThenWriteAdapter(ScriptedAdapter):
+        def infer(self, request):
+            if request.role != "coder":
+                return super().infer(request)
+            self.calls.append(request.role)
+            if request.prior_tool_result is None:
+                return _tool_call("create_file", {"path": "docs/HELLO.md", "content": "hello"})
+            if request.prior_tool_result.tool == "create_file":
+                return _tool_call("read_file", {"path": "docs/HELLO.md"})
+            if request.prior_tool_result.tool == "read_file":
+                data = json.loads(request.prior_tool_result.output_summary)
+                assert data["content"] == "hello"
+                assert len(data["expected_hash"]) == 64
+                assert data["truncated"] is False
+                return _tool_call(
+                    "write_file",
+                    {
+                        "path": "docs/HELLO.md",
+                        "content": "hello\n",
+                        "expected_hash": data["expected_hash"],
+                    },
+                )
+            return _text(_CODER_FINAL_REPORT)
+
+    adapter = ReadThenWriteAdapter({
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = _happy_job(db_conn, tmp_path, ready_repo, adapter)
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    assert Path(result.job_worktree_path, "docs/HELLO.md").read_text() == "hello\n"
+
+
+def test_unauthorized_read_reveals_no_content_or_hash(db_conn, tmp_path, ready_repo):
+    priors = []
+
+    class CapturingAdapter(ScriptedAdapter):
+        def infer(self, request):
+            if request.role == "coder":
+                priors.append(request.prior_tool_result)
+            return super().infer(request)
+
+    info = identity.resolve(ready_repo)
+    plan = _ready_plan(
+        db_conn, tmp_path / "blobs", repo_id=info.repo_id, worktree_id=info.worktree_id,
+        paths=("docs/HELLO.md",),
+    )
+    adapter = CapturingAdapter({
+        "coder": [
+            _tool_call("read_file", {"path": "secrets/.gitkeep"}),
+            _tool_call("create_file", {"path": "docs/HELLO.md", "content": "hello world\n"}),
+            _text(_CODER_FINAL_REPORT),
+        ],
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = run_coding_job(
+        ready_repo, control_conn=db_conn, control_blobs_dir=tmp_path / "blobs", plan=plan,
+        original_prompt="Add docs/HELLO.md", allowed_scope=("docs/HELLO.md",),
+        coder_adapter=adapter, reviewer_adapter=adapter, security_adapter=adapter,
+    )
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    denied = priors[1]
+    assert denied is not None
+    assert denied.tool == "read_file"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(denied.output_summary)
+    assert "expected_hash" not in denied.output_summary
+    assert '"content"' not in denied.output_summary
+
+
 def _happy_job(db_conn, tmp_path, ready_repo, adapter):
     info = identity.resolve(ready_repo)
     plan = _ready_plan(

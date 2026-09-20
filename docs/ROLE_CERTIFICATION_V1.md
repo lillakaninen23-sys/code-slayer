@@ -61,16 +61,20 @@ executed as Python. Reviewer/Security negative and positive diffs never reach an
 Production mutations still use ToolExecutor and Finalizer. No ranking benchmarks, UI,
 CLI, scheduler, promotion workflow or cloud integration are introduced here.
 
-Parent observation: Coder `read_file` currently supplies a status-only tool result,
-without the file content or expected hash needed for subsequent writes. This role
-certification change does not repair that separate tool-loop behavior.
+Production `read_file` and Coder/Repairer qualification share
+`coding.tool_loop.format_authorized_read_result`: authorized reads return bounded
+JSON `{content, expected_hash, truncated}` from ToolExecutor evidence (never a second
+host-path read). Unauthorized reads still return a status-only summary with no
+content or hash.
 
 
 ## Validation and review handoff
 
-Observed branch: `role-certification-v1`. Base and unchanged HEAD:
-`433f7fb00215e3b36c174057acc53d0f79a9bc32`. Implementation remains uncommitted
-for independent review: five modified tracked files and seven new files.
+Observed branch: `role-certification-v1`. Approved parent:
+`5df0f731572ef20a48b5572275c2125207490edf`. Reviewed feature HEAD before the
+blocker-fix pass: `3670256`. This pass is the narrow merge-blocker fix only
+(final revalidation TaskState containment, Reviewer fail-closed without Repairer,
+production/qualification `read_file` contract alignment).
 
 Files:
 

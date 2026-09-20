@@ -8,9 +8,19 @@ attempt to execute, with a stable `ToolLoopContractError`.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from code_slayer.coding.tool_loop import CODER_TOOLS, ToolLoopContractError, _build_tool_request
+from code_slayer.audit.canonical import canonical_json
+from code_slayer.coding import qualification, tool_loop
+from code_slayer.coding.tool_loop import (
+    CODER_TOOLS,
+    MAX_AUTHORIZED_READ_CHARS,
+    ToolLoopContractError,
+    _build_tool_request,
+    format_authorized_read_result,
+)
 from code_slayer.tools.models import ToolRequest
 
 _HASH64 = "a" * 64
@@ -107,3 +117,30 @@ def test_non_mapping_params_is_rejected():
         _build_tool_request("read_file", "a.py")
     with pytest.raises(ToolLoopContractError):
         _build_tool_request("read_file", ["a.py"])
+
+
+def test_authorized_read_result_contains_content_and_expected_hash():
+    payload = b"def add(a, b):\n    return a - b\n"
+    digest = "e" * 64
+    raw = format_authorized_read_result(payload, digest)
+    data = json.loads(raw)
+    assert data == {
+        "content": payload.decode(),
+        "expected_hash": digest,
+        "truncated": False,
+    }
+    assert raw == canonical_json(data)
+
+
+def test_authorized_read_result_bounds_oversized_content_without_dropping_hash():
+    payload = ("x" * (MAX_AUTHORIZED_READ_CHARS + 50)).encode()
+    digest = "f" * 64
+    data = json.loads(format_authorized_read_result(payload, digest))
+    assert data["truncated"] is True
+    assert data["content"] == "x" * MAX_AUTHORIZED_READ_CHARS
+    assert data["expected_hash"] == digest
+    assert len(data["content"]) == MAX_AUTHORIZED_READ_CHARS
+
+
+def test_qualification_and_production_share_authorized_read_helper():
+    assert qualification.format_authorized_read_result is tool_loop.format_authorized_read_result

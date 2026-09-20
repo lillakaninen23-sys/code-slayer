@@ -55,6 +55,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from code_slayer.audit.canonical import canonical_json
 from code_slayer.coding.contracts import (
     CoderExecutionRecord,
     CoderInput,
@@ -69,6 +70,7 @@ from code_slayer.policy.engine import Decision
 from code_slayer.store.tool_operations_repo import ToolOperationsRepo
 from code_slayer.tools.executor import ToolExecutor
 from code_slayer.tools.models import PatchHunk, ToolRequest
+from code_slayer.workers.execution import evidence_content
 from code_slayer.workers.protocol import (
     ToolRequirement,
     WorkerAdapter,
@@ -86,6 +88,10 @@ CODER_TOOLS: tuple[str, ...] = ("read_file", "create_file", "write_file", "apply
 
 _MAX_SUMMARY_CHARS = 2000
 _MAX_TRANSCRIPT_CHARS = 20000
+# Model-facing authorized-read payload bound. Full-file `expected_hash` is
+# always the ToolExecutor/harness digest of the complete authorized bytes;
+# only the `content` field is clipped.
+MAX_AUTHORIZED_READ_CHARS = 65536
 
 
 class ToolLoopContractError(RuntimeError):
@@ -179,6 +185,29 @@ def _render_base_prompt(coder_input: CoderInput) -> str:
             ),
         ]
     return "\n".join(lines)
+
+
+def format_authorized_read_result(content: bytes, expected_hash: str) -> str:
+    """Deterministic model-facing JSON for an already-authorized read_file.
+
+    Production retrieves `content` from `workers.execution.evidence_content()`
+    using `ToolResult.output_hash` (never a second host-path read).
+    Qualification hashes its in-memory fixture bytes and calls this same
+    helper, so certification cannot attest a richer protocol than production.
+    """
+    if not isinstance(content, (bytes, bytearray)):
+        raise ToolLoopContractError("read_content_must_be_bytes")
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise ToolLoopContractError("missing_or_invalid_expected_hash")
+    text = bytes(content).decode("utf-8", errors="replace")
+    truncated = len(text) > MAX_AUTHORIZED_READ_CHARS
+    if truncated:
+        text = text[:MAX_AUTHORIZED_READ_CHARS]
+    return canonical_json({
+        "content": text,
+        "expected_hash": expected_hash,
+        "truncated": truncated,
+    })
 
 
 def _summarize_tool_result(tool: str, result) -> str:
@@ -365,6 +394,26 @@ def run_coder_turn(
                 continue
             tool_result = executor.execute(task_id, tool_request)
             if tool_result.decision == Decision.ALLOW and tool_result.status == "SUCCEEDED":
+                if call.tool == "read_file":
+                    content = evidence_content(conn, blobs_dir, tool_result.output_hash)
+                    if content is None or not isinstance(tool_result.output_hash, str):
+                        attempts.append(ToolCallAttempt(
+                            iteration, "read_evidence_unavailable", tool=call.tool,
+                            operation_id=tool_result.operation_id,
+                            reason="read_evidence_unavailable",
+                        ))
+                        record = CoderExecutionRecord(
+                            authoritative_facts=build_authoritative_facts(
+                                mutations=tuple(mutations),
+                            ),
+                        )
+                        return ToolLoopOutcome(
+                            False, "read_evidence_unavailable", record, tuple(attempts),
+                            CoderFailureCategory.TOOL_EXECUTION_DENIED, iteration,
+                        )
+                    summary = format_authorized_read_result(content, tool_result.output_hash)
+                else:
+                    summary = _summarize_tool_result(call.tool, tool_result)
                 consecutive_malformed = 0
                 operation = operations.get(tool_result.operation_id)
                 mutations.append(coder_mutation_record_from_tool_operation(operation))
@@ -372,7 +421,6 @@ def run_coder_turn(
                     iteration, "tool_succeeded", tool=call.tool,
                     operation_id=tool_result.operation_id,
                 ))
-                summary = _summarize_tool_result(call.tool, tool_result)
                 prior_result = WorkerToolResult(tool=call.tool, output_summary=summary)
                 transcript.append(f"[{iteration}] {call.tool}({tool_request.path}) -> {summary}")
                 continue

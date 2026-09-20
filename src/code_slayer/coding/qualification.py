@@ -19,7 +19,12 @@ from code_slayer.coding.pipeline_types import ReviewVerdict, SecurityVerdict
 from code_slayer.coding.reviewer import ReviewerTurnError, run_reviewer_turn
 from code_slayer.coding.routing import attest, configured_adapter, targets_from_config
 from code_slayer.coding.security_gate import SecurityTurnError, run_security_turn
-from code_slayer.coding.tool_loop import CODER_TOOLS, ToolLoopContractError, _build_tool_request
+from code_slayer.coding.tool_loop import (
+    CODER_TOOLS,
+    ToolLoopContractError,
+    _build_tool_request,
+    format_authorized_read_result,
+)
 from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import utcnow_iso
 from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
@@ -144,13 +149,11 @@ def _mutator_case(adapter, role, case_id, budget):
         current = state.get(tool.path)
         if tool.tool == "read_file" and current is not None:
             read_seen = True
+            payload = current.encode()
             prior = WorkerToolResult(
                 tool=tool.tool,
-                output_summary=canonical_json(
-                    {
-                        "content": current,
-                        "expected_hash": hashlib.sha256(current.encode()).hexdigest(),
-                    }
+                output_summary=format_authorized_read_result(
+                    payload, hashlib.sha256(payload).hexdigest(),
                 ),
             )
             continue

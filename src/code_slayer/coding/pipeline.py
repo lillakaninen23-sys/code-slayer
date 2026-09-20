@@ -403,14 +403,55 @@ def _run_coding_job(
                     plan_goal=validated_plan.content.goal, diff_text=diff_text,
                 )
             except ReviewerTurnError as exc:
+                cause = exc.__cause__
+                reason = (
+                    cause.reason if isinstance(cause, RoleRoutingError)
+                    else f"reviewer_unavailable:{exc}"
+                )
                 review = ReviewResult(
                     verdict=ReviewVerdict.BLOCKED, summary=str(exc), findings=(),
                     diff_fingerprint=diff_fingerprint(diff_text),
+                )
+                _job_event(control_conn, job_id, EventType.REVIEW_FINDING, {
+                    "verdict": review.verdict.value, "summary": review.summary,
+                    "findings": len(review.findings), "diff_fingerprint": review.diff_fingerprint,
+                })
+                _best_effort_fail_task(
+                    exec_conn, machine, job_id, TaskState.VERIFYING, lease,
+                )
+                lease = None
+                _set_state(
+                    control_conn, job_id, CodingJobState.BLOCKED, reason=reason,
+                    finished_at=utcnow_iso(), repair_attempts=repair_attempts,
+                    review_verdict=review.verdict.value,
+                    review_evidence_ref=review.diff_fingerprint,
+                )
+                return CodingJobResult(
+                    job_id, CodingJobState.BLOCKED, reason, task_id=job_id,
+                    job_worktree_path=str(handle.path), review=review,
+                    repair_attempts=repair_attempts,
                 )
             _job_event(control_conn, job_id, EventType.REVIEW_FINDING, {
                 "verdict": review.verdict.value, "summary": review.summary,
                 "findings": len(review.findings), "diff_fingerprint": review.diff_fingerprint,
             })
+            if review.verdict not in (ReviewVerdict.PASS, ReviewVerdict.CHANGES_REQUIRED):
+                _best_effort_fail_task(
+                    exec_conn, machine, job_id, TaskState.VERIFYING, lease,
+                )
+                lease = None
+                reason = f"reviewer_{review.verdict.value.lower()}"
+                _set_state(
+                    control_conn, job_id, CodingJobState.BLOCKED, reason=reason,
+                    finished_at=utcnow_iso(), repair_attempts=repair_attempts,
+                    review_verdict=review.verdict.value,
+                    review_evidence_ref=review.diff_fingerprint,
+                )
+                return CodingJobResult(
+                    job_id, CodingJobState.BLOCKED, reason, task_id=job_id,
+                    job_worktree_path=str(handle.path), review=review,
+                    repair_attempts=repair_attempts,
+                )
             review_evidence = ReviewEvidence(
                 approved=review.verdict == ReviewVerdict.PASS,
                 reason=review.summary or review.verdict.value, blocking=True,
@@ -617,10 +658,24 @@ def _run_coding_job(
                 for adapter in role_routes.values():
                     adapter.router.revalidate(adapter.target, adapter.binding)
             except RoleRoutingError as exc:
-                _set_state(control_conn, job_id, CodingJobState.BLOCKED,
-                           reason=exc.reason, finished_at=utcnow_iso())
-                return CodingJobResult(job_id, CodingJobState.BLOCKED, exc.reason,
-                                       task_id=job_id, job_worktree_path=str(handle.path))
+                _best_effort_fail_task(
+                    exec_conn, machine, job_id, TaskState.READY_FOR_CHECKPOINT, lease,
+                )
+                lease = None
+                _set_state(
+                    control_conn, job_id, CodingJobState.BLOCKED,
+                    reason=exc.reason, finished_at=utcnow_iso(),
+                    repair_attempts=repair_attempts,
+                    review_verdict=review_verdict_value,
+                    review_evidence_ref=review.diff_fingerprint if review is not None else None,
+                    security_verdict=security.verdict.value,
+                    security_evidence_ref=security.diff_fingerprint,
+                )
+                return CodingJobResult(
+                    job_id, CodingJobState.BLOCKED, exc.reason,
+                    task_id=job_id, job_worktree_path=str(handle.path),
+                    review=review, security=security, repair_attempts=repair_attempts,
+                )
         checkpoint_result = advance_ready_for_checkpoint(
             exec_conn, job_id, lease, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir,
         )
