@@ -135,6 +135,20 @@ unmodified.
 - **Baseline Security Certification is untouched**: this package reviews
   one job's code change; it neither reads, writes, nor substitutes for
   `workers.security_baseline`'s mandatory, worker-level certification.
+- **Residual risk — shared adapter across roles**: `run_coding_job()`
+  accepts separate `coder_adapter`/`reviewer_adapter`/`security_adapter`
+  parameters, but a caller may legitimately point all three at the same
+  underlying model/process (this prototype's own example usage does).
+  Capability-level independence is still real and enforced regardless
+  (Reviewer/Security literally cannot call a mutation tool, whatever they
+  are told to do), but *judgment*-level independence — a genuinely
+  different, independently qualified model catching what the Coder's own
+  model missed, including a prompt-injection attempt embedded in
+  reviewed repository content — is only as strong as the adapters a
+  caller actually supplies. A production deployment that wants real
+  judgment independence must supply genuinely distinct, independently
+  qualified adapters for each role; this slice does not implement or
+  enforce that distinctness itself.
 
 ## Job lifecycle (`coding.pipeline_types.CodingJobState`)
 
