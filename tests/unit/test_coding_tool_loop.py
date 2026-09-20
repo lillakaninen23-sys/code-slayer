@@ -132,15 +132,41 @@ def test_authorized_read_result_contains_content_and_expected_hash():
     assert raw == canonical_json(data)
 
 
-def test_authorized_read_result_bounds_oversized_content_without_dropping_hash():
+def test_authorized_read_result_oversized_omits_write_authorizing_hash():
     payload = ("x" * (MAX_AUTHORIZED_READ_CHARS + 50)).encode()
     digest = "f" * 64
-    data = json.loads(format_authorized_read_result(payload, digest))
+    raw = format_authorized_read_result(payload, digest)
+    data = json.loads(raw)
     assert data["truncated"] is True
+    assert data["reason"] == "read_exceeds_bound"
     assert data["content"] == "x" * MAX_AUTHORIZED_READ_CHARS
-    assert data["expected_hash"] == digest
+    assert "expected_hash" not in data
+    assert digest not in raw
     assert len(data["content"]) == MAX_AUTHORIZED_READ_CHARS
+
+
+def test_authorized_read_result_invalid_utf8_omits_write_authorizing_hash():
+    payload = b"hello\xffworld"
+    digest = "a" * 64
+    raw = format_authorized_read_result(payload, digest)
+    data = json.loads(raw)
+    assert data["reason"] == "read_not_utf8"
+    assert "expected_hash" not in data
+    assert "content" not in data
+    assert digest not in raw
 
 
 def test_qualification_and_production_share_authorized_read_helper():
     assert qualification.format_authorized_read_result is tool_loop.format_authorized_read_result
+
+
+def test_qualification_restricted_contract_omits_hash_when_lossy():
+    digest = "ab" * 32
+    oversized = qualification.format_authorized_read_result(
+        ("x" * (MAX_AUTHORIZED_READ_CHARS + 1)).encode(), digest,
+    )
+    invalid = qualification.format_authorized_read_result(b"\xff", digest)
+    for raw in (oversized, invalid):
+        data = json.loads(raw)
+        assert "expected_hash" not in data
+        assert digest not in raw

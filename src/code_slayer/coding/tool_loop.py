@@ -88,9 +88,11 @@ CODER_TOOLS: tuple[str, ...] = ("read_file", "create_file", "write_file", "apply
 
 _MAX_SUMMARY_CHARS = 2000
 _MAX_TRANSCRIPT_CHARS = 20000
-# Model-facing authorized-read payload bound. Full-file `expected_hash` is
-# always the ToolExecutor/harness digest of the complete authorized bytes;
-# only the `content` field is clipped.
+# Model-facing authorized-read payload bound. A write-authorizing
+# `expected_hash` is returned only when the complete original bytes were
+# represented losslessly within this bound. Oversized or non-UTF-8 reads
+# omit it so ToolExecutor cannot accept a subsequent write_file/apply_patch
+# against content the model never actually received.
 MAX_AUTHORIZED_READ_CHARS = 65536
 
 
@@ -194,19 +196,31 @@ def format_authorized_read_result(content: bytes, expected_hash: str) -> str:
     using `ToolResult.output_hash` (never a second host-path read).
     Qualification hashes its in-memory fixture bytes and calls this same
     helper, so certification cannot attest a richer protocol than production.
+
+    `expected_hash` is write-authorizing only when the model received the
+    complete original bytes losslessly. Truncated or non-UTF-8 reads omit
+    it: ToolExecutor's write_file/apply_patch check is `hash(current file)
+    == expected_hash` and does not know the model saw a partial or lossy
+    representation. Do not rely on the model honoring `truncated=true`.
     """
     if not isinstance(content, (bytes, bytearray)):
         raise ToolLoopContractError("read_content_must_be_bytes")
     if not isinstance(expected_hash, str) or len(expected_hash) != 64:
         raise ToolLoopContractError("missing_or_invalid_expected_hash")
-    text = bytes(content).decode("utf-8", errors="replace")
-    truncated = len(text) > MAX_AUTHORIZED_READ_CHARS
-    if truncated:
-        text = text[:MAX_AUTHORIZED_READ_CHARS]
+    try:
+        text = bytes(content).decode("utf-8")
+    except UnicodeDecodeError:
+        return canonical_json({"reason": "read_not_utf8", "truncated": False})
+    if len(text) > MAX_AUTHORIZED_READ_CHARS:
+        return canonical_json({
+            "content": text[:MAX_AUTHORIZED_READ_CHARS],
+            "truncated": True,
+            "reason": "read_exceeds_bound",
+        })
     return canonical_json({
         "content": text,
         "expected_hash": expected_hash,
-        "truncated": truncated,
+        "truncated": False,
     })
 
 

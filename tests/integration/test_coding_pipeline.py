@@ -26,6 +26,7 @@ import pytest
 from code_slayer.coding.pipeline import CodingJobConfig
 from code_slayer.coding.pipeline_types import CodingJobState
 from code_slayer.coding.testing import run_coding_job_for_testing as run_coding_job
+from code_slayer.coding.tool_loop import MAX_AUTHORIZED_READ_CHARS
 from code_slayer.planning.models import (
     AffectedFile,
     AffectedFileAction,
@@ -538,6 +539,158 @@ def test_unauthorized_read_reveals_no_content_or_hash(db_conn, tmp_path, ready_r
         json.loads(denied.output_summary)
     assert "expected_hash" not in denied.output_summary
     assert '"content"' not in denied.output_summary
+
+
+def _oversized_hello() -> str:
+    return "x" * (MAX_AUTHORIZED_READ_CHARS + 50)
+
+
+def test_oversized_read_cannot_write_file(db_conn, tmp_path, ready_repo):
+    """A truncated read must not supply a write-authorizing hash; a
+    subsequent write_file must not replace unseen tail bytes."""
+    original = _oversized_hello()
+    captured = {}
+
+    class OversizedWriteAdapter(ScriptedAdapter):
+        def infer(self, request):
+            if request.role != "coder":
+                return super().infer(request)
+            self.calls.append(request.role)
+            if request.prior_tool_result is None:
+                return _tool_call("create_file", {"path": "docs/HELLO.md", "content": original})
+            if request.prior_tool_result.tool == "create_file":
+                return _tool_call("read_file", {"path": "docs/HELLO.md"})
+            if request.prior_tool_result.tool == "read_file":
+                captured["read"] = request.prior_tool_result.output_summary
+                data = json.loads(request.prior_tool_result.output_summary)
+                assert "expected_hash" not in data
+                assert data["truncated"] is True
+                leaked = data.get("expected_hash") or "0" * 64
+                return _tool_call(
+                    "write_file",
+                    {
+                        "path": "docs/HELLO.md",
+                        "content": "truncated-overwrite\n",
+                        "expected_hash": leaked,
+                    },
+                )
+            return _text(_CODER_FINAL_REPORT)
+
+    adapter = OversizedWriteAdapter({
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = _happy_job(db_conn, tmp_path, ready_repo, adapter)
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    assert "expected_hash" not in captured["read"]
+    assert Path(result.job_worktree_path, "docs/HELLO.md").read_text() == original
+
+
+def test_oversized_read_cannot_apply_patch(db_conn, tmp_path, ready_repo):
+    """A truncated read must not supply an apply_patch-authorizing hash."""
+    original = _oversized_hello()
+    captured = {}
+
+    class OversizedPatchAdapter(ScriptedAdapter):
+        def infer(self, request):
+            if request.role != "coder":
+                return super().infer(request)
+            self.calls.append(request.role)
+            if request.prior_tool_result is None:
+                return _tool_call("create_file", {"path": "docs/HELLO.md", "content": original})
+            if request.prior_tool_result.tool == "create_file":
+                return _tool_call("read_file", {"path": "docs/HELLO.md"})
+            if request.prior_tool_result.tool == "read_file":
+                captured["read"] = request.prior_tool_result.output_summary
+                data = json.loads(request.prior_tool_result.output_summary)
+                assert "expected_hash" not in data
+                leaked = data.get("expected_hash") or "0" * 64
+                return _tool_call(
+                    "apply_patch",
+                    {
+                        "path": "docs/HELLO.md",
+                        "expected_hash": leaked,
+                        "hunks": [{"offset": 0, "before": "x", "after": "y"}],
+                    },
+                )
+            return _text(_CODER_FINAL_REPORT)
+
+    adapter = OversizedPatchAdapter({
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = _happy_job(db_conn, tmp_path, ready_repo, adapter)
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    assert "expected_hash" not in captured["read"]
+    assert Path(result.job_worktree_path, "docs/HELLO.md").read_text() == original
+
+
+def test_invalid_utf8_read_omits_write_authorizing_hash(db_conn, tmp_path, ready_repo):
+    """Lossy/non-UTF-8 authorized reads must not expose the full-file hash."""
+    binary = ready_repo / "docs" / "binary.bin"
+    binary.write_bytes(b"hello\xffworld")
+    commit(ready_repo, "add non-utf8 docs/binary.bin")
+    priors = []
+
+    class CapturingAdapter(ScriptedAdapter):
+        def infer(self, request):
+            if request.role == "coder":
+                priors.append(request.prior_tool_result)
+            return super().infer(request)
+
+    info = identity.resolve(ready_repo)
+    now = utcnow_iso()
+    blobs = tmp_path / "blobs"
+    with transaction(db_conn):
+        PlanningRepo(db_conn).create_in_transaction(
+            plan_id="plan-1", created_at=now, schema_version="v1", repo_id=info.repo_id,
+            worktree_id=info.worktree_id, run_id=None,
+            request_content_hash=files.digest(b"original request"), predecessor_plan_id=None,
+            revision=1, state="DRAFT",
+        )
+    content = EngineeringPlanContent(
+        goal="Add docs/HELLO.md",
+        planned_changes=(PlannedChange(description="add hello doc", paths=("docs/HELLO.md",)),),
+        affected_files=(
+            AffectedFile(
+                path="docs/HELLO.md", action=AffectedFileAction.CREATE, reason="add hello doc",
+                exists_in_repository=False,
+            ),
+            AffectedFile(
+                path="docs/binary.bin", action=AffectedFileAction.MODIFY, reason="read binary",
+                exists_in_repository=True,
+            ),
+        ),
+    )
+    blob = store_plan_content(ContentStore(db_conn, blobs), content)
+    with transaction(db_conn):
+        PlanningRepo(db_conn).update_in_transaction(
+            "plan-1", updated_at=utcnow_iso(), state="READY", plan_content_hash=blob.content_hash,
+        )
+    plan = PlanningRepo(db_conn).get("plan-1")
+    adapter = CapturingAdapter({
+        "coder": [
+            _tool_call("read_file", {"path": "docs/binary.bin"}),
+            _tool_call("create_file", {"path": "docs/HELLO.md", "content": "hello world\n"}),
+            _text(_CODER_FINAL_REPORT),
+        ],
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = run_coding_job(
+        ready_repo, control_conn=db_conn, control_blobs_dir=blobs, plan=plan,
+        original_prompt="Add docs/HELLO.md",
+        allowed_scope=("docs/HELLO.md", "docs/binary.bin"),
+        coder_adapter=adapter, reviewer_adapter=adapter, security_adapter=adapter,
+    )
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    read_result = priors[1]
+    assert read_result is not None
+    assert read_result.tool == "read_file"
+    data = json.loads(read_result.output_summary)
+    assert "expected_hash" not in data
+    assert data["reason"] == "read_not_utf8"
+    assert "content" not in data
 
 
 def _happy_job(db_conn, tmp_path, ready_repo, adapter):
