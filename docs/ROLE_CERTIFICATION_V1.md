@@ -72,8 +72,9 @@ content or hash.
 
 Observed branch: `role-certification-v1`. Approved parent:
 `5df0f731572ef20a48b5572275c2125207490edf`. Reviewed feature HEAD before the
-blocker-fix pass: `3670256`. This pass is the narrow merge-blocker fix only
-(final revalidation TaskState containment, Reviewer fail-closed without Repairer,
+blocker-fix pass: `3670256`. This pass implementation commit:
+`b848328d894b73c3017e5e07013166a4ed043c06` (narrow merge-blocker fix only:
+final revalidation TaskState containment, Reviewer fail-closed without Repairer,
 production/qualification `read_file` contract alignment).
 
 Files:
@@ -93,7 +94,10 @@ Files:
 - `tests/integration/test_coding_pipeline.py`: explicitly uses the test harness.
 - `docs/ROLE_CERTIFICATION_V1.md`: architecture, permission review and handoff.
 
-Final focused validation: **554 passed**, no failures or skips (528 + 26).
+Final focused validation before this pass: **554 passed**, no failures or skips
+(528 + 26). This blocker-fix pass: documented Role Certification selection
+**573 passed**; post-rebase coding/role subset **212 passed** (190 baseline plus
+new containment, Reviewer fail-closed, and `read_file` contract tests).
 The first sandboxed broad run had 432 passes and 96 setup errors because temporary
 localhost HTTP sockets were prohibited. The same 528-test selection passed with
 socket access; no live model/server was contacted. The additional 26 tests cover
