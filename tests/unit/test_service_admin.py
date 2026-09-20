@@ -777,6 +777,49 @@ def test_register_worker_update_never_erases_approved_identity(admin_app, runtim
     assert loaded.worker_by_id("w1").planner_timeout_seconds == 45.0
 
 
+def test_register_worker_kind_and_network_class_use_the_same_preservation_path(
+    admin_app, runtime_server,
+):
+    """Review fix: `kind`/`network_class` must be sourced through the
+    SAME `_optional()` preserve-on-omit mechanism as every other
+    optional field, never a bare `data.get(key, default)` literal that
+    silently resets on every update. `ALLOWED_WORKER_KINDS`/
+    `ALLOWED_NETWORK_CLASSES` are both currently singleton sets, so a
+    preserved value and a freshly-defaulted value are indistinguishable
+    by VALUE alone -- this test never widens either set to work around
+    that; it inspects `register_worker()`'s own source to prove the
+    code path structurally, exactly as it does for every other field."""
+    client, _app, _config, _repo = admin_app
+    _script, origin = runtime_server
+    client.post("/api/runtime/ollama-servers", json={"id": "local", "origin": origin})
+    created = client.post(
+        "/api/runtime/workers",
+        json={"worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+    assert created.status_code == 200
+
+    # An update omitting kind/network_class must still succeed and keep
+    # reporting the same (only legal) values -- no crash, no drift.
+    updated = client.post(
+        "/api/runtime/workers",
+        json={"worker_id": "w1", "ollama_server_id": "local", "model_tag": "demo-model:1"},
+    )
+    assert updated.status_code == 200
+    worker = next(w for w in updated.get_json()["workers"] if w["worker_id"] == "w1")
+    assert worker["kind"] == "openai_compatible"
+    assert worker["network_class"] == "local"
+
+    import inspect
+
+    from code_slayer.api.admin import AdminFacade
+
+    source = inspect.getsource(AdminFacade.register_worker)
+    assert 'kind=_optional("kind"' in source
+    assert 'network_class=_optional("network_class"' in source
+    assert 'kind=data.get(' not in source
+    assert 'network_class=data.get(' not in source
+
+
 def test_runtime_projection_exposes_planner_role_execution_config(admin_app, runtime_server):
     client, _app, _config, _repo = admin_app
     _script, origin = runtime_server

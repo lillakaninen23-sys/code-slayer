@@ -302,11 +302,14 @@ class AdminFacade:
         a dataclass default (H.4.1 fix: `planner_timeout_seconds`/
         `output_token_budget`/`tool_choice_enforcement`/`planner_policy_
         version` -- and, for consistency, `effective_context_tokens`/
-        `temperature`/`normalizer_id`/`normalizer_version` -- previously
-        collapsed to their defaults on every re-registration, which is
-        exactly how the earlier v1->v2 planner_policy_version alignment
-        only worked by coincidence, since every other live value already
-        happened to equal its default).
+        `temperature`/`normalizer_id`/`normalizer_version`/`kind`/
+        `network_class` -- previously collapsed to their defaults on
+        every re-registration, which is exactly how the earlier v1->v2
+        planner_policy_version alignment only worked by coincidence,
+        since every other live value already happened to equal its
+        default). Every optional field goes through the SAME `_optional()`
+        helper below -- one consistent preservation path, not a
+        per-field special case.
 
         `approved_model_digest`/`approved_runtime_version` are never
         client-suppliable here (the closed-set route spec has no such
@@ -343,8 +346,8 @@ class AdminFacade:
         try:
             worker = WorkerRuntimeConfig(
                 worker_id=data["worker_id"],
-                kind=data.get("kind", "openai_compatible"),
-                network_class=data.get("network_class", "local"),
+                kind=_optional("kind", "openai_compatible"),
+                network_class=_optional("network_class", "local"),
                 ollama_server_id=data["ollama_server_id"],
                 model_tag=data["model_tag"],
                 approved_model_digest=digest,
