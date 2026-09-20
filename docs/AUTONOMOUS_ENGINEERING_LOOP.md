@@ -117,21 +117,41 @@ unmodified.
   `finalization.verification`'s existing closed `_ARGV_BY_COMMAND`
   allow-list, against an isolated materialized tree, never the live
   worktree.
-- **Staleness**: `coding.pipeline_types.diff_fingerprint()` fingerprints
-  exactly the diff text a Reviewer/Security turn saw; each repair round
-  recomputes a fresh diff and re-runs Reviewer before Finalizer is
-  consulted again, so a stale verdict can never be reused after a
-  mutation.
+- **Staleness (candidate identity)**: two independent layers. Structurally,
+  `PolicyEngine` only allows a mutation capability while `TaskState` is
+  `IMPLEMENTING`/`REPAIRING`; by the time Reviewer/Security run for a
+  given round, the task has already moved past both (`VERIFYING` for
+  Reviewer, `READY_FOR_CHECKPOINT` for Security), so no further Coder
+  mutation is even possible during that round. Explicitly, `coding.
+  pipeline_types.verify_candidate_identity()` — called by `run_coding_
+  job()` immediately before it will ever checkpoint — recomputes the
+  current candidate's diff fingerprint fresh, from authoritative git
+  state (`coding.mutation_guard.compute_diff_text()`), and requires it to
+  exactly equal both the fingerprint the latest Reviewer PASS and the
+  latest Security PASS were actually bound to; any mismatch fails the job
+  closed to `BLOCKED` with a `stale_evidence:...` reason, never
+  checkpointed. Each repair round also independently recomputes a fresh
+  diff and re-runs Reviewer before Finalizer is consulted again.
 - **Bounded repair**: `CodingJobConfig.max_repair_attempts` (default 2)
   is passed straight into `Finalizer.decide_after_verification()`'s own,
   already-tested `max_repair_attempts` parameter — no second budget
   invented. Exhaustion (`Finalizer`'s own `repair_attempts_exhausted`
   reason) maps to `CodingJobState.HUMAN_REQUIRED`.
 - **Security veto**: `SecurityVerdict.PASS` is the only verdict under
-  which `coding.pipeline` ever calls `finalization.lifecycle.
+  which `coding.pipeline` will even attempt `finalization.lifecycle.
   advance_ready_for_checkpoint()`/`advance_checkpointed_completion()`.
   `FAIL`/`HUMAN_REQUIRED` leave the task at `READY_FOR_CHECKPOINT`
   forever — never checkpointed, never completed.
+- **Checkpoint/completion outcome gating**: `READY_FOR_HUMAN_MERGE` is
+  set only when `advance_ready_for_checkpoint()` actually returns
+  `CheckpointAdvanceOutcome.CREATED` AND the subsequent
+  `advance_checkpointed_completion()` actually returns
+  `CompletionAdvanceOutcome.COMPLETED` — both real return values are
+  inspected, never assumed from Security having passed. Any other
+  outcome (`DENIED`/`FAILED`/`NOT_READY`/`STALE_LEASE`/`UNKNOWN`/
+  `CONTAINED_EXCEPTION` for either call) fails the job closed to
+  `BLOCKED`, with the exact outcome and underlying reason preserved in
+  `coding_jobs.final_reason`.
 - **Baseline Security Certification is untouched**: this package reviews
   one job's code change; it neither reads, writes, nor substitutes for
   `workers.security_baseline`'s mandatory, worker-level certification.
@@ -165,11 +185,16 @@ One new table, `coding_jobs` (`store.migrations.0021_coding_jobs.sql`),
 mirrors `planning_jobs`' own "identity locked at creation, lifecycle
 fields evolve" shape (see that migration's own comment for why rich
 per-attempt evidence lives in `audit_events` instead of a second ledger).
-Two new `EventType` members (`CODING_SECURITY_REVIEW_DECIDED`,
-`CODING_UNAUTHORIZED_MUTATION_DETECTED`) plus `CODING_JOB_CREATED`; every
-other event reuses the existing vocabulary (`REVIEW_STARTED`/
-`REVIEW_FINDING`/`REPAIR_STARTED`/`REPAIR_FINISHED`/
-`FINALIZATION_DECIDED`, all already defined and, until now, unused).
+`coding_jobs.final_reason` is durably written by `_set_state()` whenever
+a real `reason` is given (every terminal/blocking transition), alongside
+a `CODING_JOB_TERMINATED` audit event carrying the same reason — the
+`reason` argument to `_set_state()` is never merely accepted and
+discarded. New `EventType` members: `CODING_JOB_CREATED`,
+`CODING_JOB_TERMINATED`, `CODING_SECURITY_REVIEW_DECIDED`,
+`CODING_UNAUTHORIZED_MUTATION_DETECTED`; every other event reuses the
+existing vocabulary (`REVIEW_STARTED`/`REVIEW_FINDING`/`REPAIR_STARTED`/
+`REPAIR_FINISHED`/`FINALIZATION_DECIDED`, all already defined and, until
+now, unused).
 
 ## How to run the focused tests
 
