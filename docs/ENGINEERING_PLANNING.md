@@ -377,6 +377,175 @@ recovery logic already handles correctly on the next start. This works
 unmodified under the existing systemd-hosted `codeslayer serve` process
 model; no second ad-hoc background-process architecture was introduced.
 
+## Worker-bound Planner routing (H.4)
+
+H.3 documented (see the old "Known limitations" entry this section
+replaces) that no durable `planning_jobs` row recorded which registered
+worker/model actually supplied the Planner for a turn, so H.3's
+`ACTIVE`/`ARCHIVED` lifecycle gate could not be enforced here at all.
+H.4 closes that gap: `planning.routing` is the one module that turns
+current server-owned worker configuration into an exact, durable
+routing decision.
+
+```
+current persistent worker config
+      |
+      v
+workers.production_eligibility.evaluate_production_eligibility()  (canonical,
+      |                                                             unchanged)
+      v
+planning.routing.select_planner_route()
+      |
+      +-- 0 eligible  -> no_eligible_planner_worker  (503, nothing created)
+      +-- >1 eligible -> multiple_eligible_planner_workers (503, nothing created)
+      +-- 1 eligible  -> PlannerRouteBinding
+                            |
+                            v
+      EngineeringPlanningService.create_job()/replan_job()
+        (schema v19, `planning_jobs.worker_id`/`runtime_identity_
+         fingerprint`/`role_evaluation_fingerprint`/
+         `security_certificate_id`/`role_certificate_id`/
+         `output_token_budget`/`tool_choice_enforcement`/
+         `planner_policy_version`, plus schema v20's `planner_timeout_
+         seconds` (H.4.1) — atomically re-verified, INSIDE the
+         same production `BEGIN IMMEDIATE` transaction that creates the
+         plan/job row, against a lifecycle+eligibility recheck; NOT
+         merely `worker.lifecycle_state == ACTIVE` alone)
+                            |
+                            v
+      planning.executor.PlanningJobExecutor
+        (claim -> planning.routing.revalidate_route_binding(),
+         verify_live_runtime=True -> planner_factory_for_worker(worker_id,
+         job_id) -> execute_claimed_job(), which now enforces the job's own
+         certified `output_token_budget` as WorkerRequest.max_output_tokens
+         and constructs the Planner adapter with the job's own certified
+         `planner_timeout_seconds` as OpenAICompatibleConfig.timeout)
+```
+
+**No client authority.** `POST /api/plans`/`POST /api/plans/{plan_id}/
+replan` still accept only `{request}`/`{}` — the closed-set body parser
+(`api.routes.body()`) has no `worker_id`/`model`/`certificate_id`/
+`runtime_identity_fingerprint`/`planner_timeout_seconds` key in its
+spec, so a client that supplies one fails closed with `invalid_fields`
+before routing is ever reached. The backend always selects the worker
+and its Planner inference timeout.
+
+## Certified, durable Planner inference timeout (H.4.1)
+
+H.4's first live production planning job failed after ~31.8s with
+durable provenance `{"error": "adapter_error:transport_timeout",
+"failure_category": "TRANSPORT_ERROR", "outcome": "MALFORMED"}`,
+because `config.bindings.planner_for_worker()` constructed the
+production Planner's `OpenAICompatibleConfig` with no explicit
+`timeout` — silently inheriting `workers.openai_compatible_adapter`'s
+own hardcoded 30.0s default. H.4.1 makes the Planner INFERENCE request
+timeout (`OpenAICompatibleConfig.timeout` for `/v1/chat/completions`
+calls) server-owned, worker-specific, durable, and role-evaluation-
+bound, exactly like `output_token_budget`/`tool_choice_enforcement`
+already were:
+
+- **Distinct from the runtime-attestation probe timeout.** `config.
+  schema.WorkerRuntimeConfig.planner_timeout_seconds` (bounded `1.0`–
+  `1800.0`, default `30.0` for backwards config compatibility) is never
+  conflated with `security.live_certification.
+  LiveOllamaRuntimeExpectation.timeout`, which only bounds
+  `/api/version`/`/api/tags` runtime-attestation probe traffic.
+- **Role-evaluation identity spec v2.** `workers.role_qualification.
+  ROLE_EVALUATION_SPEC_VERSION` bumped `role-evaluation-spec-v1` ->
+  `role-evaluation-spec-v2`, adding the role-generic
+  `execution_timeout_seconds` field (`RoleEvaluationIdentity`/
+  `canonical_role_evaluation_spec()`). A v1-era stored
+  `role_evaluation_fingerprint` never matches a freshly computed v2
+  fingerprint — this intentionally makes any Planner role certificate
+  minted before this change stale once the new v2 profile is activated;
+  it remains durable historical evidence, never reinterpreted or
+  rewritten.
+- **Planner policy version v2.** `planning.planner_certification.
+  PLANNER_CERTIFICATION_POLICY_VERSION` bumped `planner-certification-
+  v1` -> `planner-certification-v2`. No certificate is automatically
+  minted or rewritten under the new version — a worker must undergo an
+  explicit fresh Planner certification under v2 before it can become
+  eligible again.
+- **Certification uses the configured timeout, not the probe's.**
+  `security.live_planner_certification.certify_live_planner_role()`
+  constructs its qualification `OpenAICompatibleConfig.timeout` from
+  the role target's own `planner_timeout_seconds`, records it onto
+  `planning.qualification.RuntimeContextProfile`/`AttemptProvenance`,
+  and refuses to mint a certificate (`planner_timeout_not_enforced`)
+  unless every qualification attempt's provenance shows that exact
+  timeout was used — mirroring the existing output-token-budget proof.
+- **Durable route binding.** `planning.routing.PlannerRouteBinding`
+  gained a ninth field, `planner_timeout_seconds`, included in the
+  exact-match comparison at both creation-time and execution-time
+  revalidation. A queued job never silently adopts a later timeout: if
+  current config/certification timeout changes, the job's own binding
+  goes `ROUTE_BINDING_STALE` and fails closed at execution — no Planner
+  factory or model call is ever made.
+- **Schema v20** (`store.migrations.0020_planner_timeout_binding`) adds
+  a nullable `planner_timeout_seconds REAL` column to `planning_jobs`,
+  extends the immutable-identity and complete-route-binding triggers to
+  cover it, and is purely additive — every pre-v20 row (including a
+  fully-bound schema-v19 row) reads back with `planner_timeout_seconds
+  = NULL`, never a guessed value; `planning.routing.
+  route_binding_from_job()` treats such a row as unbound, exactly like
+  a legacy pre-H.4 job with no `worker_id` at all.
+
+**No ranking yet.** There is no code-owned Planner strength score.
+Zero or multiple currently-eligible candidates both fail closed rather
+than guessing (first config entry, alphabetical, newest certificate,
+...); a later phase may introduce deliberate ranking.
+
+**Candidates come from current config, never stale DB history.** H.3
+deliberately preserves archived/historical worker rows forever;
+`select_planner_route()`'s candidate enumeration is driven by current
+`RuntimeBindings.baseline_certification_targets`/
+`.role_evaluation_targets` (themselves rebuilt fresh from
+`config.bindings.runtime_bindings_from_config()` every time), never a
+`SELECT * FROM workers` scan.
+
+**No reroute, ever.** A job's route binding is immutable after
+creation (`store.migrations.0019_planner_worker_routing`'s
+`planning_jobs_no_mutate_identity` trigger — extended, not replaced).
+If the bound worker later becomes ineligible, the job fails closed
+(`failure_category="routing"`, e.g. `failure_reason=
+"planner_worker_archived"`/`"planner_worker_not_eligible:..."`/
+`"planner_route_binding_stale"`/`"planner_runtime_unreachable"`/
+`"planner_runtime_identity_mismatch"`/`"planner_worker_unbound"`) — it
+is never silently reassigned to a different, currently-eligible
+worker, even one for the exact same role. A newly created (or
+replanned) job independently selects its own binding.
+
+**`planning_jobs` is now H.3 archive-active-work-aware**:
+`workers.lifecycle.archive_worker()` refuses `worker_has_active_work`
+if the worker has ANY `QUEUED`/`RUNNING` planning job bound to it (via
+a dedicated, uncapped `PlanningJobsRepo.has_status_for_worker_in_
+transaction()` query — never a paginated history view), joined into
+the SAME atomic transaction as the pre-existing `runner_runs` check
+(both live in the same production database, so no distributed-
+transaction problem here, unlike Certification Center's separate
+`certification_runs` database).
+
+**Legacy pre-H.4 jobs** (schema v18 and earlier) have `worker_id` and
+every other route-binding column `NULL` — never rewritten to claim a
+binding they never had. A legacy `QUEUED`/reclaimable-`RUNNING` job
+discovered after this migration fails closed
+(`failure_reason="planner_worker_unbound"`) before any Planner
+factory/model call — never guessed onto any worker, certified or not.
+
+**Job failure taxonomy**: `planning_jobs.failure_category` is now
+`planning.models.JobFailureCategory` (`routing`/`planner`/
+`internal_error`) — a coarse, top-level bucket distinct from
+`planning.planner.PlannerFailureCategory` (which classifies WHY a
+Planner *transport turn itself* failed, and now lives inside
+`failure_reason` as `f"malformed_planner_output:{category}"` rather
+than in `failure_category` directly). A routing failure never reached
+a Planner at all and must never be reported under the same vocabulary
+an HTTP/WebUI consumer already reads as "a model turn happened and
+failed."
+
+See `planning.routing`'s own module docstring for the complete,
+authoritative contract.
+
 ## HTTP API
 
 See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
@@ -403,3 +572,25 @@ See [`WEBUI_API.md`](WEBUI_API.md#engineering-planning-phase-82) for
   Repository Intelligence against the *same* working tree at the same
   moment — evidence that safe parallelism here is not yet trivial, so
   the conservative default is kept rather than raised speculatively.
+- ~~Worker lifecycle gates (H.3) cannot currently attribute or enforce
+  anything here~~ — **closed by H.4.** See "Worker-bound Planner
+  routing (H.4)" above: `planning_jobs` now durably records the exact
+  worker/certificate/runtime-identity authority a job was created
+  under, `workers.lifecycle`'s `ACTIVE`/`ARCHIVED` gate is enforced
+  both atomically at creation and again at execution time, and
+  `RuntimeBindings.planner_factory_for_worker: Callable[[worker_id,
+  job_id], Planner]` replaced the old zero-argument `planner_factory`
+  as the real production path (the old field remains only as a
+  legacy, non-authoritative dev/test convenience).
+- There is still no deliberate Planner routing *ranking* — zero or
+  multiple currently-eligible candidates both fail closed (H.4); a
+  later phase may introduce one.
+- ~~The production Planner adapter had no explicit inference timeout,
+  silently inheriting the transport's hardcoded 30.0s default~~ —
+  **closed by H.4.1.** See "Certified, durable Planner inference
+  timeout (H.4.1)" above. The currently deployed Planner role
+  certificate becomes stale once a v2 execution profile (with an
+  explicit `planner_timeout_seconds`) is activated for a worker; a
+  fresh Planner certification under `planner-certification-v2` is
+  required before production planning is eligible again for that
+  worker.

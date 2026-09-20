@@ -9,26 +9,48 @@ are separate modules under `src/code_slayer/api/`.
 
 ## Run locally
 
-Inside the backend checkout, with its virtual environment active:
+After a first-time install from the backend checkout:
+
+```bash
+./cslr install-service
+```
+
+systemd --user starts Code Slayer on boot and binds **127.0.0.1:8765**.
+Ordinary administration is in the WebUI. The terminal is for first-time
+install and emergency recovery (`./cslr status|start|stop|restart`).
+
+For a foreground process from a checkout (no systemd):
 
 ```bash
 python3 -m pip install -e '.[dev]'
-codeslayer serve --repo . --webui-dir ../path-to-codeslayer-webui-sidecar
+./cslr serve
 ```
 
-Pass the actual sidecar checkout directory. Open `http://127.0.0.1:8765`.
-`--webui-dir` is optional for API-only use. `--port` selects another port when an
-old prototype server is already using 8765. Development edits are served directly;
-no asset copying or frontend build is required. Both assets and `/api` use one
-origin. Committed source contains no machine-specific paths. No Sites hosting or
-remote deployment is involved in this local backend integration.
+`--webui-dir` defaults to this checkout's `webui/`. Open `http://127.0.0.1:8765`.
+Development edits are served directly; no asset copying or frontend build is
+required. Both assets and `/api` use one origin. Committed source contains no
+machine-specific paths.
 
-The CLI defaults to **127.0.0.1:8765**, no CORS, no debugger and no authentication.
-Requests require a trusted Host; cross-origin browser requests are rejected.
-Mutations require JSON and reject unknown fields. Body size is capped at 64 KiB.
-For explicit LAN use, set `--host` and `--trusted-host` to the intended bind address
-and host name. This exposes unauthenticated application actions to reachable peers;
-use only an appropriately protected environment. Wildcard CORS is not supported.
+Persistent machine-local configuration lives at
+`~/.config/codeslayer/config.toml` (override: `$CODESLAYER_CONFIG`). It is
+not in Git. Workers, Ollama origins, approved runtime identity, bind address,
+and Tailscale Serve intent are stored there. Fingerprints are derived from
+approved fields at runtime and are never an independent stored authority.
+
+The server binds **loopback only**. `0.0.0.0` is rejected. Remote access is
+optional Tailscale Serve of localhost:8765 (never Funnel). The CLI defaults
+to no CORS, no debugger and no authentication. Requests require a trusted
+Host (exact loopback names, plus the machine's observed MagicDNS). Browser
+`Origin` is URL-parsed and must agree with that Host: loopback WebUI is
+`http://127.0.0.1:PORT` / `http://localhost:PORT` for the matching loopback
+Host; Tailscale WebUI is `https://<exact observed MagicDNS>` (port 443) for
+that exact Host. Allowed origins come from the configured loopback bind and
+local `tailscale status --json` `Self.DNSName`, never from `X-Forwarded-*`,
+`Forwarded`, `CONFIG_BOUND` `tailscale.enabled`, or the Flask backend
+scheme. `Sec-Fetch-Site: cross-site` is rejected. Requests with no Origin
+(CLI/API clients) remain allowed. Mutations require JSON and
+reject unknown fields. Body size is capped at 64 KiB. Wildcard CORS is not
+supported.
 
 The configured repository selects normal external state through `store.location`.
 The existing `CODESLAYER_STATE_ROOT` environment setting can isolate development
@@ -104,20 +126,28 @@ The project's HEAD is not mislabelled as the installed service's source HEAD.
 | --- | --- |
 | `GET /api/plans?limit=100&offset=0` | `{plans: [...]}`; a plan summary/detail per entry (see below), newest first |
 | `GET /api/plans/{plan_id}` | Full plan detail: `state`, `effective_state` (`"STALE"` in place of `"READY"` when the repository has changed since binding), `reason`, revision/predecessor linkage, repository binding, `questions`, and full `content` |
-| `POST /api/plans` | `{request}` → **202** `{job_id, plan_id, state: "QUEUED", status_url}` immediately; `503 planner_not_configured` if no server-side `Planner` is configured. Durable, server-owned background execution — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#durable-background-jobs-phase-82d); HTTP client disconnect never cancels it |
+| `POST /api/plans` | `{request}` → **202** `{job_id, plan_id, state: "QUEUED", status_url, worker_id, ...}` immediately; `503 planner_not_configured`/`no_eligible_planner_worker`/`multiple_eligible_planner_workers` if no single eligible Planner worker is currently available; `409 <reason>` if the backend-selected worker fails its own atomic re-verification before the job is accepted. Durable, server-owned background execution, worker-bound at creation (H.4) — see [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md#durable-background-jobs-phase-82d) and its "Worker-bound Planner routing (H.4)" section; HTTP client disconnect never cancels it. **Never accepts a `worker_id`/`model`/`certificate_id`/`runtime_identity_fingerprint`/`planner_timeout_seconds` field** — the backend always selects the worker and its Planner inference timeout (H.4.1) |
 | `POST /api/plans/{plan_id}/resume` | `{}` → **200**, synchronous: re-evaluates the Question Gate against durable resolutions; never invokes the planner, so there is no long-running turn to background |
-| `POST /api/plans/{plan_id}/replan` | `{}` → **202**, same durable-job contract as `POST /api/plans` |
+| `POST /api/plans/{plan_id}/replan` | `{}` → **202**, same durable-job contract as `POST /api/plans`, including its own freshly and independently selected worker binding — never inherited from the predecessor's job |
 | `POST /api/plans/{plan_id}/resolutions` | `{ambiguity_id, answer, resolution_kind: "FACT" or "AUTHORIZATION"}` → current plan detail through `record_user_resolution`; recording alone does not advance state — resume re-evaluates |
-| `GET /api/planning-jobs?limit=100&offset=0` | `{jobs: [...]}`; each with `job_id`, `plan_id`, `kind` (`"create"`/`"replan"`), `state` (`QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`), `attempt`, timestamps, `failure_category`/`failure_reason` |
+| `GET /api/planning-jobs?limit=100&offset=0` | `{jobs: [...]}`; each with `job_id`, `plan_id`, `kind` (`"create"`/`"replan"`), `state` (`QUEUED`/`RUNNING`/`SUCCEEDED`/`FAILED`), `attempt`, timestamps, `failure_category`/`failure_reason`, and (H.4) `worker_id`, `runtime_identity_fingerprint`, `role_evaluation_fingerprint`, `security_certificate_id`, `role_certificate_id`, `output_token_budget`, `tool_choice_enforcement`, `planner_policy_version` — `null` only for a job created before schema v19 — plus (H.4.1) `planner_timeout_seconds`, `null` only for a job created before schema v20 |
 | `GET /api/planning-jobs/{job_id}` | One job's full durable status — poll this after a `202` until `state` is `SUCCEEDED`/`FAILED`, then read the plan via `plan_id` |
 
 A job's `state` is distinct from the plan's own `state`: `SUCCEEDED` means
 the planner turn itself completed and produced genuine structured output —
 the resulting plan may legitimately be `READY`, `NEEDS_INPUT`, or even
 `DRAFT` (evidence validation rejected a claim). `FAILED` means the turn
-itself never produced valid structured output; `failure_category` is one
-of the small, safe, code-owned `PlannerFailureCategory` values — never raw
-model text, which stays durable-internal-only.
+either never reached a Planner at all (`failure_category: "routing"` — H.4:
+a routing/authorization refusal, e.g. `failure_reason:
+"planner_worker_archived"`/`"planner_worker_not_eligible:..."`/
+`"planner_route_binding_stale"`/`"planner_runtime_unreachable"`/
+`"planner_runtime_identity_mismatch"`/`"planner_worker_unbound"`) or reached
+one that never produced valid structured output (`failure_category:
+"planner"`, `failure_reason: "malformed_planner_output:<category>"` where
+`<category>` is one of the small, safe, code-owned `PlannerFailureCategory`
+values), or an unexpected internal error interrupted execution
+(`failure_category: "internal_error"`) — never raw model/exception/network
+text, which stays durable-internal-only.
 
 A plan's `content` (when not `None`) carries `goal`, `requirements`, `assumptions`,
 `affected_files` (each with `path`, `action`, `reason`, `exists_in_repository`,
@@ -150,6 +180,160 @@ human `ALLOW` decision is the only way a grant exists; nothing a model,
 planner, or worker outputs can create or influence one. See
 [`docs/PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md) for the full
 specification and current-vs-future implementation status.
+
+### Certification Center v1
+
+The browser is a control surface over canonical backend APIs. It never
+computes PASS/FAIL/HARD, never supplies `outcome`, `evidence_ref`,
+`adapter`, fingerprint, digest, or a hard-disqualifier list, and never
+talks to Ollama. Live Baseline Security certification writes only to
+isolated validation state:
+
+`{state_root}/validation-certification/{repo_id}/{worktree_id}/state.db`
+
+never production `{state_root}/repos/{repo_id}/worktrees/{worktree_id}/state.db`.
+Production eligibility is still computed only by
+`evaluate_production_eligibility` against production state.
+
+Expected runtime identity is server-owned persistent config
+(`~/.config/codeslayer/config.toml` → `RuntimeBindings.baseline_certification_targets`),
+never HTTP input. `--runtime-factory` / `runtime_qwen_coder:create_runtime`
+remain emergency wiring only.
+
+**Administrative lifecycle (H.3).** Worker summary/detail also carry
+the DB-authoritative `lifecycle_state`/`lifecycle_changed_at`
+(`POST /api/runtime/workers/{id}/archive`/`.../reactivate`, above).
+An `ARCHIVED` worker remains fully visible here — never hidden — but
+its preflight (`worker_lifecycle_active`, checked before any live
+Ollama/model contact for either track), Baseline Security certification
+start, Baseline Security promotion to PRODUCTION, and Planner
+certification start are all blocked (`worker_archived`), and
+`ready_for_certification`/`promotion_available`/`planner_ready_for_
+certification` all report `false` even if a stale `READY` preflight
+exists from before archival — every mutation boundary re-checks
+lifecycle fresh, never trusting that snapshot. A Certification Center
+run already `QUEUED` when a worker is archived still finishes
+`INCOMPLETE`/`worker_archived` with no model call and no certificate,
+never silently proceeding.
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/certification/workers` | `{environment: "VALIDATION", workers: [...]}` compact status: runtime `VERIFIED`/`MISMATCH`/`UNREACHABLE`/`UNKNOWN` from last durable preflight (never a live probe on GET), Baseline Security from **validation** certificates (`CERTIFIED`/`FAILED`/`NOT_CERTIFIED`), role certificates from production (`CERTIFIED`/`NOT_CERTIFIED`), production eligibility from `evaluate_production_eligibility` (`ELIGIBLE`/`BLOCKED` plus the evaluator's reason) |
+| `GET /api/certification/workers/{id}` | Worker detail: identity with `CONFIG_BOUND` vs `LIVE_ATTESTED` sources (`effective_context_tokens` is config-bound and `measured_by_ollama: false`), last durable preflight, history, `ready_for_certification`, and (H.2) `planner_last_preflight`/`planner_ready_for_certification` — a separate durable-run track, never merged with the Baseline Security fields above or with `roles.PLANNER` (the resulting certificate) |
+| `POST /api/certification/workers/{id}/baseline/preflight` | `{ }` only. Probes Ollama version/tags; **never infers**. Writes a durable READY or INCOMPLETE run. Failed preflight cannot be started. Digest mismatch cannot be started |
+| `POST /api/certification/workers/{id}/baseline/runs` | `{ }` only → **202** `{run_id, state: "QUEUED", ...}` and `Location`. Delegates to `certify_live_baseline_security`. One in-flight attempt; a second POST returns `409 certification_already_in_progress`. Closing the browser does not cancel the run. GET on this path does not start a run |
+| `GET /api/certification/runs/{id}` | Durable run projection. Poll after 202. Progress is derived from run state. Incomplete runs have `has_certificate: false` |
+| `GET /api/certification/runs/{id}/evidence` | Evidence reread through `read_baseline_security_evidence` from the validation ContentStore. `409` if missing/unverified |
+| `GET /api/certification/workers/{id}/history` | `{runs, validation_certificates, production_certificates}` — a run is not a certificate |
+| `POST /api/certification/workers/{id}/baseline/promote` (H.1) | `{ }` only → `{environment: "PRODUCTION", validation_certificate_id, production_certificate_id, runtime_identity_fingerprint, evidence_ref}`. Re-verifies the current live runtime, the most recent matching `PASS` VALIDATION certificate, and its durable evidence, then calls `record_baseline_certificate()` against PRODUCTION state with that same evidence. `409` (with a specific reason code, e.g. `no_validation_certificate`, `validation_certificate_not_pass`, `runtime_identity_fingerprint_mismatch`, `runtime_model_digest_mismatch`, `runtime_version_mismatch`, or an evidence-verification reason) on any fail-closed check. Grants no trust, permission, or role certificate — see `security.production_promotion` |
+| `POST /api/certification/workers/{id}/planner/preflight` (H.2) | `{ }` only. Live-probes Ollama, then consults the EXISTING `evaluate_production_eligibility()` evaluator to check for a matching, current `PASS` PRODUCTION Baseline Security certificate (a baseline-layer denial blocks; a role-layer denial, e.g. `no_role_certificate`, is the expected pre-certification state and does not). Writes a durable READY or INCOMPLETE run (kind `planner_role`) in the same isolated VALIDATION run-tracking table Baseline Security preflight uses — never a live model call |
+| `POST /api/certification/workers/{id}/planner/runs` (H.2) | `{ }` only → **202** `{run_id, state: "QUEUED", ...}` and `Location`. Delegates to `security.live_planner_certification.certify_live_planner_role()`, which runs the fixed `planner-live-qualification-v1` task suite through the EXISTING `planning.qualification.run_corrected_planner_case()`/`planning.planner_certification.certify_planner_from_qualification()` machinery — no second qualification harness. **A PASS records the `worker_role_certificates` row DIRECTLY in PRODUCTION** — unlike Baseline Security, a role certificate has no VALIDATION/PRODUCTION split and there is no separate promote step. FAIL/incomplete/transport-only-failure never mints a PASS. One in-flight attempt; a second POST returns `409 certification_already_in_progress`. Closing the browser does not cancel the run |
+
+Live Coder/Reviewer/Repairer/Security certification is not available in v1
+(`future_actions[].available: false` for those roles). Planner live
+certification is available (H.2) — `future_actions[role=="PLANNER"]`
+reflects the SAME `planner_ready_for_certification` field the worker
+projection already carries, never a client-side inference. PASS, FAIL, and
+HARD_DISQUALIFIED all record a validation certificate; INCOMPLETE does not.
+Baseline Security PRODUCTION certificates exist ONLY via explicit promotion
+of an already-`PASS` VALIDATION certificate (H.1); nothing writes one
+implicitly. None of these routes grant trust, permissions, or production
+eligibility directly — a promoted PRODUCTION Baseline Security certificate,
+and a PASS Planner role certificate, are each still only one of the
+independent inputs `evaluate_production_eligibility` combines with the
+other.
+
+Normal Certification Center startup reads workers/runtime identity from
+persistent config. `CODESLAYER_CERT_*` and `--runtime-factory` are emergency
+wiring, not the ordinary path.
+
+### Current Engineering Control Room frontend
+
+The reconciled frontend is a single Control Room, not a separate admin SPA.
+Its top-level navigation is Dashboard, Projects, Tasks, Models, Intelligence,
+Planning, Privacy & Security, Audit, and Settings.
+
+Administration is intentionally placed inside that existing information
+architecture:
+
+- **Models** keeps the worker/model registry and adds Runtime configuration,
+  explicit live attestation, Ollama server testing, worker registration, and
+  identity approval.
+- **Privacy & Security** keeps permission request/grant UX and adds
+  Certification Center v1. Baseline Security runs and validation certificates
+  remain distinct from production role certificates and Planner eligibility.
+- **Settings** contains System & deployment plus Remote access — Tailscale
+  Serve. Process-start source and current checkout state are displayed
+  separately; the browser displays the backend `deployment_status` /
+  `deployment_complete` verdict rather than deriving one.
+- **Dashboard** contains read-only control-plane summaries from
+  `GET /api/system`, `GET /api/runtime`, `GET /api/certification/workers`, and
+  `GET /api/tailscale`. These use a separate frontend snapshot namespace so
+  Dashboard polling cannot replace Runtime live-attestation evidence,
+  Certification Center selection/run state, or Settings mutation state.
+
+Dashboard summary GETs are partial-failure tolerant: one failed projection is
+shown as unavailable without reusing its previous value as current evidence.
+Request-generation guards prevent older responses from overwriting a newer
+summary or a disconnect invalidation. Dashboard performs no admin mutation,
+live runtime probe, certification action, identity approval, update/restart, or
+Tailscale reconciliation.
+
+Frontend authority rules:
+
+- `GET /api/runtime` is configuration-bound and never becomes
+  `LIVE_ATTESTED` merely because Dashboard/Models loaded it.
+- certification status/eligibility labels are rendered from backend
+  projections; the browser does not infer a certificate or Planner
+  eligibility from checks/history.
+- update-apply and restart responses are operation responses, not current
+  deployment proof. Current deployment comes from a later `GET /api/system`.
+  A lost restart/apply response is `UNKNOWN` from the browser's perspective
+  until current state is refreshed; the mutation is not automatically retried.
+- Tailscale intent, live Serve state, accepted Host, and `remote_access` are
+  separate evidence. `remote_access=VERIFIED` is only the backend's
+  network/Serve/Host-path verdict, not proof that a particular browser Origin
+  request succeeded.
+
+### System / runtime administration
+
+The browser is a control surface over fixed server-owned operations. It
+never runs arbitrary shell, never supplies `outcome` / `evidence_ref` /
+`adapter` / digest / fingerprint / hard-disqualifier lists, and never
+performs LAN discovery.
+
+Ollama add/test connects only to an **operator-entered** http(s) origin
+(connect, not `network.discovery.local`). Tailscale uses the local
+`tailscale` CLI (Serve, never Funnel). Update check fetches the already
+configured `origin` remote of the installed checkout.
+
+Approving a live identity writes the live-attested digest and runtime
+version server-side. A digest mismatch without
+`approve-new-identity` does not overwrite the approved identity.
+Approving a new identity does **not** transfer old certificates
+(`certificates_transferred` is always `false`; eligibility remains an
+exact fingerprint match).
+
+| Method / path | Returns |
+| --- | --- |
+| `GET /api/system` | Service running/stopped, version, **process_commit** captured at process start together with working-tree cleanliness. `process_commit_source` is `VERIFIED` only for a clean checkout with a valid HEAD; dirty tracked/index/untracked (non-ignored) source is `DIRTY` (never `VERIFIED` — an editable install can load that source while HEAD is unchanged); unresolvable Git is `UNVERIFIED`. `process_source_dirty` / `process_source_state` are the immutable process-start tree. **checkout_head** is observed now (`OBSERVED`/`UNVERIFIED`); `checkout_source_dirty` / `checkout_source_state` are the live tree. `deployment_status` is `VERIFIED`/`DIRTY`/`MISMATCH`/`UNVERIFIED`. `deployment_complete` is true only when SHAs match **and** process-start source is `VERIFIED` **and** the current checkout is clean. `running_commit` is the process-start SHA, never a later checkout HEAD. After `git merge` and before restart: process_commit OLD, checkout_head NEW, deployment MISMATCH |
+| `POST /api/system/restart` | `{ }` only. systemd --user restart of `codeslayer.service` |
+| `POST /api/system/update/check` | `{ }` only. Fail-closed git check: expected remotes only, dirty/divergent reported, never a deployment |
+| `POST /api/system/update/apply` | `{ }` only. Fast-forward only. Refuses dirty/divergent/unexpected remotes. `deployment_complete` is false until `GET /api/system` shows `process_commit == checkout_head` with `process_commit_source=VERIFIED` and a clean checkout after restart. `git merge` is not a completed deployment |
+| `GET /api/runtime` | Config-bound Ollama servers and workers. **Does not probe live.** Provenance labels are `CONFIG_BOUND` / `UNVERIFIED`. Each worker also carries the durable administrative lifecycle (H.3, separate from runtime health): `lifecycle_state` (`ACTIVE`/`ARCHIVED`), `lifecycle_changed_at`, and the backend-authoritative `archive_available`/`archive_reason`/`reactivate_available`/`reactivate_reason` the WebUI gates its Archive/Reactivate buttons on. Archived workers remain listed, never hidden. Also carries the server-owned Planner role/execution config as `CONFIG_BOUND` observational data — `output_token_budget`, `tool_choice_enforcement`, `planner_policy_version`, `planner_timeout_seconds` (H.4.1) — never live-inferred or certified here; only a live Planner turn or certification run proves these were actually enforced |
+| `POST /api/runtime/attest` | `{ }` only. Live-attests configured workers (`VERIFIED`/`MISMATCH`/`UNREACHABLE`/`OBSERVED`/`UNVERIFIED`) |
+| `POST /api/runtime/ollama-servers` | `{id, origin}` only. Tests the origin then saves it. Invalid origin: 400. Unreachable: 409, not saved |
+| `POST /api/runtime/ollama-servers/{id}/test` | `{ }` only. Live inventory (`LIVE_ATTESTED`) — observation, not identity approval |
+| `POST /api/runtime/workers` | `{worker_id, ollama_server_id, model_tag}` plus optional kind/network_class/context/temperature/normalizer, and (H.4.1) `output_token_budget`/`tool_choice_enforcement`/`planner_policy_version`/`planner_timeout_seconds` (`planner_timeout_seconds` bounded `1.0`–`1800.0`, same as the TOML schema). **Rejects digest/fingerprint/outcome/adapter/evidence_ref.** Preserves any already-approved identity. **Registers a new worker, or updates an existing one, through this one path.** For a NEW worker, any optional field omitted uses the schema default. For an EXISTING worker, any optional field omitted **preserves that worker's current persisted value** — it is never silently reset to a schema default; only fields the request actually supplies change. `planner_timeout_seconds` is role-evaluation identity material, not common runtime identity: changing it alone leaves the approved runtime identity and its fingerprint untouched, but makes the worker's existing Planner role certificate no longer match the new role-evaluation profile (`role_certificate_evaluation_profile_mismatch`) until a fresh Planner certification is run under the new value — this endpoint itself never issues, revokes, or touches any certificate |
+| `POST /api/runtime/workers/{id}/approve` | `{ }` only. Approves the live-attested digest/version. Mismatch against an existing approved identity returns `MISMATCH` and does not overwrite |
+| `POST /api/runtime/workers/{id}/approve-new-identity` | `{ }` only. Replaces the approved identity from live attestation. Does not transfer certificates |
+| `POST /api/runtime/workers/{id}/archive` | `{ }` only (H.3). Sets administrative lifecycle to `ARCHIVED` — blocks new production runs/resumes, Certification Center preflight/start/promotion, and production eligibility (`worker_archived`), never a delete: worker row, config, certificates, trust, permission grants, certification/runner history, and evidence blobs are all preserved untouched. Idempotent (already-`ARCHIVED` is a no-op success). Refuses with `409 worker_has_active_work` if the worker has a non-terminal production run or a `QUEUED`/`RUNNING` Certification Center run. Returns the current lifecycle projection |
+| `POST /api/runtime/workers/{id}/reactivate` | `{ }` only (H.3). Sets administrative lifecycle back to `ACTIVE`. Idempotent (already-`ACTIVE` is a no-op success). Issues no certificate and starts no work by itself — production eligibility is simply re-derived by the existing evaluator from whatever certificates/runtime identity are still on file. Restart/re-registration/config-reload/identity-approval/certification-run/certificate-promotion never implicitly reactivate an archived worker — only this endpoint does |
+| `GET /api/tailscale` | Node connectivity from `tailscale status --json` (`OBSERVED`) plus Serve mapping from `tailscale serve status --json`. **Host:** machine MagicDNS from `Self.DNSName` only (trailing dot stripped, exact hostname, never suffix/wildcard/IP). `host.accepted` is independent verification that this process would accept that Host header. **Intent:** `CONFIG_BOUND` `enabled` vs live Serve presence; drift is `alignment: MISMATCH` and is not silently rewritten. `serve_status=VERIFIED` is the exact CSLR-owned Serve topology: HTTPS :443, the machine MagicDNS host, handler `/`, configured loopback proxy, Funnel false, and no other proxy/host/handler/TCP forward. A matching proxy among extra forwards is `MISMATCH`, not `VERIFIED`. `remote_access` is `VERIFIED` only when the node is Connected **and** that exact topology is live **and** the Serve Host is accepted. That is network/Serve/Host-path evidence, **not** a claim that a browser same-origin WebUI request would succeed — Origin acceptance is a separate boundary (loopback HTTP vs MagicDNS HTTPS, above). Connected-without-Serve is `UNVERIFIED`. Wrong backend, extra forwarding, or Funnel is `MISMATCH`. Malformed/unavailable Serve status is `UNVERIFIED`/`ERROR`, never `VERIFIED` |
+| `POST /api/tailscale/enable` | `{ }` only. Fail-closed reconciliation. **Adopt** (no CLI) only when live evidence is the full usable path: node `Connected`, exact CSLR Serve topology (`serve_status=VERIFIED`), Funnel false, exact Host accepted, `remote_access=VERIFIED`. **Configure** with `tailscale serve --bg http://127.0.0.1:PORT` only when Serve is attested `not_configured` (`LIVE_ATTESTED`), the node is `Connected`, and the exact Host is already accepted. After that CLI, a fresh live read must satisfy the adopt predicate or the request is `409 tailscale_enable_unverified` and **config is unchanged**. Mixed topology (expected mapping plus extra handler/host/TCP/proxy), backend `MISMATCH`, Funnel, ERROR, UNVERIFIED, node not Connected, Host rejected, or `remote_access` not `VERIFIED` while a mapping exists: `409`, no mutation, config unchanged. Never Funnel. No `--yes` (serve-set does not prompt; `serve reset` does not register `--yes`; see admin/tailscale.py). Trusted Host discovery is live |
+| `POST /api/tailscale/disable` | `{ }` only. Attested `not_configured`: no CLI, persist `enabled=false`. Exact CSLR-owned topology (`serve_status=VERIFIED`, no Funnel): `tailscale serve reset`, then persist false only if a fresh read is attested absent. Expected mapping plus extra handler/host/TCP, mixed/ambiguous topology, backend `MISMATCH`, Funnel, ERROR, UNVERIFIED: `409`, no reset, config unchanged. Never resets an unexpected or mixed external Serve config |
+
+`CONFIG_BOUND` `enabled` is written only after live evidence matches the requested end state. Enable persists `true` only for an already-exact live path, or after a successful allowlisted `serve --bg` whose **fresh** read is that same exact path. A CLI that returns 0 but whose follow-up observation is not `remote_access=VERIFIED` is `409 tailscale_enable_unverified`; intent stays false; the JSON never reports `alignment`/`remote_access` `VERIFIED` from the CLI exit code. Disable persists `false` only when Serve is attested absent, or after `serve reset` whose fresh read is attested absent. A response always re-reads live state; `enabled` is never a claim that Serve is up.
 
 A summary contains run/task IDs, status, worker/role, creation/update timestamps,
 question strings, reason code and execution worktree ID. Detailed questions contain
@@ -188,16 +372,40 @@ No AUTO or model mutation trust was added. The `/api/intelligence/*` routes
 (Phase 8.1, [`REPOSITORY_INTELLIGENCE.md`](REPOSITORY_INTELLIGENCE.md)), the
 `/api/plans*` routes (Phase 8.2, [`ENGINEERING_PLANNING.md`](ENGINEERING_PLANNING.md)),
 and the `/api/permissions*` routes (Governance Foundation slice G2,
-[`PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)) are the additions since WebUI
-Foundation 1 — deterministic, read-only repository evidence, planning, and
-now permission consent/revocation, never a filesystem/DB path from the
-client, never a new authority: a repository fact still cannot become trusted
-`ResolutionEvidence` except through the existing, unmodified
-application-owned authority path, a `READY` plan authorizes no execution, no
-mutation, and no command, and `/api/permissions*` can only decide on or
-revoke a permission request/grant a trusted backend subsystem already
-created — never mint one, and never accept anything beyond `{decision}` /
-`{}` in a mutating body.
+[`PERMISSIONS_MODEL.md`](PERMISSIONS_MODEL.md)), and the
+`/api/certification*` routes (Certification Center v1) are the
+additions since WebUI Foundation 1 — deterministic, read-only
+repository evidence, planning, permission consent/revocation, and a
+control surface over isolated Baseline Security certification — together
+with `/api/system*`, `/api/runtime*`, and `/api/tailscale*` (local
+service administration). Never a
+filesystem/DB path from the client, never a new authority: a repository
+fact still cannot become trusted `ResolutionEvidence` except through the
+existing, unmodified application-owned authority path, a `READY` plan
+authorizes no execution, no mutation, and no command,
+`/api/permissions*` can only decide on or revoke a permission
+request/grant a trusted backend subsystem already created — never mint
+one, and never accept anything beyond `{decision}` / `{}` in a mutating
+body — and `/api/certification*` never accepts an outcome, score,
+pass/fail, evidence reference, adapter, digest, fingerprint, certificate
+id, role-policy identity, or test results. Live Baseline Security
+certification writes only to isolated validation state. The one
+exception is the explicit H.1 promotion action
+(`POST /api/certification/workers/{id}/baseline/promote`), which durably
+re-verifies and carries an already-`PASS` VALIDATION certificate forward
+into PRODUCTION state — still with an empty `{}` body, still never a
+client-supplied outcome/evidence/certificate id, and still never itself a
+grant of trust, permissions, or a role certificate (see `security.
+production_promotion`). H.2's Planner certification routes
+(`POST /api/certification/workers/{id}/planner/preflight` and
+`.../planner/runs`) are the same closed-set `{}`-only shape; a PASS run
+records a PRODUCTION role certificate directly (see `security.
+live_planner_certification`), still never itself a grant of trust or
+permissions, and production eligibility is still computed only by the
+unmodified `evaluate_production_eligibility()`.
+`/api/runtime*` never accepts a client-supplied digest or fingerprint;
+`/api/system*` and `/api/tailscale*` map only to fixed argv tuples,
+never a shell string.
 
 Audit payloads use an allowlist of short machine fields. Prompt/answer contents,
 provider errors, raw parameters, large blobs, filesystem locations and lease tokens
@@ -211,13 +419,55 @@ absent. Missing execution state is explicitly surfaced.
 
 ## Validation
 
+Frontend/admin reconciliation is accepted from current source plus explicit
+evidence. A model/assistant self-report is not a test result, and pre-existing
+repository failures are not silently relabelled as reconciliation regressions.
+
+Focused reconciliation gates:
+
 ```bash
-python3 -m pytest -q
-.venv/bin/ruff check .
+BASE="/mnt/AI/cslr-pytest-webui-$(date +%Y%m%d-%H%M%S)-$$"
+
+env -u PYTHONPATH .venv/bin/python -m pytest   tests/unit/test_service_admin.py   tests/unit/test_certification_center.py   tests/unit/test_runtime_identity_separation.py   tests/unit/test_production_promotion.py   tests/unit/test_config_bindings.py   -q --basetemp="$BASE"
+
+env -u PYTHONPATH .venv/bin/ruff check .
 git diff --check
-# In the sidecar:
+
+cd webui
 npm test
 ```
+
+A full `pytest -q` run is still required as a diagnostic before merge/deploy.
+If the repository baseline is not green, classify every failure against the
+pre-reconciliation baseline and block on any **new** failure in the changed
+surface. Do not claim the full suite passed when it did not.
+
+`mypy .` is currently a diagnostic, not a reconciliation acceptance gate,
+until the repository-wide type-check baseline itself is clean. New type errors
+in changed code still block their owning change; unrelated pre-existing type
+errors do not become evidence that a documentation/frontend-only change
+regressed runtime behavior.
+
+Before merge/deploy, run a browser smoke against the actual served checkout.
+At minimum verify all nine navigation views load, then:
+
+1. Dashboard renders the four read-only summaries and exposes no admin action.
+2. Models GET-load does not live-attest; explicit attestation/test/approval
+   controls remain explicit.
+3. Privacy & Security still renders permission UX and Certification Center;
+   changing worker selection cannot bind an old run/evidence response.
+4. Settings distinguishes process vs checkout deployment evidence; update
+   check is explicit; apply/restart require inline confirmation; a lost
+   response is not presented as success and is not retried.
+5. Tailscale intent, Serve status, Host acceptance, and `remote_access` remain
+   distinct; no arbitrary topology/public-ingress control is exposed.
+6. Disconnect/reconnect invalidates current admin/Dashboard evidence rather
+   than continuing to display it as current.
+7. No browser console error, failed same-origin asset load, or unexpected API
+   mutation occurs while merely navigating/read-loading views.
+
+Only after that browser smoke should the reconciliation branch be considered
+ready for merge/deployment review.
 
 Tests use temporary Git repositories/control databases and deterministic fake worker
 responses. They execute the real runner, gate, human-resolution recording, trust,

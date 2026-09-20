@@ -1,0 +1,1631 @@
+<!doctype html>
+<html lang="en">
+
+
+<!-- =========================================================
+     DOCUMENT HEAD
+     ========================================================= -->
+
+<head>
+  <meta charset="utf-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+  >
+
+  <title>
+    Code Slayer — Engineering Control Room
+  </title>
+
+  <link
+    rel="manifest"
+    href="/manifest.json"
+  >
+
+  <link
+    rel="stylesheet"
+    href="/static/app.css"
+  >
+</head>
+
+
+<!-- =========================================================
+     BODY
+     ========================================================= -->
+
+<body>
+
+
+  <!-- =======================================================
+       APP SHELL
+       ======================================================= -->
+
+  <div class="app-shell">
+
+
+    <!-- =====================================================
+         SIDEBAR
+         ===================================================== -->
+
+    <aside class="sidebar">
+
+
+      <!-- ===================================================
+           BRAND
+           =================================================== -->
+
+      <div class="brand">
+
+        <div class="brand-mark">
+          CS
+        </div>
+
+        <div>
+
+          <div class="brand-title">
+            CSLR
+          </div>
+
+          <div class="brand-subtitle">
+            Engineering Control Room
+          </div>
+
+        </div>
+
+      </div>
+
+
+      <!-- ===================================================
+           MAIN NAVIGATION
+           =================================================== -->
+
+      <nav
+        class="nav"
+        aria-label="Main navigation"
+      >
+
+        <button
+          class="nav-item active"
+          data-view="dashboard"
+        >
+          Dashboard
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="projects"
+        >
+          Projects
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="tasks"
+        >
+          Tasks
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="models"
+        >
+          Models
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="intelligence"
+        >
+          Intelligence
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="planning"
+        >
+          Planning
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="privacy"
+        >
+          Privacy &amp; Security
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="audit"
+        >
+          Audit
+        </button>
+
+        <button
+          class="nav-item"
+          data-view="settings"
+        >
+          Settings
+        </button>
+
+      </nav>
+
+
+      <!-- ===================================================
+           CONNECTION STATUS
+           =================================================== -->
+
+      <div class="sidebar-footer">
+
+        <div
+          id="connection-dot"
+          class="status-dot offline"
+        ></div>
+
+        <span id="connection-label">
+          Connecting…
+        </span>
+
+      </div>
+
+    </aside>
+
+
+    <!-- =====================================================
+         MAIN CONTENT
+         ===================================================== -->
+
+    <main class="main">
+
+
+      <!-- ===================================================
+           TOP BAR
+           =================================================== -->
+
+      <header class="topbar">
+
+
+        <!-- Project identity -->
+
+        <div>
+
+          <div class="eyebrow">
+            PROJECT
+          </div>
+
+          <h1 id="project-name">
+            Loading project…
+          </h1>
+
+        </div>
+
+
+        <!-- Main actions -->
+
+        <div class="topbar-actions">
+
+          <button
+            id="refresh"
+            class="ghost"
+          >
+            Refresh
+          </button>
+
+          <button
+            id="new-run"
+            class="primary"
+            disabled
+          >
+            Start task
+          </button>
+
+        </div>
+
+      </header>
+
+
+      <!-- ===================================================
+           GLOBAL NOTICE
+           =================================================== -->
+
+      <p
+        id="notice"
+        class="notice"
+        role="status"
+        aria-live="polite"
+      >
+        Connecting to backend…
+      </p>
+
+
+      <!-- ===================================================
+           DASHBOARD
+           =================================================== -->
+
+      <section
+        id="dashboard"
+        class="view active"
+      >
+
+
+        <!-- =================================================
+             ATTENTION + CURRENT TASK
+             ================================================= -->
+
+        <div class="grid main-grid">
+
+
+          <!-- Attention -->
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+
+                <div class="eyebrow">
+                  ATTENTION
+                </div>
+
+                <h2>
+                  Needs your attention
+                </h2>
+
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Questions or decisions that require you will appear here.
+            </p>
+
+            <div id="questions"></div>
+
+            <button
+              id="resume"
+              class="primary"
+              disabled
+            >
+              Resume task
+            </button>
+
+          </article>
+
+
+          <!-- Current task -->
+
+          <article class="card current-task-card">
+
+            <div class="card-head">
+
+              <div>
+
+                <div class="eyebrow">
+                  CURRENT TASK
+                </div>
+
+                <h2 id="run-heading">
+                  Loading tasks…
+                </h2>
+
+              </div>
+
+              <span
+                id="run-badge"
+                class="badge muted"
+              >
+                WAITING
+              </span>
+
+            </div>
+
+            <div
+              id="run-detail"
+              class="empty-state"
+            >
+              Waiting for backend data.
+            </div>
+
+            <details>
+
+              <summary>
+                Technical details
+              </summary>
+
+              <pre id="run-advanced">No task selected.</pre>
+
+            </details>
+
+          </article>
+
+        </div>
+
+
+        <!-- =================================================
+             RECENT TASKS
+             ================================================= -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                HISTORY
+              </div>
+
+              <h2>
+                Recent tasks
+              </h2>
+
+            </div>
+
+          </div>
+
+          <div id="runs-list">
+            Loading…
+          </div>
+
+          <button
+            id="load-more"
+            class="ghost small"
+            hidden
+          >
+            Load older tasks
+          </button>
+
+        </article>
+
+
+        <!-- =================================================
+             SYSTEM METRICS
+             ================================================= -->
+
+        <div class="grid cards-4">
+
+
+          <!-- Backend -->
+
+          <article class="card metric">
+
+            <div class="metric-label">
+              Backend
+            </div>
+
+            <div
+              id="backend-status"
+              class="metric-value"
+            >
+              CONNECTING
+            </div>
+
+            <div
+              id="backend-version"
+              class="metric-foot"
+            >
+              Waiting for API
+            </div>
+
+          </article>
+
+
+          <!-- Active model -->
+
+          <article class="card metric">
+
+            <div class="metric-label">
+              Active model
+            </div>
+
+            <div
+              id="current-worker"
+              class="metric-value"
+            >
+              —
+            </div>
+
+            <div
+              id="worker-network"
+              class="metric-foot"
+            >
+              No task selected
+            </div>
+
+          </article>
+
+
+          <!-- Repository -->
+
+          <article class="card metric">
+
+            <div class="metric-label">
+              Repository
+            </div>
+
+            <div
+              id="project-head"
+              class="metric-value"
+            >
+              —
+            </div>
+
+            <div
+              id="project-branch"
+              class="metric-foot"
+            >
+              Loading…
+            </div>
+
+          </article>
+
+
+          <!-- History loaded -->
+
+          <article class="card metric">
+
+            <div class="metric-label">
+              History loaded
+            </div>
+
+            <div
+              id="run-count"
+              class="metric-value"
+            >
+              —
+            </div>
+
+            <div class="metric-foot">
+              Durable task state
+            </div>
+
+          </article>
+
+        </div>
+
+
+        <!-- =================================================
+             CONTROL PLANE SUMMARY
+             ================================================= -->
+
+        <article class="card" id="dashboard-control-summary">
+
+          <div class="card-head">
+            <div>
+              <div class="eyebrow">CONTROL PLANE</div>
+              <h2>Read-only summaries</h2>
+            </div>
+          </div>
+
+          <p class="muted-text">
+            Separate GET snapshots for deployment, runtime configuration,
+            certification projection, and remote access. Dashboard never
+            performs live attestation, certification, or administrative mutation.
+          </p>
+
+          <div class="grid cards-4">
+
+            <article class="card metric">
+              <div class="metric-label">Deployment</div>
+              <div id="dashboard-system-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Runtime configuration</div>
+              <div id="dashboard-runtime-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Certification projection</div>
+              <div id="dashboard-certification-summary">Loading…</div>
+            </article>
+
+            <article class="card metric">
+              <div class="metric-label">Remote access</div>
+              <div id="dashboard-tailscale-summary">Loading…</div>
+            </article>
+
+          </div>
+
+        </article>
+
+
+        <!-- =================================================
+             TECHNICAL ACTIVITY
+             ================================================= -->
+
+        <article class="card">
+
+          <details>
+
+            <summary>
+              Technical activity
+            </summary>
+
+            <div class="card-head">
+
+              <div>
+
+                <div class="eyebrow">
+                  AUDIT
+                </div>
+
+                <h2>
+                  Recent activity
+                </h2>
+
+              </div>
+
+            </div>
+
+            <div
+              id="audit-preview"
+              class="timeline"
+            >
+              Select a task to see its audit trail.
+            </div>
+
+          </details>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           PROJECTS
+           =================================================== -->
+
+      <section
+        id="projects"
+        class="view"
+      >
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <h2>
+              Current project
+            </h2>
+
+          </div>
+
+          <div id="project-detail">
+            Loading…
+          </div>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           TASKS
+           =================================================== -->
+
+      <section
+        id="tasks"
+        class="view"
+      >
+
+        <article class="card">
+
+
+          <!-- Task header -->
+
+          <div class="card-head">
+
+            <h2>
+              Start a task
+            </h2>
+
+          </div>
+
+
+          <!-- Explanation -->
+
+          <p class="muted-text">
+            The backend analyzes your prompt and decides whether to ask
+            questions or execute a bounded read-only turn.
+          </p>
+
+
+          <!-- Task form -->
+
+          <form id="start-form">
+
+
+            <!-- Prompt -->
+
+            <label>
+
+              Prompt
+
+              <textarea
+                id="prompt"
+                required
+                maxlength="32768"
+                rows="5"
+              ></textarea>
+
+            </label>
+
+
+            <!-- Worker settings -->
+
+            <div class="settings-grid">
+
+
+              <!-- Registered worker -->
+
+              <label>
+
+                Registered worker
+
+                <select
+                  id="worker"
+                  required
+                ></select>
+
+              </label>
+
+
+              <!-- Role -->
+
+              <label>
+
+                Role
+
+                <select
+                  id="role"
+                  required
+                >
+                  <option value="coder">
+                    Coder
+                  </option>
+
+                  <option value="planner">
+                    Planner
+                  </option>
+
+                  <option value="reviewer">
+                    Reviewer
+                  </option>
+
+                  <option value="repairer">
+                    Repairer
+                  </option>
+
+                  <option value="security">
+                    Security
+                  </option>
+                </select>
+
+              </label>
+
+            </div>
+
+
+            <!-- Submit -->
+
+            <button
+              id="start-submit"
+              class="primary"
+              disabled
+            >
+              Start run
+            </button>
+
+          </form>
+
+
+          <!-- Task help -->
+
+          <p
+            id="start-help"
+            class="muted-text"
+          >
+            Waiting for backend configuration.
+          </p>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           MODELS
+           =================================================== -->
+
+      <section
+        id="models"
+        class="view"
+      >
+
+        <div class="models-layout">
+
+
+          <!-- Model registry -->
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  MODEL REGISTRY
+                </div>
+
+                <h2>
+                  Models
+                </h2>
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Registered workers and current availability.
+            </p>
+
+            <div
+              id="workers-list"
+              class="model-grid"
+            >
+              Loading…
+            </div>
+
+          </article>
+
+
+          <!-- Selected model -->
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  SELECTED MODEL
+                </div>
+
+                <h2>
+                  Details
+                </h2>
+              </div>
+
+            </div>
+
+            <div id="worker-detail">
+              Select a model to inspect its trust and conformance.
+            </div>
+
+          </article>
+
+        </div>
+
+        <div
+          id="runtime-stack"
+          class="runtime-stack"
+        >
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  RUNTIME
+                </div>
+
+                <h2>
+                  Runtime configuration
+                </h2>
+              </div>
+
+              <button
+                id="runtime-attest"
+                class="ghost small"
+                type="button"
+              >
+                Live attest runtime
+              </button>
+
+            </div>
+
+            <p class="muted-text">
+              Configured runtime state is not a live probe.
+              GET /api/runtime is CONFIG_BOUND / UNVERIFIED information.
+              Live attestation appears only after the explicit control below.
+            </p>
+
+            <div id="runtime-attestation">
+              <p class="muted-text">
+                No live attestation in this session. Configured runtime state is not a live probe.
+              </p>
+            </div>
+
+          </article>
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  CONNECT
+                </div>
+
+                <h2>
+                  Ollama servers
+                </h2>
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Operator-entered connect targets, not LAN discovery.
+              A test is live observation, not model identity approval.
+            </p>
+
+            <div id="runtime-servers">
+              Loading…
+            </div>
+
+            <form id="ollama-server-form">
+
+              <label>
+                Server ID
+                <input
+                  id="ollama-server-id"
+                  name="server_id"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <label>
+                Origin
+                <input
+                  id="ollama-server-origin"
+                  name="origin"
+                  required
+                  maxlength="500"
+                  autocomplete="off"
+                  placeholder="http://127.0.0.1:<port>"
+                >
+              </label>
+
+              <button
+                id="ollama-server-submit"
+                class="small"
+                type="submit"
+              >
+                Add Ollama server
+              </button>
+
+            </form>
+
+          </article>
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <div>
+                <div class="eyebrow">
+                  RUNTIME WORKERS
+                </div>
+
+                <h2>
+                  Runtime workers
+                </h2>
+              </div>
+
+            </div>
+
+            <p class="muted-text">
+              Persistent Runtime configuration — distinct from the model
+              registry above. Digest and version values are display-only.
+            </p>
+
+            <div id="runtime-workers">
+              Loading…
+            </div>
+
+            <form id="runtime-worker-form">
+
+              <label>
+                Worker ID
+                <input
+                  id="runtime-worker-id"
+                  name="worker_id"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <label>
+                Ollama server
+                <select
+                  id="runtime-worker-server"
+                  name="ollama_server_id"
+                  required
+                >
+                  <option value="">
+                    No configured servers
+                  </option>
+                </select>
+              </label>
+
+              <label>
+                Model tag
+                <input
+                  id="runtime-worker-model"
+                  name="model_tag"
+                  required
+                  maxlength="200"
+                  autocomplete="off"
+                >
+              </label>
+
+              <details id="runtime-worker-advanced">
+
+                <summary>
+                  Advanced settings
+                </summary>
+
+                <label>
+                  Kind
+                  <input
+                    id="runtime-worker-kind"
+                    name="kind"
+                    maxlength="100"
+                    autocomplete="off"
+                    placeholder="openai_compatible"
+                  >
+                </label>
+
+                <label>
+                  Network class
+                  <input
+                    id="runtime-worker-network"
+                    name="network_class"
+                    maxlength="100"
+                    autocomplete="off"
+                    placeholder="local"
+                  >
+                </label>
+
+                <label>
+                  Effective context tokens
+                  <input
+                    id="runtime-worker-context"
+                    name="effective_context_tokens"
+                    inputmode="numeric"
+                    autocomplete="off"
+                    placeholder="16384"
+                  >
+                </label>
+
+                <label>
+                  Temperature
+                  <input
+                    id="runtime-worker-temperature"
+                    name="temperature"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    placeholder="0"
+                  >
+                </label>
+
+                <label>
+                  Normalizer ID
+                  <input
+                    id="runtime-worker-normalizer-id"
+                    name="normalizer_id"
+                    maxlength="200"
+                    autocomplete="off"
+                  >
+                </label>
+
+                <label>
+                  Normalizer version
+                  <input
+                    id="runtime-worker-normalizer-version"
+                    name="normalizer_version"
+                    inputmode="numeric"
+                    autocomplete="off"
+                  >
+                </label>
+
+              </details>
+
+              <button
+                id="runtime-worker-submit"
+                class="small"
+                type="submit"
+              >
+                Register runtime worker
+              </button>
+
+            </form>
+
+          </article>
+
+        </div>
+
+      </section>
+
+
+      <!-- ===================================================
+           INTELLIGENCE
+           =================================================== -->
+
+      <section
+        id="intelligence"
+        class="view"
+      >
+
+
+        <!-- =================================================
+             INDEX STATUS
+             ================================================= -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                REPOSITORY INTELLIGENCE
+              </div>
+
+              <h2>
+                Index status
+              </h2>
+
+            </div>
+
+            <span
+              id="intel-badge"
+              class="badge muted"
+            >
+              NOT INDEXED
+            </span>
+
+          </div>
+
+          <p class="muted-text">
+            Deterministic, read-only repository evidence — never a model guess.
+            Reduces the need to hand an entire repository to a worker.
+          </p>
+
+          <div id="intel-status">
+            Loading…
+          </div>
+
+          <button
+            id="intel-refresh"
+            class="ghost small"
+          >
+            Refresh index
+          </button>
+
+        </article>
+
+
+        <!-- =================================================
+             PROJECTS + COMMANDS
+             ================================================= -->
+
+        <div class="grid main-grid">
+
+
+          <!-- Detected projects -->
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <h2>
+                Detected projects
+              </h2>
+
+            </div>
+
+            <div
+              id="intel-projects"
+              class="model-grid"
+            >
+              —
+            </div>
+
+          </article>
+
+
+          <!-- Discovered commands -->
+
+          <article class="card">
+
+            <div class="card-head">
+
+              <h2>
+                Discovered commands
+              </h2>
+
+            </div>
+
+            <p class="muted-text">
+              Discovered only — never executed by Code Slayer.
+            </p>
+
+            <div id="intel-commands">
+              —
+            </div>
+
+          </article>
+
+        </div>
+
+
+        <!-- =================================================
+             RELEVANT FILE SEARCH
+             ================================================= -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <h2>
+              Find relevant files
+            </h2>
+
+          </div>
+
+          <p class="muted-text">
+            Deterministic ranking only — exact path/symbol matches and
+            import proximity, never a model.
+          </p>
+
+          <form id="intel-query-form">
+
+            <label>
+
+              Describe a task
+
+              <textarea
+                id="intel-query-text"
+                required
+                maxlength="4096"
+                rows="3"
+              ></textarea>
+
+            </label>
+
+            <button
+              class="primary small"
+              type="submit"
+            >
+              Find relevant files
+            </button>
+
+          </form>
+
+          <div id="intel-results">
+            Describe a task above to find relevant files.
+          </div>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           PLANNING
+           =================================================== -->
+
+      <section
+        id="planning"
+        class="view"
+      >
+
+
+        <!-- =================================================
+             PLANS
+             ================================================= -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                ENGINEERING PLANNING
+              </div>
+
+              <h2>
+                Plans
+              </h2>
+
+            </div>
+
+            <span
+              id="planning-badge"
+              class="badge muted"
+            >
+              NOT CONFIGURED
+            </span>
+
+          </div>
+
+          <p class="muted-text">
+            Deterministic, evidence-validated engineering plans — planning only.
+            Nothing here mutates a file, executes a command, or grants trust.
+          </p>
+
+          <form id="plan-form">
+
+            <label>
+
+              Describe an engineering request
+
+              <textarea
+                id="plan-request"
+                required
+                maxlength="32768"
+                rows="4"
+              ></textarea>
+
+            </label>
+
+            <button
+              id="plan-submit"
+              class="primary small"
+              type="submit"
+              disabled
+            >
+              Create plan
+            </button>
+
+          </form>
+
+          <p
+            id="plan-help"
+            class="muted-text"
+          >
+            Waiting for backend configuration.
+          </p>
+
+          <div
+            id="plan-list"
+            class="model-grid"
+          >
+            Loading…
+          </div>
+
+        </article>
+
+
+        <!-- =================================================
+             SELECTED PLAN
+             ================================================= -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                SELECTED PLAN
+              </div>
+
+              <h2 id="plan-heading">
+                No plan selected
+              </h2>
+
+            </div>
+
+            <span
+              id="plan-state-badge"
+              class="badge muted"
+            >
+              —
+            </span>
+
+          </div>
+
+          <div id="plan-detail">
+            <div class="plan-empty">
+              <div class="plan-empty-title">No plan selected</div>
+              <div class="muted-text">
+                Select a plan above to inspect its engineering details.
+              </div>
+            </div>
+          </div>
+
+          <div id="plan-questions"></div>
+
+          <div class="topbar-actions">
+
+            <button
+              id="plan-resume"
+              class="ghost small"
+              disabled
+            >
+              Resume
+            </button>
+
+            <button
+              id="plan-replan"
+              class="ghost small"
+              disabled
+            >
+              Replan
+            </button>
+
+          </div>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           PRIVACY & SECURITY
+           =================================================== -->
+
+      <section
+        id="privacy"
+        class="view"
+      >
+
+
+        <!-- Pending requests -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                PRIVACY &amp; SECURITY
+              </div>
+
+              <h2>
+                Pending requests
+              </h2>
+
+            </div>
+
+            <span
+              id="privacy-badge"
+              class="badge muted"
+            >
+              —
+            </span>
+
+          </div>
+
+          <p class="muted-text">
+            Every permission CSLR has ever asked for, decided, or revoked.
+            Nothing is granted without your explicit Allow, and nothing a model
+            outputs can grant or widen a permission.
+          </p>
+
+          <div
+            id="privacy-pending"
+            class="model-grid"
+          >
+            Loading…
+          </div>
+
+        </article>
+
+
+        <!-- Active permissions -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <h2>
+                Active permissions
+              </h2>
+
+            </div>
+
+          </div>
+
+          <div
+            id="privacy-active"
+            class="model-grid"
+          >
+            Loading…
+          </div>
+
+        </article>
+
+
+        <!-- Permission history -->
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <div>
+
+              <h2>
+                History
+              </h2>
+
+            </div>
+
+          </div>
+
+          <p class="muted-text">
+            Denied and revoked permissions.
+            Historical evidence is never deleted.
+          </p>
+
+          <div
+            id="privacy-history"
+            class="model-grid"
+          >
+            Loading…
+          </div>
+
+        </article>
+
+
+        <!-- Certification Center -->
+
+        <article class="card" id="cert-stack">
+
+          <div class="card-head">
+
+            <div>
+
+              <div class="eyebrow">
+                CERTIFICATION CENTER
+              </div>
+
+              <h2>
+                Certification workers
+              </h2>
+
+            </div>
+
+            <span
+              id="cert-badge"
+              class="badge muted"
+            >
+              —
+            </span>
+
+          </div>
+
+          <p class="muted-text">
+            Baseline Security certification runs here use isolated VALIDATION state.
+            They do not grant trust, permissions, or production eligibility.
+            This projection is not the model registry and is not Runtime configuration.
+          </p>
+
+          <div class="models-layout">
+
+            <div
+              id="cert-workers"
+            >
+              Loading…
+            </div>
+
+            <div>
+
+              <div
+                id="cert-detail"
+              >
+                Select a certification worker.
+              </div>
+
+              <div
+                id="cert-run"
+              ></div>
+
+              <div
+                id="cert-planner-run"
+              ></div>
+
+              <div
+                id="cert-evidence"
+              ></div>
+
+            </div>
+
+          </div>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           AUDIT
+           =================================================== -->
+
+      <section
+        id="audit"
+        class="view"
+      >
+
+        <article class="card">
+
+          <div class="card-head">
+
+            <h2>
+              Selected run audit
+            </h2>
+
+          </div>
+
+          <p class="muted-text">
+            Latest 100 events across control and execution state.
+            This view does not verify the audit hash chain.
+          </p>
+
+          <div
+            id="audit-timeline"
+            class="timeline"
+          >
+            Select a run.
+          </div>
+
+        </article>
+
+      </section>
+
+
+      <!-- ===================================================
+           SETTINGS
+           =================================================== -->
+
+      <section id="settings" class="view">
+
+        <article class="card" id="system-settings-card">
+          <div class="card-head"><div><div class="eyebrow">SYSTEM</div><h2>System &amp; deployment</h2></div></div>
+          <p class="muted-text">Current deployment state comes only from GET /api/system. Process and checkout state are shown separately; the browser does not derive deployment verification.</p>
+          <div id="system-settings">Loading…</div>
+        </article>
+
+        <article class="card" id="tailscale-settings-card">
+          <div class="card-head"><div><div class="eyebrow">REMOTE ACCESS</div><h2>Remote access — Tailscale Serve</h2></div></div>
+          <p class="muted-text">Server-observed Tailscale node, Serve, host, intent, and remote-access state. No public-ingress control or arbitrary topology editor is exposed here.</p>
+          <div id="tailscale-settings">Loading…</div>
+        </article>
+
+      </section>
+
+    </main>
+
+  </div>
+
+
+  <!-- =======================================================
+       JAVASCRIPT
+       ======================================================= -->
+
+  <script
+    type="module"
+    src="/static/app.js"
+  ></script>
+
+
+</body>
+</html>

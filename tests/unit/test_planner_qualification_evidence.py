@@ -11,10 +11,12 @@ that evidence. Nothing here issues a live/production certificate.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from code_slayer.audit.canonical import canonical_json
 from code_slayer.planning.fake_planner import FakePlanner
 from code_slayer.planning.planner import (
     PlannerOutcome,
@@ -23,7 +25,10 @@ from code_slayer.planning.planner import (
     PlannerStructuredOutput,
     ToolCallTransport,
 )
-from code_slayer.planning.planner_certification import certify_planner_from_qualification
+from code_slayer.planning.planner_certification import (
+    PLANNER_CERTIFICATION_POLICY_VERSION,
+    certify_planner_from_qualification,
+)
 from code_slayer.planning.qualification import (
     RuntimeContextProfile,
     run_planner_case_with_correction,
@@ -72,6 +77,7 @@ _PROFILE = RuntimeContextProfile(
     endpoint="http://local:11436/v1",
     runtime_version="0.1.0",
     temperature=0.0,
+    planner_timeout_seconds=45.0,
 )
 
 
@@ -83,13 +89,15 @@ def _identity_and_eval(results, profile=_PROFILE):
         runtime_identity_fingerprint=identity_fp,
         output_token_budget=profile.output_token_budget,
         tool_choice_enforcement=profile.tool_choice_enforcement,
-        policy_version="planner-certification-v1",
+        execution_timeout_seconds=profile.planner_timeout_seconds,
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
     )
     evaluation_spec = canonical_role_evaluation_spec(
         role=evaluation.role,
         runtime_identity_fingerprint=evaluation.runtime_identity_fingerprint,
         output_token_budget=evaluation.output_token_budget,
         tool_choice_enforcement=evaluation.tool_choice_enforcement,
+        execution_timeout_seconds=evaluation.execution_timeout_seconds,
         policy_version=evaluation.policy_version,
     )
     return identity_spec, identity_fp, evaluation_spec, evaluation.role_evaluation_fingerprint
@@ -106,7 +114,7 @@ def _build_document(results, profile=_PROFILE, *, classification="PASS_FIRST_TRY
         runtime_identity_fingerprint=identity_fp,
         role_evaluation_spec=evaluation_spec,
         role_evaluation_fingerprint=evaluation_fp,
-        policy_version="planner-certification-v1",
+        policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
         classification=classification,
     ), identity_fp, evaluation_fp
 
@@ -391,6 +399,7 @@ def test_native_vs_normalized_transport_is_retained_in_evidence(conn, blobs_dir)
         endpoint=_PROFILE.endpoint,
         runtime_version=_PROFILE.runtime_version,
         temperature=_PROFILE.temperature,
+        planner_timeout_seconds=_PROFILE.planner_timeout_seconds,
         normalizer_id="qwen_textual_tool_v1",
         normalizer_version=1,
     )
@@ -532,3 +541,225 @@ def test_document_records_attempt_count_correction_and_classification(conn, blob
     assert _SECRET_RAW not in json.dumps(document)
     # blobs_dir type is retained for restart-style callers
     assert isinstance(blobs_dir, Path)
+
+
+# -- H.4.1 Blocker 2: durable Planner inference timeout in evidence ----------
+
+
+def test_new_evidence_is_v3_with_role_evaluation_spec_v2_and_timeout_everywhere(
+    conn, blobs_dir,
+):
+    """New evidence is `planner-qualification-evidence-v3`, its
+    `role_evaluation_spec` carries the CURRENT `role-evaluation-spec-v2`
+    shape (with `execution_timeout_seconds`), every persisted attempt's
+    own provenance records the timeout it actually used, and the
+    top-level document exposes the same bounded value as
+    `planner_timeout_seconds`."""
+    result = _certify(conn, blobs_dir, (_pass_result(),))
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        conn, blobs_dir, result.certificate.evidence_ref,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+    assert document["spec_version"] == QUALIFICATION_EVIDENCE_SPEC_VERSION
+    assert document["spec_version"] == "planner-qualification-evidence-v3"
+    assert document["role_evaluation_spec"]["spec_version"] == "role-evaluation-spec-v2"
+    assert document["role_evaluation_spec"]["execution_timeout_seconds"] == 45.0
+    assert document["planner_timeout_seconds"] == 45.0
+    for instance in document["instances"]:
+        for attempt in instance["provenance"]:
+            assert attempt["planner_timeout_seconds"] == 45.0
+
+
+def test_attempt_timeout_mismatch_across_instances_refuses_evidence_build():
+    """Mirrors the existing output-token-budget/tool-choice-enforcement
+    evidence-integrity checks: two instances whose attempts used
+    DIFFERENT Planner inference timeouts must never be collapsed into
+    one evidence document."""
+    other_profile = replace(_PROFILE, planner_timeout_seconds=120.0)
+    results = (_pass_result(profile=_PROFILE), _pass_result(profile=other_profile))
+    identity_spec, identity_fp, evaluation_spec, evaluation_fp = _identity_and_eval(
+        results, _PROFILE,
+    )
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        build_planner_qualification_evidence_document(
+            results=results,
+            runtime_identity_spec=identity_spec,
+            runtime_identity_fingerprint=identity_fp,
+            role_evaluation_spec=evaluation_spec,
+            role_evaluation_fingerprint=evaluation_fp,
+            policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+            classification="PASS_FIRST_TRY",
+        )
+
+
+def test_attempt_timeout_missing_refuses_new_evidence_build():
+    """An attempt whose provenance never established `planner_timeout_
+    seconds` (e.g. a pre-H.4.1-shaped profile) must refuse new evidence
+    construction -- never silently built against the certified spec's
+    own timeout as if the attempt had actually used it."""
+    no_timeout_profile = replace(_PROFILE, planner_timeout_seconds=None)
+    result = _pass_result(profile=no_timeout_profile)
+    assert result.provenance[0].planner_timeout_seconds is None
+    identity_spec, identity_fp, evaluation_spec, evaluation_fp = _identity_and_eval(
+        (result,), _PROFILE,
+    )
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        build_planner_qualification_evidence_document(
+            results=(result,),
+            runtime_identity_spec=identity_spec,
+            runtime_identity_fingerprint=identity_fp,
+            role_evaluation_spec=evaluation_spec,
+            role_evaluation_fingerprint=evaluation_fp,
+            policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
+            classification="PASS_FIRST_TRY",
+        )
+
+
+def test_tampered_attempt_timeout_in_persisted_evidence_refuses_verification(conn, blobs_dir):
+    """The top-level runtime-identity/role-evaluation fingerprints alone
+    never cover a per-attempt field -- `_verify_v3_document()`'s own
+    dedicated re-check is what catches a persisted document whose
+    per-attempt `planner_timeout_seconds` was tampered with after the
+    fact, even though both outer fingerprints still recompute
+    correctly."""
+    result = _certify(conn, blobs_dir, (_pass_result(),))
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        conn, blobs_dir, result.certificate.evidence_ref,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"][0]["provenance"][0]["planner_timeout_seconds"] = 999.0
+    store = ContentStore(conn, blobs_dir)
+    tampered_payload = canonical_json(tampered).encode("utf-8")
+    tampered_blob = store.put(
+        tampered_payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        read_planner_qualification_evidence(
+            conn, blobs_dir, tampered_blob.content_hash,
+            expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+            expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+        )
+
+
+# -- H.4.1 review round 3: v3 read must never vacuously accept a --------------
+# -- document with no real, provably-timed attempt at all --------------------
+
+
+def _certified_v3_document(conn, blobs_dir):
+    """A real, freshly certified, valid v3 document plus the certificate
+    that reads it -- the shared starting point every tamper test below
+    mutates a COPY of."""
+    result = _certify(conn, blobs_dir, (_pass_result(),))
+    assert result.ok, result.reason
+    document = read_planner_qualification_evidence(
+        conn, blobs_dir, result.certificate.evidence_ref,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+    return result, document
+
+
+def _reread_tampered(conn, blobs_dir, result, tampered):
+    """Store `tampered` (a mutated copy of an authentic document) as its
+    own new content-addressed blob and attempt to read it back under the
+    ORIGINAL certificate's expected fingerprints -- exactly what a
+    caller re-reading durable evidence would do."""
+    store = ContentStore(conn, blobs_dir)
+    payload = canonical_json(tampered).encode("utf-8")
+    blob = store.put(
+        payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    return read_planner_qualification_evidence(
+        conn, blobs_dir, blob.content_hash,
+        expected_runtime_identity_fingerprint=result.certificate.runtime_identity_fingerprint,
+        expected_role_evaluation_fingerprint=result.certificate.role_evaluation_fingerprint,
+    )
+
+
+def test_v3_read_succeeds_for_a_genuinely_valid_document(conn, blobs_dir):
+    """Baseline: the already-added happy path, kept alongside the
+    refusal cases below so a future regression in the stricter checks
+    is caught immediately next to what it would break."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    assert document["spec_version"] == "planner-qualification-evidence-v3"
+    assert document["instances"]
+    assert document["instances"][0]["provenance"]
+
+
+def test_v3_read_refuses_missing_instances_key(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_empty_instances_list(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"] = []
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_instance_with_missing_provenance_key(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"][0]["provenance"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_instance_with_empty_provenance_list(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"][0]["provenance"] = []
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_missing_top_level_timeout(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["planner_timeout_seconds"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_top_level_timeout_disagreeing_with_canonical_spec(conn, blobs_dir):
+    """The top-level `planner_timeout_seconds` convenience copy must
+    never be allowed to disagree with its own canonical authority
+    (`role_evaluation_spec.execution_timeout_seconds`), even though
+    changing it alone does not touch either outer fingerprint."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["planner_timeout_seconds"] = 999.0
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_attempt_with_missing_timeout(conn, blobs_dir):
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    del tampered["instances"][0]["provenance"][0]["planner_timeout_seconds"]
+    with pytest.raises(QualificationEvidenceError, match="malformed_qualification_evidence"):
+        _reread_tampered(conn, blobs_dir, result, tampered)
+
+
+def test_v3_read_refuses_attempt_timeout_disagreeing_with_canonical_spec(conn, blobs_dir):
+    """Mirrors `test_tampered_attempt_timeout_in_persisted_evidence_
+    refuses_verification` above, named to match the explicit review
+    checklist -- kept as a separate, narrowly-named test rather than
+    folded away."""
+    result, document = _certified_v3_document(conn, blobs_dir)
+    tampered = json.loads(json.dumps(document))
+    tampered["instances"][0]["provenance"][0]["planner_timeout_seconds"] = 999.0
+    with pytest.raises(QualificationEvidenceError, match="role_evaluation_fingerprint_mismatch"):
+        _reread_tampered(conn, blobs_dir, result, tampered)

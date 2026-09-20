@@ -1,0 +1,565 @@
+"""WebUI/CLI administration facade. Browser is a control surface only."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+from code_slayer import __version__
+from code_slayer.admin.process import ProcessError
+from code_slayer.admin.runtime import attest_worker
+from code_slayer.admin.service import restart_service, service_status
+from code_slayer.admin.tailscale import (
+    disable_serve,
+    enable_serve,
+    exact_desired_live_serve,
+    intent_alignment,
+    plan_disable,
+    plan_enable,
+    serve_absent_attested,
+)
+from code_slayer.admin.tailscale import status as tailscale_status
+from code_slayer.admin.updates import apply_update, check_for_update
+from code_slayer.api.service import APIError
+from code_slayer.config.schema import (
+    ConfigError,
+    OllamaServerConfig,
+    WorkerRuntimeConfig,
+)
+from code_slayer.security.certification_service import KIND_BASELINE, KIND_PLANNER
+from code_slayer.security.live_certification import probe_ollama_inventory
+from code_slayer.store.certification_runs_repo import CertificationRunsRepo
+
+
+class AdminFacade:
+    def __init__(self, application) -> None:
+        self._app = application
+
+    def system_status(self) -> dict:
+        status = service_status()
+        process = self._app.process_identity
+        checkout = self._app.current_checkout_identity()
+        checkout_head_source = "OBSERVED" if checkout.commit is not None else "UNVERIFIED"
+        checkout_state_source = (
+            "OBSERVED" if checkout.dirty is not None else "UNVERIFIED"
+        )
+        if (
+            process.commit is None
+            or checkout.commit is None
+            or process.dirty is None
+            or checkout.dirty is None
+        ):
+            deployment_status = "UNVERIFIED"
+            deployment_complete = False
+        elif process.commit != checkout.commit:
+            deployment_status = "MISMATCH"
+            deployment_complete = False
+        elif process.commit_source != "VERIFIED" or checkout.dirty:
+            deployment_status = "DIRTY"
+            deployment_complete = False
+        else:
+            deployment_status = "VERIFIED"
+            deployment_complete = True
+        cfg = self._app.persistent_config()
+        return {
+            "service": {
+                "state": status.state,
+                "running": status.active,
+                "unit": status.unit,
+                "source": status.source,
+                "version": __version__,
+                "process_commit": process.commit,
+                "process_commit_source": process.commit_source,
+                "process_source_dirty": process.dirty,
+                "process_source_state": process.state,
+                "running_commit": process.commit,
+                "running_commit_source": process.commit_source,
+                "checkout_head": checkout.commit,
+                "checkout_head_source": checkout_head_source,
+                "checkout_source_dirty": checkout.dirty,
+                "checkout_source_state": checkout.state,
+                "checkout_source_state_source": checkout_state_source,
+                "deployment_status": deployment_status,
+                "deployment_complete": deployment_complete,
+                "uptime_seconds": int(time.monotonic() - self._app._started_at),
+            },
+            "network": {
+                "local_url": f"http://{cfg.server.host}:{cfg.server.port}",
+                "bind_host": cfg.server.host,
+                "bind_port": cfg.server.port,
+            },
+            "health": self._health_fragment(),
+        }
+
+    def _health_fragment(self) -> dict:
+        try:
+            with self._app.reads() as reads:
+                project = reads.project()
+            return {
+                "status": "ok",
+                "schema_version": project["schema_version"],
+                "source": "VERIFIED",
+            }
+        except Exception:
+            return {"status": "unavailable", "schema_version": None, "source": "UNVERIFIED"}
+
+    def runtime_overview(self, *, probe: bool = False) -> dict:
+        cfg = self._app.persistent_config()
+        servers = []
+        for server in cfg.ollama_servers:
+            entry = {
+                "id": server.server_id,
+                "origin": server.origin,
+                "origin_source": "CONFIG_BOUND",
+            }
+            if probe:
+                try:
+                    inventory = probe_ollama_inventory(server.origin)
+                    entry["live"] = {
+                        "status": "LIVE_ATTESTED",
+                        "runtime_version": inventory.runtime_version,
+                        "models": [
+                            {"name": item.name, "digest": item.digest}
+                            for item in inventory.models
+                        ],
+                    }
+                except ValueError as exc:
+                    entry["live"] = {
+                        "status": "UNREACHABLE",
+                        "reason": str(exc) or "runtime_probe_unavailable",
+                    }
+            servers.append(entry)
+        workers = []
+        for worker in cfg.workers:
+            attestation = None
+            if probe:
+                attestation = asdict(attest_worker(cfg, worker))
+            workers.append({
+                "worker_id": worker.worker_id,
+                "kind": worker.kind,
+                "network_class": worker.network_class,
+                "ollama_server_id": worker.ollama_server_id,
+                "model_tag": {"value": worker.model_tag, "source": "CONFIG_BOUND"},
+                "approved_model_digest": {
+                    "value": worker.approved_model_digest,
+                    "source": "CONFIG_BOUND" if worker.approved_model_digest else "UNVERIFIED",
+                },
+                "approved_runtime_version": {
+                    "value": worker.approved_runtime_version,
+                    "source": "CONFIG_BOUND" if worker.approved_runtime_version else "UNVERIFIED",
+                },
+                "effective_context_tokens": {
+                    "value": worker.effective_context_tokens,
+                    "source": "CONFIG_BOUND",
+                    "measured_by_ollama": False,
+                },
+                "temperature": {"value": worker.temperature, "source": "CONFIG_BOUND"},
+                "normalizer_id": {"value": worker.normalizer_id, "source": "CONFIG_BOUND"},
+                "normalizer_version": {
+                    "value": worker.normalizer_version, "source": "CONFIG_BOUND",
+                },
+                # H.4.1: server-owned role/execution config, observational
+                # only -- lets an operator verify what they just saved
+                # through register_worker(). Never live-inferred/certified
+                # here; a live Planner turn/certification run is the only
+                # thing that ever proves these were actually enforced.
+                "output_token_budget": {
+                    "value": worker.output_token_budget, "source": "CONFIG_BOUND",
+                },
+                "tool_choice_enforcement": {
+                    "value": worker.tool_choice_enforcement, "source": "CONFIG_BOUND",
+                },
+                "planner_policy_version": {
+                    "value": worker.planner_policy_version, "source": "CONFIG_BOUND",
+                },
+                "planner_timeout_seconds": {
+                    "value": worker.planner_timeout_seconds, "source": "CONFIG_BOUND",
+                },
+                "identity_approved": worker.identity_approved,
+                "attestation": attestation,
+                **self._lifecycle_view(worker.worker_id),
+            })
+        return {"ollama_servers": servers, "workers": workers}
+
+    def _lifecycle_view(self, worker_id: str) -> dict:
+        """H.3: the DB `workers.lifecycle_state` merged into a config-
+        bound worker entry -- operator state, never runtime liveness.
+        A worker declared in persistent config but never yet registered
+        in the DB (should not normally happen once `refresh_persistent_
+        workers()` has run) reports ACTIVE/available -- there is
+        nothing to archive yet. `archive_available`/`reactivate_
+        available` are a display snapshot of current lifecycle only,
+        never a live-recomputed guarantee that a mutation will succeed
+        (the mutation itself is the real authority, and independently
+        enforces the active-work invariant)."""
+        with self._app.reads() as reads:
+            worker = reads.worker(worker_id)
+        if worker is None:
+            return {
+                "lifecycle_state": "ACTIVE",
+                "lifecycle_changed_at": None,
+                "archive_available": True,
+                "archive_reason": "",
+                "reactivate_available": False,
+                "reactivate_reason": "not_archived",
+            }
+        active = worker.lifecycle_state == "ACTIVE"
+        return {
+            "lifecycle_state": worker.lifecycle_state,
+            "lifecycle_changed_at": worker.lifecycle_changed_at,
+            "archive_available": active,
+            "archive_reason": "" if active else "already_archived",
+            "reactivate_available": not active,
+            "reactivate_reason": "" if not active else "already_active",
+        }
+
+    def _active_certification_work_reason(self, worker_id: str) -> str | None:
+        """H.3: a SEPARATE, best-effort, non-atomic, cross-DB
+        precondition (never part of the canonical lifecycle
+        transaction -- see `workers.lifecycle`'s own module docstring
+        for exactly why, and why correctness never depends on this
+        alone). `None` means no QUEUED/RUNNING Certification Center run
+        was observed for either track at the moment of this read; a
+        READY (not yet started) run is never "active work" here, same
+        as `workers.lifecycle`'s own runner_runs policy."""
+        with self._app.certification() as service:
+            conn = service.validation_conn()
+            for kind in (KIND_BASELINE, KIND_PLANNER):
+                active = CertificationRunsRepo(conn).active_for_worker(worker_id, kind=kind)
+                if active is not None and active.state in ("QUEUED", "RUNNING"):
+                    return "worker_has_active_work"
+        return None
+
+    def archive_worker(self, worker_id: str) -> dict:
+        blocking = self._active_certification_work_reason(worker_id)
+        if blocking is not None:
+            raise APIError(blocking, "A certification run is currently active.", 409)
+        with self._app.runner() as runner:
+            result = runner.archive_worker(worker_id)
+        if not result.ok:
+            if result.reason == "unknown_worker":
+                raise APIError("not_found", "Worker is not registered.", 404)
+            raise APIError(result.reason, "Worker has active work and cannot be archived.", 409)
+        return self._lifecycle_view(worker_id)
+
+    def reactivate_worker(self, worker_id: str) -> dict:
+        with self._app.runner() as runner:
+            result = runner.reactivate_worker(worker_id)
+        if not result.ok:
+            if result.reason == "unknown_worker":
+                raise APIError("not_found", "Worker is not registered.", 404)
+            raise APIError(result.reason, "Worker could not be reactivated.", 409)
+        return self._lifecycle_view(worker_id)
+
+    def add_ollama_server(self, server_id: str, origin: str) -> dict:
+        try:
+            probe_ollama_inventory(origin)
+        except ValueError as exc:
+            # Still allow saving an origin only after it is a valid origin
+            # AND reachable — discovery is not approval of a model digest.
+            reason = str(exc) or "runtime_probe_unavailable"
+            if reason.startswith("ollama_root"):
+                raise APIError(reason, "Ollama origin is not allowed.", 400) from None
+            raise APIError(reason, "Ollama server is unreachable.", 409) from None
+        cfg = self._app.persistent_config()
+        cfg = cfg.with_ollama_server(OllamaServerConfig(server_id=server_id, origin=origin))
+        try:
+            self._app.save_persistent_config(cfg)
+        except ConfigError as exc:
+            raise APIError("invalid_config", str(exc), 400) from None
+        return self.runtime_overview(probe=False)
+
+    def test_ollama_server(self, server_id: str) -> dict:
+        cfg = self._app.persistent_config()
+        server = cfg.server_by_id(server_id)
+        if server is None:
+            raise APIError("not_found", "Ollama server is not configured.", 404)
+        try:
+            inventory = probe_ollama_inventory(server.origin)
+        except ValueError as exc:
+            raise APIError(
+                str(exc) or "runtime_probe_unavailable",
+                "Ollama probe failed.",
+                409,
+            ) from None
+        return {
+            "id": server.server_id,
+            "origin": server.origin,
+            "status": "LIVE_ATTESTED",
+            "runtime_version": inventory.runtime_version,
+            "models": [
+                {"name": item.name, "digest": item.digest} for item in inventory.models
+            ],
+        }
+
+    def register_worker(self, data: dict) -> dict:
+        """Register a NEW worker, or update an EXISTING one, through the
+        one supported admin path. For a NEW worker, any optional field
+        `data` omits uses `WorkerRuntimeConfig`'s own schema default. For
+        an EXISTING worker, any optional field `data` omits PRESERVES that
+        worker's current persisted value -- it is never silently reset to
+        a dataclass default (H.4.1 fix: `planner_timeout_seconds`/
+        `output_token_budget`/`tool_choice_enforcement`/`planner_policy_
+        version` -- and, for consistency, `effective_context_tokens`/
+        `temperature`/`normalizer_id`/`normalizer_version`/`kind`/
+        `network_class` -- previously collapsed to their defaults on
+        every re-registration, which is exactly how the earlier v1->v2
+        planner_policy_version alignment only worked by coincidence,
+        since every other live value already happened to equal its
+        default). Every optional field goes through the SAME `_optional()`
+        helper below -- one consistent preservation path, not a
+        per-field special case.
+
+        `approved_model_digest`/`approved_runtime_version` are never
+        client-suppliable here (the closed-set route spec has no such
+        keys) and are always carried forward from the existing worker,
+        unchanged -- runtime identity approval remains exclusively
+        `approve_worker_identity()`'s own job.
+
+        Distinguishing "field omitted" (preserve) from an explicit
+        request to clear `normalizer_id`/`normalizer_version` is not
+        needed here: the closed-set route spec types both as plain
+        `str`/`int`, so JSON `null` (or an empty string) for either was
+        already rejected before reaching this method, both before and
+        after this change -- there has never been a supported way to
+        submit an explicit "clear normalizer" request distinct from
+        omitting the keys, so preserving on omission introduces no new
+        ambiguity."""
+        cfg = self._app.persistent_config()
+        if cfg.server_by_id(data["ollama_server_id"]) is None:
+            raise APIError("not_found", "Ollama server is not configured.", 404)
+        existing = cfg.worker_by_id(data["worker_id"])
+        digest = existing.approved_model_digest if existing else None
+        version = existing.approved_runtime_version if existing else None
+
+        def _optional(key: str, default):
+            """`data[key]` if the caller supplied it; otherwise the
+            EXISTING worker's own current value when updating, or
+            `default` (the schema default) when registering new."""
+            if key in data:
+                return data[key]
+            if existing is not None:
+                return getattr(existing, key)
+            return default
+
+        try:
+            worker = WorkerRuntimeConfig(
+                worker_id=data["worker_id"],
+                kind=_optional("kind", "openai_compatible"),
+                network_class=_optional("network_class", "local"),
+                ollama_server_id=data["ollama_server_id"],
+                model_tag=data["model_tag"],
+                approved_model_digest=digest,
+                approved_runtime_version=version,
+                effective_context_tokens=_optional("effective_context_tokens", 16384),
+                temperature=_optional("temperature", 0.0),
+                normalizer_id=_optional("normalizer_id", None),
+                normalizer_version=_optional("normalizer_version", None),
+                output_token_budget=_optional("output_token_budget", 4096),
+                tool_choice_enforcement=_optional(
+                    "tool_choice_enforcement", "ADVISORY_ONLY_UNVERIFIED",
+                ),
+                planner_policy_version=_optional(
+                    "planner_policy_version", "planner-certification-v2",
+                ),
+                planner_timeout_seconds=_optional("planner_timeout_seconds", 30.0),
+            )
+        except ConfigError as exc:
+            raise APIError("invalid_config", str(exc), 400) from None
+        try:
+            self._app.save_persistent_config(cfg.with_worker(worker))
+        except ConfigError as exc:
+            raise APIError("invalid_config", str(exc), 400) from None
+        return self.runtime_overview(probe=False)
+
+    def approve_worker_identity(self, worker_id: str, *, allow_replace: bool) -> dict:
+        cfg = self._app.persistent_config()
+        worker = cfg.worker_by_id(worker_id)
+        if worker is None:
+            raise APIError("not_found", "Worker is not configured.", 404)
+        attestation = attest_worker(cfg, worker)
+        if attestation.observed_digest is None or attestation.observed_version is None:
+            raise APIError(
+                attestation.reason, "Cannot approve without a live-attested digest.", 409,
+            )
+        if (
+            worker.identity_approved
+            and not allow_replace
+            and attestation.status == "MISMATCH"
+        ):
+            return {
+                "status": "MISMATCH",
+                "reason": "runtime_identity_mismatch",
+                "configured_digest": worker.approved_model_digest,
+                "observed_digest": attestation.observed_digest,
+                "configured_version": worker.approved_runtime_version,
+                "observed_version": attestation.observed_version,
+                "replaced": False,
+            }
+        updated = WorkerRuntimeConfig(
+            worker_id=worker.worker_id,
+            kind=worker.kind,
+            network_class=worker.network_class,
+            ollama_server_id=worker.ollama_server_id,
+            model_tag=worker.model_tag,
+            approved_model_digest=attestation.observed_digest,
+            approved_runtime_version=attestation.observed_version,
+            effective_context_tokens=worker.effective_context_tokens,
+            temperature=worker.temperature,
+            normalizer_id=worker.normalizer_id,
+            normalizer_version=worker.normalizer_version,
+            output_token_budget=worker.output_token_budget,
+            tool_choice_enforcement=worker.tool_choice_enforcement,
+            planner_policy_version=worker.planner_policy_version,
+            planner_timeout_seconds=worker.planner_timeout_seconds,
+        )
+        self._app.save_persistent_config(cfg.with_worker(updated))
+        return {
+            "status": "VERIFIED",
+            "reason": "approved_from_live_attestation",
+            "configured_digest": updated.approved_model_digest,
+            "observed_digest": attestation.observed_digest,
+            "replaced": allow_replace and worker.identity_approved,
+            "certificates_transferred": False,
+        }
+
+    def restart(self) -> dict:
+        try:
+            restart_service()
+        except ProcessError as exc:
+            raise APIError(exc.code, "Service restart failed.", 409) from None
+        return {"status": "restarted", "unit": "codeslayer.service"}
+
+    def update_check(self) -> dict:
+        cfg = self._app.persistent_config()
+        checkout = Path(cfg.server.checkout or self._app.repo_path)
+        try:
+            result = check_for_update(checkout)
+        except ProcessError as exc:
+            raise APIError(exc.code, "Update check failed.", 409) from None
+        return asdict(result)
+
+    def update_apply(self) -> dict:
+        cfg = self._app.persistent_config()
+        checkout = Path(cfg.server.checkout or self._app.repo_path)
+        try:
+            result = apply_update(checkout)
+        except ProcessError as exc:
+            raise APIError(exc.code, "Update refused or failed.", 409) from None
+        restart_error = None
+        try:
+            restart_service()
+        except ProcessError as exc:
+            restart_error = exc.code
+        payload = asdict(result)
+        payload["restart_requested"] = restart_error is None
+        payload["restart_error"] = restart_error
+        payload["deployment_complete"] = False
+        payload["deployment_note"] = (
+            "git merge is not a completed deployment; poll GET /api/system "
+            "for process_commit == checkout_head with process_commit_source "
+            "VERIFIED and a clean checkout after restart"
+        )
+        return payload
+
+    def tailscale_view(self) -> dict:
+        cfg = self._app.persistent_config()
+        runner, static_hosts = self._tailscale_request_context()
+        view = tailscale_status(
+            runner=runner,
+            backend_host=cfg.server.host, backend_port=cfg.server.port,
+            static_trusted_hosts=static_hosts,
+        )
+        alignment = intent_alignment(cfg.tailscale.enabled, view.serve_status)
+        return {
+            "node": {"state": view.node_state, "source": view.node_source},
+            "serve": {
+                "status": view.serve_status,
+                "source": view.serve_source,
+                "expected_backend": view.expected_backend,
+                "observed_backend": view.observed_backend,
+                "funnel_detected": view.funnel_detected,
+                "hosts": list(view.serve_hosts),
+            },
+            "host": {
+                "name": view.dns_name,
+                "source": view.dns_name_source,
+                "accepted": view.host_accepted,
+                "accepted_source": view.host_accepted_source,
+            },
+            "intent": {
+                "enabled": cfg.tailscale.enabled,
+                "enabled_source": "CONFIG_BOUND",
+                "alignment": alignment,
+            },
+            "remote_access": view.remote_access,
+            "url": view.url,
+            "backend": view.expected_backend,
+            "enabled": cfg.tailscale.enabled,
+            "enabled_source": "CONFIG_BOUND",
+            "alignment": alignment,
+            "detail": view.detail,
+            "source": view.source,
+        }
+
+    @staticmethod
+    def _tailscale_request_context():
+        from code_slayer.admin.hosts import LOOPBACK_TRUSTED_HOSTS
+
+        try:
+            from flask import current_app, has_request_context
+        except ImportError:
+            return None, LOOPBACK_TRUSTED_HOSTS
+        if not has_request_context():
+            return None, LOOPBACK_TRUSTED_HOSTS
+        runner = current_app.config.get("TAILSCALE_RUNNER")
+        static = current_app.config.get("STATIC_TRUSTED_HOSTS") or LOOPBACK_TRUSTED_HOSTS
+        return runner, tuple(static)
+
+    def tailscale_set(self, enabled: bool) -> dict:
+        cfg = self._app.persistent_config()
+        runner, static_hosts = self._tailscale_request_context()
+
+        def observe():
+            return tailscale_status(
+                runner=runner,
+                backend_host=cfg.server.host,
+                backend_port=cfg.server.port,
+                static_trusted_hosts=static_hosts,
+            )
+
+        view = observe()
+        try:
+            if enabled:
+                plan = plan_enable(view)
+                if plan == "adopt":
+                    pass
+                elif plan == "configure":
+                    enable_serve(
+                        runner=runner,
+                        backend_host=cfg.server.host,
+                        backend_port=cfg.server.port,
+                    )
+                    view = observe()
+                    if not exact_desired_live_serve(view):
+                        raise ProcessError("tailscale_enable_unverified")
+                else:
+                    raise ProcessError(plan)
+            else:
+                plan = plan_disable(view)
+                if plan == "clear_intent":
+                    pass
+                elif plan == "reset":
+                    disable_serve(runner=runner)
+                    view = observe()
+                    if not serve_absent_attested(view):
+                        raise ProcessError("tailscale_disable_unverified")
+                else:
+                    raise ProcessError(plan)
+        except ProcessError as exc:
+            raise APIError(exc.code, "Tailscale operation failed.", 409) from None
+        # Persist intent only after live evidence matches the requested end
+        # state. CONFIG_BOUND enabled is not LIVE_ATTESTED remote_access.
+        self._app.save_persistent_config(cfg.with_tailscale_enabled(enabled))
+        return self.tailscale_view()

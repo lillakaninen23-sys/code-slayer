@@ -20,6 +20,8 @@ from code_slayer.intelligence.service import RepositoryIntelligenceService
 from code_slayer.planning.fake_planner import FakePlanner
 from code_slayer.planning.planner import (
     PlannerAffectedFileProposal,
+    PlannerChangeProposal,
+    PlannerEvidenceClaim,
     PlannerFailureCategory,
     PlannerOutcome,
     PlannerRequest,
@@ -31,6 +33,7 @@ from code_slayer.planning.qualification import (
     DEFAULT_MAX_CORRECTION_ATTEMPTS,
     AttemptProvenance,
     PlannerTrial,
+    QualificationExpectation,
     QualificationOutcome,
     RuntimeContextProfile,
     TokenMeasurement,
@@ -224,6 +227,211 @@ def test_evidence_grounded_success_reports_ready_or_needs_input(git_repo_with_co
     ready = classify_planner_response(_structured(), snapshot)
     assert ready[0] == TrialOutcome.VALID_STRUCTURED_PLAN
     assert ready[2] == "READY"
+
+
+# --- 5b. QualificationExpectation: minimum semantic-content requirements ----
+# Review finding: a schema-valid, task-relevant, evidence-clean plan can
+# still say nothing concrete (a bare `{"goal": "..."}`). These tests cover
+# `classify_planner_response`'s `expectation` gate directly -- still one
+# classifier, never a second one.
+
+
+def test_expectation_none_is_byte_for_byte_the_same_as_before(git_repo_with_commit):
+    """Every existing call site passes no `expectation` -- confirms the
+    new gate is fully inert by default."""
+    snapshot = _snapshot(git_repo_with_commit)
+    outcome, _detail, hint = classify_planner_response(_structured(), snapshot)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+    assert hint == "READY"
+
+
+def test_expectation_goal_only_response_fails_require_affected_files():
+    expectation = QualificationExpectation(require_affected_files=True)
+    outcome, detail, _hint = classify_planner_response(_structured(), expectation=expectation)
+    assert outcome == TrialOutcome.EXPECTATION_NOT_MET
+    assert "affected_files" in detail
+
+
+def test_expectation_affected_files_present_satisfies_the_requirement():
+    expectation = QualificationExpectation(require_affected_files=True)
+    response = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="src/thing.py", action="create", reason="x"),
+        ),
+    )
+    outcome, _detail, _hint = classify_planner_response(response, expectation=expectation)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+
+
+def test_expectation_require_evidence_grounding_without_a_snapshot_is_a_caller_error():
+    """There is nothing to ground against -- a misconfigured task,
+    never a model failure -- so this raises immediately rather than
+    silently always failing or always passing."""
+    expectation = QualificationExpectation(require_evidence_grounding=True)
+    with pytest.raises(ValueError):
+        classify_planner_response(_structured(), expectation=expectation)
+
+
+def test_expectation_evidence_grounding_fails_without_any_grounded_claim(git_repo_with_commit):
+    snapshot = _snapshot(git_repo_with_commit)
+    expectation = QualificationExpectation(require_evidence_grounding=True)
+    outcome, detail, _hint = classify_planner_response(
+        _structured(), snapshot, expectation=expectation,
+    )
+    assert outcome == TrialOutcome.EXPECTATION_NOT_MET
+    assert "evidence_grounding" in detail
+
+
+def test_expectation_evidence_grounding_passes_with_a_real_affected_file(git_repo_with_commit):
+    snapshot = _snapshot(git_repo_with_commit)
+    expectation = QualificationExpectation(
+        require_affected_files=True, require_evidence_grounding=True,
+    )
+    response = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="README.md", action="modify", reason="x"),
+        ),
+    )
+    outcome, _detail, hint = classify_planner_response(response, snapshot, expectation=expectation)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+    assert hint == "READY"
+
+
+def test_expectation_evidence_grounding_passes_with_a_validated_evidence_claim(
+    git_repo_with_commit,
+):
+    snapshot = _snapshot(git_repo_with_commit)
+    expectation = QualificationExpectation(require_evidence_grounding=True)
+    response = _structured(
+        evidence_claims=(PlannerEvidenceClaim(kind="file_exists", key="README.md"),),
+    )
+    outcome, _detail, _hint = classify_planner_response(response, snapshot, expectation=expectation)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+
+
+def test_expectation_fabricated_file_still_fails_plan_validation_not_expectation(
+    git_repo_with_commit,
+):
+    """A nonexistent claimed file is rejected by the pre-existing
+    `validate_plan_against_intelligence()` gate (`PLAN_VALIDATION_
+    REJECTED`) -- never relabeled `EXPECTATION_NOT_MET`. The two checks
+    stay distinct even when the same task declares both a snapshot and
+    an evidence-grounding expectation."""
+    snapshot = _snapshot(git_repo_with_commit)
+    expectation = QualificationExpectation(
+        require_affected_files=True, require_evidence_grounding=True,
+    )
+    response = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="does_not_exist.py", action="modify", reason="x"),
+        ),
+    )
+    outcome, detail, hint = classify_planner_response(response, snapshot, expectation=expectation)
+    assert outcome == TrialOutcome.PLAN_VALIDATION_REJECTED
+    assert "does_not_exist.py" in detail
+
+
+def test_expectation_require_requirements_minimum_count_not_met():
+    expectation = QualificationExpectation(require_requirements=True, min_requirements=2)
+    response = _structured(requirements=("only one requirement",))
+    outcome, detail, _hint = classify_planner_response(response, expectation=expectation)
+    assert outcome == TrialOutcome.EXPECTATION_NOT_MET
+    assert "requirements>=2" in detail
+
+
+def test_expectation_require_requirements_minimum_count_met():
+    expectation = QualificationExpectation(require_requirements=True, min_requirements=2)
+    response = _structured(requirements=("first requirement", "second requirement"))
+    outcome, _detail, _hint = classify_planner_response(response, expectation=expectation)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+
+
+def test_expectation_require_planned_changes_and_verification_steps_not_met():
+    expectation = QualificationExpectation(
+        require_planned_changes=True, require_verification_steps=True,
+    )
+    outcome, detail, _hint = classify_planner_response(_structured(), expectation=expectation)
+    assert outcome == TrialOutcome.EXPECTATION_NOT_MET
+    assert "planned_changes" in detail
+    assert "verification_steps" in detail
+
+
+def test_expectation_require_planned_changes_and_verification_steps_met():
+    expectation = QualificationExpectation(
+        require_planned_changes=True, require_verification_steps=True,
+    )
+    response = _structured(
+        planned_changes=(PlannerChangeProposal(description="do the thing", paths=()),),
+        verification_steps=("run the tests",),
+    )
+    outcome, _detail, _hint = classify_planner_response(response, expectation=expectation)
+    assert outcome == TrialOutcome.VALID_STRUCTURED_PLAN
+
+
+def test_expectation_scope_violation_still_reported_as_itself_not_expectation_not_met():
+    """A more specific violation is never masked as "missing content" --
+    the scope/policy gate runs, and is reported, before the expectation
+    gate even though the same response would also fail the
+    expectation."""
+    expectation = QualificationExpectation(require_affected_files=True)
+    response = _structured(
+        affected_files=(
+            PlannerAffectedFileProposal(path="outside/scope.py", action="create", reason="x"),
+        ),
+    )
+    outcome, _detail, _hint = classify_planner_response(
+        response, allowed_scope=("src/example_service/",), expectation=expectation,
+    )
+    assert outcome == TrialOutcome.SCOPE_VIOLATION
+
+
+def test_expectation_task_not_relevant_still_reported_as_itself_not_expectation_not_met():
+    expectation = QualificationExpectation(require_requirements=True)
+    response = _structured(goal="Completely unrelated topic")
+    outcome, _detail, _hint = classify_planner_response(
+        response, original_request="Add a read-only endpoint.", expectation=expectation,
+    )
+    assert outcome == TrialOutcome.TASK_NOT_RELEVANT
+
+
+def test_expectation_not_met_is_correctable_with_feedback_naming_missing_fields():
+    expectation = QualificationExpectation(require_affected_files=True)
+    responses = [
+        _structured(),
+        _structured(
+            affected_files=(
+                PlannerAffectedFileProposal(path="src/thing.py", action="create", reason="x"),
+            ),
+        ),
+    ]
+    planner = FakePlanner(responses)
+    result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="EXPECT",
+        unsafe_allow_unverified_environment=True,
+        expectation=expectation,
+    )
+    assert result.outcome == QualificationOutcome.PASS_AFTER_FEEDBACK
+    assert result.expectation == expectation
+    assert len(result.feedback) == 1
+    assert result.feedback[0].failure_category == TrialOutcome.EXPECTATION_NOT_MET.value
+    assert "affected_files" in result.feedback[0].observed_behaviour
+
+
+def test_expectation_not_met_exhausted_is_fail_capability_never_a_pass():
+    expectation = QualificationExpectation(require_affected_files=True)
+    responses = [_structured() for _ in range(DEFAULT_MAX_CORRECTION_ATTEMPTS + 1)]
+    planner = FakePlanner(responses)
+    result = run_planner_case_with_correction(
+        planner,
+        _REQUEST,
+        qualification_class="EXPECT",
+        unsafe_allow_unverified_environment=True,
+        expectation=expectation,
+    )
+    assert result.outcome == QualificationOutcome.FAIL_CAPABILITY
+    assert result.attempt_count == DEFAULT_MAX_CORRECTION_ATTEMPTS + 1
 
 
 # --- 6. metrics aggregate correctly ------------------------------------------

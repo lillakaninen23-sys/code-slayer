@@ -42,26 +42,21 @@ handed to the model itself:
 
 ## Structured-output-only tool schemas grant no capability by existing
 
-`_TOOL_SCHEMAS` currently has three entries: `read_file` (a real,
-`tools.executor.ToolExecutor`-backed capability — offering its schema is
-what lets a model *request* a read, still gated entirely by
-`workers.execution`/`policy.engine.PolicyEngine` downstream, never by
-this adapter), `emit_prompt_analysis` (`workers.worker_prompt_analyst.
-WorkerAdapterPromptAnalyst`'s structured-output transport for one Prompt
-Analyst turn), and `emit_engineering_plan` (Phase 8.2/8.2b —
-`planning.worker_planner.WorkerAdapterPlanner`'s structured-output
-transport for one planning turn). Offering `emit_prompt_analysis`'s or
-`emit_engineering_plan`'s schema is not itself a capability grant of any
-kind: this module has no
-`ToolExecutor`, `PolicyEngine`, lease, or checkpoint import anywhere,
-and a call naming it produces nothing but a `WorkerToolCall(tool=
-"emit_engineering_plan", params={...})` for `workers.protocol_
-validation.validate_response()` to structurally validate and `planning.
-worker_planner`/`planning.planner.parse_planner_output()` to schema-
-validate — it authorizes no filesystem mutation, no command execution,
-no checkpoint creation, and no trust promotion, exactly like every
-other entry in this table only ever describes *what a model may ask
-for*, never *what happens when it does*.
+`_TOOL_SCHEMAS` has explicit, reviewed translations for the Coder/Repairer
+mutation contract (`read_file`, `create_file`, `write_file`, `apply_patch`)
+plus two structured-output-only transports: `emit_prompt_analysis`
+(`workers.worker_prompt_analyst.WorkerAdapterPromptAnalyst`) and
+`emit_engineering_plan` (`planning.worker_planner.WorkerAdapterPlanner`).
+Offering a schema lets a model *request* that tool; it grants no
+authority. Every mutation is still gated entirely by
+`workers.protocol_validation.validate_response()`,
+`coding.tool_loop._build_tool_request()`, `tools.executor.ToolExecutor`
+and `policy.engine.PolicyEngine` downstream, never by this adapter.
+`run_command` and `checkpoint_create` are never offered. Offering
+`emit_prompt_analysis` or `emit_engineering_plan` produces nothing but a
+`WorkerToolCall` for the corresponding parser — it authorizes no
+filesystem mutation, no command execution, no checkpoint creation, and
+no trust promotion.
 
 ## No raw tool-call recovery
 
@@ -129,9 +124,13 @@ _DEFAULT_TEMPERATURE = 0.0  # deterministic by default — see the module docstr
 # a Code Slayer capability into. Deliberately not derived from
 # tools.registry.CAPABILITIES wholesale: only capabilities this module
 # has an explicit, reviewed JSON-schema translation for can ever be
-# offered to a model, and today that is exactly one, read-only
-# capability. Extending this table is a deliberate code change, never
-# something a request or a model can do at runtime.
+# offered to a model. That set is the Coder/Repairer contract
+# (read_file/create_file/write_file/apply_patch) plus the structured-
+# output-only emit_prompt_analysis/emit_engineering_plan transports.
+# run_command and checkpoint_create are never offered. Field shapes lock
+# to coding.tool_loop._build_tool_request() / ToolExecutor. Extending
+# this table is a deliberate code change, never something a request or a
+# model can do at runtime.
 _TOOL_SCHEMAS: dict[str, dict] = {
     "read_file": {
         "type": "function",
@@ -150,6 +149,122 @@ _TOOL_SCHEMAS: dict[str, dict] = {
                     },
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "create_file": {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": (
+                "Create a new file at path relative to the repository root. "
+                "The path must not already exist."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the repository root.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Exact UTF-8 text to write to the new file.",
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "write_file": {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Replace an existing file's contents. expected_hash must be "
+                "the write-authorizing hash from a prior complete lossless "
+                "read_file of this path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the repository root.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Exact UTF-8 text that will replace the file.",
+                    },
+                    "expected_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": (
+                            "SHA-256 hex digest of the current file bytes, "
+                            "from a prior complete lossless read_file."
+                        ),
+                    },
+                },
+                "required": ["path", "content", "expected_hash"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "apply_patch": {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply one or more hunks to an existing file. expected_hash "
+                "must be the write-authorizing hash from a prior complete "
+                "lossless read_file of this path. Each hunk is offset plus "
+                "before/after UTF-8 text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the repository root.",
+                    },
+                    "expected_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "description": (
+                            "SHA-256 hex digest of the current file bytes, "
+                            "from a prior complete lossless read_file."
+                        ),
+                    },
+                    "hunks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "offset": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Byte offset of this hunk in the current file.",
+                                },
+                                "before": {
+                                    "type": "string",
+                                    "description": "UTF-8 text currently at offset.",
+                                },
+                                "after": {
+                                    "type": "string",
+                                    "description": "UTF-8 text that replaces before.",
+                                },
+                            },
+                            "required": ["offset", "before", "after"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["path", "expected_hash", "hunks"],
                 "additionalProperties": False,
             },
         },

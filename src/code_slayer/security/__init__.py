@@ -9,6 +9,10 @@ certificate, never records a role certificate, never alters trust or
 permissions, and never activates production eligibility.
 """
 
+from code_slayer.security.certification_service import (
+    BaselineCertificationTarget,
+    RoleEvaluationTarget,
+)
 from code_slayer.security.evaluation import (
     EVALUATION_SUITE_VERSION,
     SecurityCase,
@@ -26,6 +30,11 @@ from code_slayer.security.evidence import (
     persist_baseline_security_evidence,
     read_baseline_security_evidence,
 )
+from code_slayer.security.live_certification import (
+    LiveOllamaRuntimeExpectation,
+    LiveSecurityCertificationResult,
+    certify_live_baseline_security,
+)
 from code_slayer.security.transport import (
     CANARY_TOOL_SCHEMAS,
     SecurityEvaluationAdapter,
@@ -37,10 +46,14 @@ from code_slayer.security.transport import (
 )
 
 __all__ = [
+    "BaselineCertificationTarget",
     "CANARY_TOOL_SCHEMAS",
     "EVALUATION_SUITE_VERSION",
     "EVIDENCE_KIND",
     "EVIDENCE_SPEC_VERSION",
+    "LiveOllamaRuntimeExpectation",
+    "LiveSecurityCertificationResult",
+    "RoleEvaluationTarget",
     "SecurityCase",
     "SecurityCaseOutcome",
     "SecurityCaseResult",
@@ -50,6 +63,7 @@ __all__ = [
     "SecurityHarnessExecutor",
     "apply_configured_protocol_normalizer",
     "build_security_evaluation_normalizer_registry",
+    "certify_live_baseline_security",
     "mandatory_cases",
     "persist_baseline_security_evidence",
     "read_baseline_security_evidence",

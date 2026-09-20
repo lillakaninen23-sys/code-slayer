@@ -23,6 +23,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
 from code_slayer.store.db import transaction
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
 from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.workers.lifecycle import archive_worker, reactivate_worker
 from code_slayer.workers.production_eligibility import (
     EligibilityDecision,
     evaluate_production_eligibility,
@@ -78,6 +79,7 @@ def _role_eval(profile: RuntimeProfileIdentity, role=ProductionRole.PLANNER, **o
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=30.0,
         policy_version=POLICY_VERSION,
     )
     kwargs.update(overrides)
@@ -580,6 +582,8 @@ def test_evaluate_production_eligibility_accepts_no_role_verdict_parameter():
         "runtime_profile",
         "role_evaluation",
         "expected_role_policy_version",
+        "blobs_dir",
+        "now_fn",
     }
 
 
@@ -869,3 +873,128 @@ def test_missing_runtime_identity_fingerprint_is_insufficient(db_conn, registere
         expected_role_policy_version=POLICY_VERSION,
     )
     assert decision == EligibilityDecision(False, "insufficient_runtime_profile_identity")
+
+
+# -- H.3: administrative lifecycle takes precedence over everything else -----
+
+
+def test_archived_worker_is_blocked_even_with_perfect_certificates(
+    db_conn, registered_worker, profile,
+):
+    security = _security_pass(db_conn, registered_worker, profile)
+    role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    before = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert before.eligible is True
+
+    result = archive_worker(db_conn, worker_id=registered_worker)
+    assert result.ok and result.changed
+
+    after = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert after == EligibilityDecision(False, "worker_archived")
+    # Archiving never touched the certificates that made it eligible a
+    # moment ago -- they are still exactly the rows eligibility would
+    # use once reactivated.
+    assert BaselineSecurityCertificatesRepo(db_conn).list_for_worker(
+        registered_worker,
+    )[0].certificate_id == security.certificate.certificate_id
+    assert RoleCertificatesRepo(db_conn).list_for_worker_role(
+        registered_worker, "PLANNER",
+    )[0].certificate_id == role.certificate.certificate_id
+
+
+def test_archived_worker_reason_precedes_missing_certificate_reasons(
+    db_conn, registered_worker,
+):
+    """`worker_archived` is reported even when NEITHER certificate
+    exists yet -- lifecycle is checked before either certificate is
+    looked up, exactly like a hard Security disqualifier."""
+    archive_worker(db_conn, worker_id=registered_worker)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, _full_profile())
+    assert decision == EligibilityDecision(False, "worker_archived")
+
+
+def test_archived_worker_reason_precedes_security_fail(db_conn, registered_worker, profile):
+    _security_fail(db_conn, registered_worker, profile)
+    archive_worker(db_conn, worker_id=registered_worker)
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert decision == EligibilityDecision(False, "worker_archived")
+
+
+def test_archived_worker_reason_precedes_incomplete_runtime_profile(db_conn, registered_worker):
+    """H.3 review finding #5: lifecycle is checked immediately after
+    basic input TYPE/shape validation, BEFORE the deeper `runtime_
+    profile`/`role_evaluation` completeness checks -- an archived
+    worker must never appear to deny for some OTHER reason (like an
+    incomplete/stale profile) just because the request happened to also
+    be incomplete. `test_incompletely_specified_runtime_profile_is_
+    denied` proves the `insufficient_runtime_profile_identity` reason
+    for the SAME weak profile on an ACTIVE worker -- this proves
+    `worker_archived` wins once archived, for a structurally valid
+    (correctly-typed) but otherwise incomplete request."""
+    archive_worker(db_conn, worker_id=registered_worker)
+    weak_profile = RuntimeProfileIdentity(model_tag="devstral:24b")
+    decision = evaluate_production_eligibility(
+        db_conn,
+        worker_id=registered_worker,
+        role=ProductionRole.PLANNER,
+        runtime_profile=weak_profile,
+        role_evaluation=_role_eval(_full_profile()),
+        expected_role_policy_version=POLICY_VERSION,
+    )
+    assert decision == EligibilityDecision(False, "worker_archived")
+
+
+def test_reactivated_worker_with_still_current_certificates_is_eligible_again(
+    db_conn, registered_worker, profile,
+):
+    """No re-certification required: if the exact same runtime/role
+    evaluation identity is still current, reactivation alone restores
+    eligibility."""
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    archive_worker(db_conn, worker_id=registered_worker)
+    assert _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile).eligible is False
+
+    result = reactivate_worker(db_conn, worker_id=registered_worker)
+    assert result.ok and result.changed
+
+    after = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    assert after.eligible is True
+    assert after.reason == "eligible"
+
+
+def test_reactivated_worker_with_changed_runtime_identity_still_fails_closed(
+    db_conn, registered_worker, profile,
+):
+    """Reactivation restores ordinary evaluation -- it never bypasses
+    the normal mismatch/staleness checks. A runtime identity that
+    changed while archived is denied exactly like it would be for a
+    worker that was never archived at all."""
+    _security_pass(db_conn, registered_worker, profile)
+    _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    archive_worker(db_conn, worker_id=registered_worker)
+    reactivate_worker(db_conn, worker_id=registered_worker)
+
+    changed_profile = _full_profile(model_digest="sha256:different")
+    decision = _evaluate(db_conn, registered_worker, ProductionRole.PLANNER, changed_profile)
+    assert decision.eligible is False
+    assert decision.reason == "baseline_security_certificate_profile_mismatch"
+
+
+def test_archiving_never_mutates_certificate_rows(db_conn, registered_worker, profile):
+    security = _security_pass(db_conn, registered_worker, profile)
+    role = _role_pass(db_conn, registered_worker, ProductionRole.PLANNER, profile)
+    sec_before = dict(vars(BaselineSecurityCertificatesRepo(db_conn).get(
+        security.certificate.certificate_id,
+    )))
+    role_before = dict(vars(RoleCertificatesRepo(db_conn).get(role.certificate.certificate_id)))
+
+    archive_worker(db_conn, worker_id=registered_worker)
+    reactivate_worker(db_conn, worker_id=registered_worker)
+
+    sec_after = dict(vars(BaselineSecurityCertificatesRepo(db_conn).get(
+        security.certificate.certificate_id,
+    )))
+    role_after = dict(vars(RoleCertificatesRepo(db_conn).get(role.certificate.certificate_id)))
+    assert sec_after == sec_before
+    assert role_after == role_before

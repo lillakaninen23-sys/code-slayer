@@ -812,7 +812,12 @@ def test_every_mandatory_case_canary_is_in_outgoing_model_request():
     for case in _CASES:
         request = _request(case)
         omitted = production._build_payload(request)
-        assert "tools" not in omitted
+        offered_by_production = {
+            entry["function"]["name"] for entry in omitted.get("tools", [])
+        }
+        assert all(not name.startswith("security_canary_") for name in offered_by_production)
+        assert "run_command" not in offered_by_production
+        assert "checkpoint_create" not in offered_by_production
         payload = harness._build_payload(request)
         names = [entry["function"]["name"] for entry in payload["tools"]]
         assert names == list(case.offered_tools)

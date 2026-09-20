@@ -7,16 +7,37 @@ Qualification Certification foundation).
 
 Production eligibility requires ALL of:
 
+0. the worker is administratively `ACTIVE` (`workers.lifecycle`, schema
+   v18/H.3) — checked before either certificate is even looked up
 1. a valid Baseline Security Certificate (`workers.security_baseline`)
 2. a valid Role Certificate for the EXACT requested role
    (`workers.role_qualification`)
 3. no hard Security disqualifier
 
 — never any subset, and never a strong role certificate compensating for
-a missing/failed/disqualifying Baseline Security Certificate. Security
-is always decided first, and a hard disqualifier is decided before the
-role certificate is even looked up — see "Hard disqualifiers always
-win" below.
+a missing/failed/disqualifying Baseline Security Certificate, and never a
+perfect certificate pair compensating for an administratively `ARCHIVED`
+worker. Security is always decided first, and a hard disqualifier is
+decided before the role certificate is even looked up — see "Hard
+disqualifiers always win" below. Lifecycle is decided before either.
+
+## Administrative lifecycle (H.3)
+
+An `ARCHIVED` worker denies with `worker_archived`, unconditionally,
+before any certificate is loaded — the same "checked first, no
+certificate can compensate" treatment as a hard Security disqualifier,
+but a SEPARATE dimension from it: `worker_archived` says nothing about
+whether the worker's certificates are still good, only that it is not
+currently authorized to receive new production work at all. This
+function never mutates `workers.lifecycle_state` and never invalidates
+a certificate because a worker is archived — see `workers.lifecycle`'s
+own module docstring for the full archive/reactivate contract. Once
+reactivated, eligibility is re-derived exactly as for any other
+worker: if the runtime/certificates on file are still exact and
+current, eligibility can become `eligible=True` again immediately,
+with no new certification required; if the runtime identity or policy
+changed while archived, the ordinary mismatch/staleness reasons below
+still apply unchanged.
 
 ## `evaluate_production_eligibility()` is the ONE authoritative path
 
@@ -128,14 +149,22 @@ this package must not import (`workers` sits below `planning` in this
 codebase's dependency direction), so the caller — which already knows
 which role it is asking about — supplies the current version for it.
 
+## Engineering roles (ROLE-CERTIFICATION-V1)
+
+For CODER / REVIEWER / REPAIRER / SECURITY, a passing certificate pair
+additionally requires `blobs_dir`: both evidence documents are reread,
+bindings and outcomes are checked, and evaluation/issuance timestamps
+must be ordered and less than 30 days old. No evidence-store argument
+means no engineering production eligibility. Planner historical behavior
+and evidence readers are unchanged. `coding.routing` selects engineering
+workers from current approved configuration and revalidates at execution.
+
 ## Not yet implemented (disclosed gaps)
 
 This module does not itself select, rank, or route to any worker — it
 only answers a single yes/no eligibility question for one already-named
-`(worker_id, role, runtime_profile)`. A real router, and a registry that
-maps each `ProductionRole` to its own current policy version
-automatically (so a caller need not already know it), remain future
-work.
+`(worker_id, role, runtime_profile)`. Measured comparative strength ranking remains future work; the
+Planner and engineering routers fail closed on ambiguous eligible sets.
 """
 
 from __future__ import annotations
@@ -146,8 +175,14 @@ from dataclasses import dataclass
 from code_slayer.store.baseline_security_certificates_repo import (
     BaselineSecurityCertificatesRepo,
 )
+from code_slayer.store.db import utcnow_iso
 from code_slayer.store.role_certificates_repo import RoleCertificatesRepo
-from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
+from code_slayer.workers.engineering_roles import (
+    ENGINEERING_ROLES,
+    RoleEvidenceError,
+    verify_engineering_certificates,
+)
 from code_slayer.workers.role_qualification import (
     ProductionRole,
     RoleEvaluationIdentity,
@@ -227,6 +262,8 @@ def evaluate_production_eligibility(
     runtime_profile: RuntimeProfileIdentity,
     role_evaluation: RoleEvaluationIdentity,
     expected_role_policy_version: str,
+    blobs_dir=None,
+    now_fn=utcnow_iso,
 ) -> EligibilityDecision:
     """The one production-eligibility gate a future router should query
     instead of deciding trust/qualification/security for itself. See the
@@ -250,6 +287,25 @@ def evaluate_production_eligibility(
         or not expected_role_policy_version.strip()
     ):
         return _deny("malformed_eligibility_request")
+
+    # H.3: administrative lifecycle is checked immediately after basic
+    # input TYPE/shape validation, before any deeper profile-
+    # completeness or certificate evaluation -- an ARCHIVED worker is
+    # blocked regardless of how stale or incomplete the REST of the
+    # request is, exactly like a hard Security disqualifier (checked
+    # before either certificate is even looked up). This never mutates
+    # or invalidates certificates (see `workers.lifecycle`'s own module
+    # docstring for why archiving never touches this table). Ordering
+    # this before `insufficient_runtime_profile_identity`/
+    # `insufficient_role_evaluation_identity` below matters: an
+    # archived worker with an otherwise stale/incomplete request must
+    # never appear to deny for some OTHER reason.
+    worker = WorkersRepo(conn).get(worker_id)
+    if worker is None:
+        return _deny("unknown_worker")
+    if worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+        return _deny("worker_archived")
+
     if not runtime_profile.is_verified_current or not runtime_profile.is_fully_specified:
         return _deny("insufficient_runtime_profile_identity")
     if not role_evaluation.is_fully_specified:
@@ -264,16 +320,18 @@ def evaluate_production_eligibility(
     ):
         return _deny("role_evaluation_runtime_identity_mismatch")
 
-    if WorkersRepo(conn).get(worker_id) is None:
-        return _deny("unknown_worker")
-
     security_certificates = BaselineSecurityCertificatesRepo(conn).list_for_worker(worker_id)
     if not security_certificates:
         return _deny("no_baseline_security_certificate")
-    security_certificate = _matching_security_certificate(
-        security_certificates,
-        runtime_profile,
-    )
+    try:
+        security_certificate = _matching_security_certificate(
+            security_certificates,
+            runtime_profile,
+        )
+    except (TypeError, ValueError):
+        if role not in ENGINEERING_ROLES:
+            raise
+        return _deny("malformed_baseline_security_certificate")
     if security_certificate is None:
         return _deny("baseline_security_certificate_profile_mismatch")
     if security_certificate.baseline_version != BASELINE_VERSION:
@@ -302,11 +360,16 @@ def evaluate_production_eligibility(
             "no_role_certificate",
             security_certificate_id=security_certificate.certificate_id,
         )
-    role_certificate = _matching_role_certificate(
-        role_certificates,
-        runtime_profile,
-        role_evaluation,
-    )
+    try:
+        role_certificate = _matching_role_certificate(
+            role_certificates,
+            runtime_profile,
+            role_evaluation,
+        )
+    except (TypeError, ValueError):
+        if role not in ENGINEERING_ROLES:
+            raise
+        return _deny("malformed_role_certificate")
     if role_certificate is None:
         # Distinguish common-runtime mismatch from evaluation-profile
         # mismatch so a Planner budget change cannot be confused with a
@@ -333,6 +396,17 @@ def evaluate_production_eligibility(
             security_certificate_id=security_certificate.certificate_id,
             role_certificate_id=role_certificate.certificate_id,
         )
+
+    if role in ENGINEERING_ROLES:
+        try:
+            verify_engineering_certificates(
+                conn, blobs_dir, role_certificate, security_certificate, now_fn(),
+            )
+        except RoleEvidenceError as exc:
+            return _deny(
+                exc.reason, security_certificate_id=security_certificate.certificate_id,
+                role_certificate_id=role_certificate.certificate_id,
+            )
 
     return EligibilityDecision(
         True,

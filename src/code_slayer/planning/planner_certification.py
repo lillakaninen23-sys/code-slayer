@@ -101,17 +101,26 @@ verdict about the model) when:
 `planning.qualification` durably stores nothing of its own. This module
 persists a bounded canonical JSON document via
 `planning.qualification_evidence` *before* recording the certificate,
-and stores that blob's content hash as `evidence_ref`. The v2 document
-contains the canonical `runtime-identity-spec-v2` and
-`role-evaluation-spec-v1` (so both fingerprints are later recomputable
-from durable state), each instance outcome, and the already-bounded
-`AttemptProvenance` records — never raw prompt or model text. A
-one-way fingerprint without that document is not sufficient forensic
-evidence; a document whose recomputed fingerprints do not match the
-certificate is refused. Existing certificates are never rewritten;
-their `evidence_ref` values stay as originally recorded. Existing v1
-evidence documents remain readable under v1 semantics and are never
-reinterpreted as v2."""
+and stores that blob's content hash as `evidence_ref`. New/current
+evidence is `planner-qualification-evidence-v3` (H.4.1) and contains
+the canonical `runtime-identity-spec-v2` and the CURRENT
+`role-evaluation-spec-v2` — which now also includes
+`execution_timeout_seconds`, the certified Planner inference timeout —
+so both fingerprints (and the timeout every attempt actually used) are
+later recomputable from durable state, alongside each instance outcome
+and the already-bounded `AttemptProvenance` records — never raw prompt
+or model text. A one-way fingerprint without that document is not
+sufficient forensic evidence; a document whose recomputed fingerprints
+(or, for v3, per-attempt timeout) do not match the certificate is
+refused. Existing certificates are never rewritten; their `evidence_ref`
+values stay as originally recorded. Existing `planner-qualification-
+evidence-v1` documents remain readable under v1 semantics, and existing
+`planner-qualification-evidence-v2` documents (H.2/H.3-era, whose
+`role_evaluation_spec` always carries the now-historical
+`role-evaluation-spec-v1`) remain readable under a dedicated, FROZEN
+historical verifier — see `planning.qualification_evidence`'s own
+module docstring. Neither is ever rewritten, upgraded, or reinterpreted
+as current (`v3`) authority."""
 
 from __future__ import annotations
 
@@ -148,7 +157,7 @@ from code_slayer.workers.security_baseline import (
 # semantics a certificate was decided under, so a later change to what
 # "Planner-qualified" even means never gets silently applied to old
 # evidence.
-PLANNER_CERTIFICATION_POLICY_VERSION = "planner-certification-v1"
+PLANNER_CERTIFICATION_POLICY_VERSION = "planner-certification-v2"
 
 _PASS_OUTCOMES = frozenset(
     {
@@ -222,28 +231,35 @@ def _agreed_role_evaluation(
     results: tuple[QualificationAttemptResult, ...],
     runtime_profile: RuntimeProfileIdentity,
 ) -> RoleEvaluationIdentity | None:
-    """`None` if output-token budget or tool-choice enforcement disagree
-    across attempts, or if the common runtime identity is missing.
-    Mixed Planner evaluation configurations are never collapsed into
-    the shared runtime identity."""
+    """`None` if output-token budget, tool-choice enforcement, or
+    Planner timeout (H.4.1) disagree across attempts, or if the common
+    runtime identity is missing. Mixed Planner evaluation configurations
+    are never collapsed into the shared runtime identity."""
     fingerprint = runtime_profile.runtime_identity_fingerprint
     if not isinstance(fingerprint, str) or not fingerprint:
         return None
-    tuples: set[tuple[int, str]] = set()
+    tuples: set[tuple[int, str, float | None]] = set()
     for result in results:
         if not result.provenance:
             return None
         for attempt in result.provenance:
-            tuples.add((attempt.output_token_budget, attempt.tool_choice_enforcement))
+            tuples.add((
+                attempt.output_token_budget,
+                attempt.tool_choice_enforcement,
+                attempt.planner_timeout_seconds,
+            ))
     if len(tuples) != 1:
         return None
-    output_token_budget, tool_choice_enforcement = next(iter(tuples))
+    output_token_budget, tool_choice_enforcement, planner_timeout_seconds = next(iter(tuples))
+    if planner_timeout_seconds is None:
+        return None
     try:
         return role_evaluation_identity_from_config(
             role=ProductionRole.PLANNER,
             runtime_identity_fingerprint=fingerprint,
             output_token_budget=output_token_budget,
             tool_choice_enforcement=tool_choice_enforcement,
+            execution_timeout_seconds=planner_timeout_seconds,
             policy_version=PLANNER_CERTIFICATION_POLICY_VERSION,
         )
     except (TypeError, ValueError):
@@ -287,6 +303,7 @@ def _persist_evidence(
         runtime_identity_fingerprint=role_evaluation.runtime_identity_fingerprint,
         output_token_budget=role_evaluation.output_token_budget,
         tool_choice_enforcement=role_evaluation.tool_choice_enforcement,
+        execution_timeout_seconds=role_evaluation.execution_timeout_seconds,
         policy_version=role_evaluation.policy_version,
     )
     document = build_planner_qualification_evidence_document(
@@ -315,6 +332,7 @@ def certify_planner_from_qualification(
     early_stopped: bool,
     blobs_dir: Path | str,
     now_fn=None,
+    require_active_worker: bool = False,
 ) -> RoleCertificationResult:
     """Decide whether a completed Planner qualification run
     (`planning.qualification.run_corrected_planner_case()`'s own return
@@ -329,7 +347,12 @@ def certify_planner_from_qualification(
     recomputed runtime-identity and role-evaluation fingerprints
     matching the certificate. Never mutates `planning`'s own state and
     never re-invokes the planner itself; this function performs no
-    inference of its own."""
+    inference of its own.
+
+    `require_active_worker` is forwarded, unchanged, to
+    `workers.role_qualification.record_role_certificate()` -- see that
+    function's own docstring for the atomicity guarantee. `False` by
+    default so every existing caller's behavior is unchanged."""
     if not isinstance(results, tuple) or not results:
         return _deny("empty_qualification_evidence")
     if not all(isinstance(result, QualificationAttemptResult) for result in results):
@@ -382,5 +405,6 @@ def certify_planner_from_qualification(
         evidence_ref=evidence_ref,
         reason=reason,
         role_evaluation=role_evaluation,
+        require_active_worker=require_active_worker,
         **kwargs,
     )

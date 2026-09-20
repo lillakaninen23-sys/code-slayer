@@ -10,16 +10,19 @@ no trust/permission/certificate side effects.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import sqlite3
 
 import pytest
 
+from code_slayer.audit.canonical import canonical_json
 from code_slayer.planning.planner_certification import PLANNER_CERTIFICATION_POLICY_VERSION
 from code_slayer.planning.qualification_evidence import (
     QUALIFICATION_EVIDENCE_KIND,
     QUALIFICATION_EVIDENCE_SPEC_VERSION_V1,
+    QUALIFICATION_EVIDENCE_SPEC_VERSION_V2,
     QualificationEvidenceError,
     persist_planner_qualification_evidence,
     read_planner_qualification_evidence,
@@ -92,6 +95,7 @@ def _eval_for(profile, **overrides):
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=4096,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version=POLICY_VERSION,
     )
     kwargs.update(overrides)
@@ -370,6 +374,7 @@ def test_missing_new_identity_fields_fail_closed(db_conn, registered_worker):
             runtime_identity_fingerprint=None,
             output_token_budget=4096,
             tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+            execution_timeout_seconds=45.0,
             policy_version=POLICY_VERSION,
         )
 
@@ -511,7 +516,10 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
         ).fetchone(),
     )
     assert "runtime_identity_fingerprint" not in before_role
-    assert db_module.migrate(conn) == 15
+    # "Whatever the latest known version is" rather than a hardcoded 17
+    # that a future schema bump (e.g. H.3's v18) would otherwise make
+    # stale for reasons unrelated to this test's own subject.
+    assert db_module.migrate(conn) == db_module.known_schema_version()
     after_role = dict(
         conn.execute(
             "SELECT * FROM worker_role_certificates WHERE certificate_id = ?",
@@ -540,12 +548,20 @@ def test_migration_0015_does_not_rewrite_existing_certificate_rows(tmp_path):
     conn.close()
 
 
-def test_schema_v15_is_known_and_0013_0014_are_untouched():
-    assert db_module.known_schema_version() == 15
+def test_schema_v17_is_known_and_prior_identity_migrations_are_untouched():
+    # Bumped to 19 by H.4 (`planner_worker_routing`, after H.3's own
+    # bump to 18 for `worker_lifecycle`), then to 20 by H.4.1
+    # (`planner_timeout_binding`), then to 21 by the Autonomous
+    # Engineering Loop V1 (`coding_jobs`) -- this test's own purpose
+    # (every prior identity-related migration this file cares about is
+    # still present and untouched) still holds; it is not itself a claim
+    # that 21 is the LAST version anything may ever add.
+    assert db_module.known_schema_version() == 21
     names = [name for _version, name, _sql in db_module._discover_migrations()]
     assert "runtime_profile_normalizer_identity" in names
     assert "runtime_config_fingerprint" in names
     assert "runtime_identity_separation" in names
+    assert "certification_runs" in names
 
 
 # -- 12. durable Planner evidence round-trips both fingerprints --------------
@@ -579,6 +595,7 @@ def test_durable_planner_evidence_round_trips_both_fingerprints_and_detects_tamp
         endpoint="http://local:11436/v1",
         runtime_version="0.1.0",
         temperature=0.0,
+        planner_timeout_seconds=45.0,
     )
     planner = FakePlanner(
         [
@@ -692,6 +709,221 @@ def test_historical_v1_evidence_document_remains_readable(db_conn, tmp_path):
         )
 
 
+# -- H.4.1 Blocker 1: historical planner-qualification-evidence-v2 -----------
+# -- (role-evaluation-spec-v1 inside) must remain readable --------------------
+
+
+def _historical_role_evaluation_spec_v1(
+    *, runtime_identity_fingerprint: str, output_token_budget: int = 4096,
+    tool_choice_enforcement: str = "ADVISORY_ONLY_UNVERIFIED", policy_version: str = POLICY_VERSION,
+) -> dict:
+    """Reproduces the FROZEN pre-H.4.1 role-evaluation-spec-v1 shape --
+    built independently of `qualification_evidence`'s own historical
+    verifier, so this test proves the verifier reproduces genuinely
+    historical behaviour rather than merely agreeing with itself."""
+    return {
+        "spec_version": "role-evaluation-spec-v1",
+        "role": "PLANNER",
+        "runtime_identity_fingerprint": runtime_identity_fingerprint,
+        "output_token_budget": output_token_budget,
+        "tool_choice_enforcement": tool_choice_enforcement,
+        "policy_version": policy_version,
+    }
+
+
+def _historical_role_evaluation_fingerprint_v1(spec: dict) -> str:
+    return hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
+
+
+def test_historical_v2_evidence_document_with_role_evaluation_spec_v1_remains_readable(
+    db_conn, tmp_path,
+):
+    """An authentic H.2/H.3-era planner-qualification-evidence-v2
+    document (whose role_evaluation_spec always carried
+    role-evaluation-spec-v1, before H.4.1's v2 bump) must still read and
+    fingerprint-verify successfully -- never refused merely because
+    current production authority moved on to role-evaluation-spec-v2."""
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    identity_spec = canonical_runtime_identity_spec(
+        model_tag="qwen3-coder-ctx16k:30b",
+        model_digest="sha256:abc",
+        endpoint="http://192.168.32.8:11434/v1",
+        runtime_version="0.16.1",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+        effective_context_tokens=16384,
+        temperature=0.0,
+    )
+    identity_fp = fingerprint_runtime_identity(identity_spec)
+    role_spec = _historical_role_evaluation_spec_v1(runtime_identity_fingerprint=identity_fp)
+    role_fp = _historical_role_evaluation_fingerprint_v1(role_spec)
+    document = {
+        "spec_version": QUALIFICATION_EVIDENCE_SPEC_VERSION_V2,
+        "role": "PLANNER",
+        "policy_version": POLICY_VERSION,
+        "runtime_identity_spec": identity_spec,
+        "runtime_identity_fingerprint": identity_fp,
+        "role_evaluation_spec": role_spec,
+        "role_evaluation_fingerprint": role_fp,
+        "model_tag": identity_spec["model_tag"],
+        "model_digest": identity_spec["model_digest"],
+        "endpoint": identity_spec["endpoint"],
+        "runtime_version": identity_spec["runtime_version"],
+        "normalizer_id": identity_spec["normalizer_id"],
+        "normalizer_version": identity_spec["normalizer_version"],
+        "effective_context_tokens": identity_spec["effective_context_tokens"],
+        "temperature": identity_spec["temperature"],
+        "output_token_budget": role_spec["output_token_budget"],
+        "tool_choice_enforcement": role_spec["tool_choice_enforcement"],
+        "final_classification": "PASS_FIRST_TRY",
+        "instance_count": 0,
+        "attempt_count": 0,
+        "correction_used": False,
+        "instances": [],
+    }
+    store = ContentStore(db_conn, blobs)
+    payload = canonical_json(document).encode("utf-8")
+    blob = store.put(
+        payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    loaded = read_planner_qualification_evidence(
+        db_conn, blobs, blob.content_hash,
+        expected_runtime_identity_fingerprint=identity_fp,
+        expected_role_evaluation_fingerprint=role_fp,
+    )
+    assert loaded["spec_version"] == QUALIFICATION_EVIDENCE_SPEC_VERSION_V2
+    assert loaded["role_evaluation_spec"]["spec_version"] == "role-evaluation-spec-v1"
+    assert loaded["role_evaluation_fingerprint"] == role_fp
+    # Byte-for-byte unchanged: re-reading the SAME content hash returns
+    # the exact same document -- nothing was rewritten to "upgrade" it.
+    reread = read_planner_qualification_evidence(
+        db_conn, blobs, blob.content_hash,
+        expected_runtime_identity_fingerprint=identity_fp,
+        expected_role_evaluation_fingerprint=role_fp,
+    )
+    assert reread == loaded
+    assert store.read(blob.content_hash) == payload
+    # Never persistable through the (now v3-only) writer.
+    with pytest.raises(QualificationEvidenceError, match="unsupported_qualification_evidence_spec"):
+        persist_planner_qualification_evidence(
+            store, document,
+            expected_runtime_identity_fingerprint=identity_fp,
+            expected_role_evaluation_fingerprint=role_fp,
+        )
+
+
+def test_historical_v2_role_evaluation_spec_v1_with_extra_field_still_reads(db_conn, tmp_path):
+    """H.4.1 review round 4: the historical verifier must reproduce the
+    OLD `fingerprint_role_evaluation()` semantics exactly -- SHA-256 of
+    the full `canonical_json(spec)`, gated only on `spec_version`, with
+    NO per-key shape restriction of its own. A real deployment could
+    have persisted a role_evaluation_spec with an extra field the old
+    code never rejected (the old fingerprinting simply hashed whatever
+    `canonical_role_evaluation_spec()` produced, and never re-validated
+    the document's shape on read); this proves such a document is not
+    now spuriously refused by a NEW restriction this module never had
+    before H.4.1. The expected fingerprint is computed independently
+    here (not via the production historical helper), so this test
+    cannot pass merely by agreeing with itself."""
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    identity_spec = canonical_runtime_identity_spec(
+        model_tag="qwen3-coder-ctx16k:30b",
+        model_digest="sha256:abc",
+        endpoint="http://192.168.32.8:11434/v1",
+        runtime_version="0.16.1",
+        normalizer_id="qwen_textual_tool_v1",
+        normalizer_version=1,
+        effective_context_tokens=16384,
+        temperature=0.0,
+    )
+    identity_fp = fingerprint_runtime_identity(identity_spec)
+    role_spec = _historical_role_evaluation_spec_v1(runtime_identity_fingerprint=identity_fp)
+    role_spec["extra_harmless_field"] = "some-value-old-code-never-rejected"
+    role_fp = hashlib.sha256(canonical_json(role_spec).encode("utf-8")).hexdigest()
+    document = {
+        "spec_version": QUALIFICATION_EVIDENCE_SPEC_VERSION_V2,
+        "role": "PLANNER",
+        "policy_version": POLICY_VERSION,
+        "runtime_identity_spec": identity_spec,
+        "runtime_identity_fingerprint": identity_fp,
+        "role_evaluation_spec": role_spec,
+        "role_evaluation_fingerprint": role_fp,
+        "model_tag": identity_spec["model_tag"],
+        "model_digest": identity_spec["model_digest"],
+        "endpoint": identity_spec["endpoint"],
+        "runtime_version": identity_spec["runtime_version"],
+        "normalizer_id": identity_spec["normalizer_id"],
+        "normalizer_version": identity_spec["normalizer_version"],
+        "effective_context_tokens": identity_spec["effective_context_tokens"],
+        "temperature": identity_spec["temperature"],
+        "output_token_budget": role_spec["output_token_budget"],
+        "tool_choice_enforcement": role_spec["tool_choice_enforcement"],
+        "final_classification": "PASS_FIRST_TRY",
+        "instance_count": 0,
+        "attempt_count": 0,
+        "correction_used": False,
+        "instances": [],
+    }
+    store = ContentStore(db_conn, blobs)
+    payload = canonical_json(document).encode("utf-8")
+    blob = store.put(
+        payload, media_type="application/json",
+        source_kind=QUALIFICATION_EVIDENCE_KIND, exportable=False,
+    )
+    loaded = read_planner_qualification_evidence(
+        db_conn, blobs, blob.content_hash,
+        expected_runtime_identity_fingerprint=identity_fp,
+        expected_role_evaluation_fingerprint=role_fp,
+    )
+    assert loaded["role_evaluation_spec"]["extra_harmless_field"] == (
+        "some-value-old-code-never-rejected"
+    )
+    assert loaded["role_evaluation_fingerprint"] == role_fp
+
+
+def test_historical_v1_role_evaluation_never_authorizes_current_v2_eligibility(db_conn):
+    """The FROZEN historical role-evaluation-spec-v1 fingerprint for a
+    given (runtime identity, output_token_budget, tool_choice_
+    enforcement, policy_version) tuple must never equal the CURRENT
+    role-evaluation-spec-v2 fingerprint for the exact same tuple plus
+    any timeout -- old evidence can never silently authorize current
+    production eligibility."""
+    identity_fp = fingerprint_runtime_identity(
+        canonical_runtime_identity_spec(
+            model_tag="qwen3-coder-ctx16k:30b", model_digest="sha256:abc",
+            endpoint="http://192.168.32.8:11434/v1", runtime_version="0.16.1",
+            normalizer_id="qwen_textual_tool_v1", normalizer_version=1,
+            effective_context_tokens=16384, temperature=0.0,
+        ),
+    )
+    historical_spec = _historical_role_evaluation_spec_v1(runtime_identity_fingerprint=identity_fp)
+    historical_fp = _historical_role_evaluation_fingerprint_v1(historical_spec)
+    current = role_evaluation_identity_from_config(
+        role=ProductionRole.PLANNER,
+        runtime_identity_fingerprint=identity_fp,
+        output_token_budget=historical_spec["output_token_budget"],
+        tool_choice_enforcement=historical_spec["tool_choice_enforcement"],
+        execution_timeout_seconds=30.0,
+        policy_version=historical_spec["policy_version"],
+    )
+    assert current.role_evaluation_fingerprint != historical_fp
+    # A certificate recorded under the historical fingerprint is simply
+    # never found when eligibility is evaluated against the current one.
+    with pytest.raises(ValueError, match="role_evaluation_fingerprint"):
+        RoleEvaluationIdentity(
+            role=ProductionRole.PLANNER,
+            runtime_identity_fingerprint=identity_fp,
+            output_token_budget=historical_spec["output_token_budget"],
+            tool_choice_enforcement=historical_spec["tool_choice_enforcement"],
+            execution_timeout_seconds=30.0,
+            policy_version=historical_spec["policy_version"],
+            role_evaluation_fingerprint=historical_fp,
+        )
+
+
 def test_generic_role_evaluation_identity_is_not_planner_specific():
     profile = _common()
     planner = _eval_for(profile, role=ProductionRole.PLANNER)
@@ -707,10 +939,11 @@ def test_generic_role_evaluation_identity_is_not_planner_specific():
         runtime_identity_fingerprint=profile.runtime_identity_fingerprint,
         output_token_budget=2048,
         tool_choice_enforcement="ADVISORY_ONLY_UNVERIFIED",
+        execution_timeout_seconds=45.0,
         policy_version="reviewer-certification-v1",
     )
     assert spec["role"] == "REVIEWER"
-    assert spec["spec_version"] == "role-evaluation-spec-v1"
+    assert spec["spec_version"] == "role-evaluation-spec-v2"
 
 
 # -- adversarial: identities are structurally self-verifying -----------------
@@ -727,6 +960,7 @@ def test_direct_role_evaluation_identity_rejects_mismatched_fingerprint():
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=genuine.output_token_budget,
             tool_choice_enforcement=genuine.tool_choice_enforcement,
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=_FORGED_SHA256,
         )
@@ -741,6 +975,7 @@ def test_role_evaluation_identity_rejects_budget_change_retaining_old_fingerprin
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=1024,
             tool_choice_enforcement=genuine.tool_choice_enforcement,
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
         )
@@ -755,6 +990,7 @@ def test_role_evaluation_identity_rejects_tool_choice_change_retaining_old_finge
             runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
             output_token_budget=genuine.output_token_budget,
             tool_choice_enforcement="REQUIRED_STRUCTURED_TOOL",
+            execution_timeout_seconds=genuine.execution_timeout_seconds,
             policy_version=genuine.policy_version,
             role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
         )
@@ -940,6 +1176,7 @@ def test_matching_direct_role_evaluation_construction_is_accepted():
         runtime_identity_fingerprint=genuine.runtime_identity_fingerprint,
         output_token_budget=genuine.output_token_budget,
         tool_choice_enforcement=genuine.tool_choice_enforcement,
+        execution_timeout_seconds=genuine.execution_timeout_seconds,
         policy_version=genuine.policy_version,
         role_evaluation_fingerprint=genuine.role_evaluation_fingerprint,
     )

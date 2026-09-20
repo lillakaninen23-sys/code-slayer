@@ -17,18 +17,27 @@ and stores the content hash as the certificate's existing `evidence_ref`.
 That is the smallest clean extension: no new certificate column for the
 blob itself.
 
-New documents use `planner-qualification-evidence-v2` and durably
-contain enough canonical information to reconstruct and independently
-verify BOTH:
+New documents use `planner-qualification-evidence-v3` (H.4.1) and
+durably contain enough canonical information to reconstruct and
+independently verify BOTH:
 
 - the common runtime identity (`runtime-identity-spec-v2` + fingerprint)
-- the Planner role/evaluation profile (`role-evaluation-spec-v1` +
-  fingerprint)
+- the Planner role/evaluation profile (`role-evaluation-spec-v2` +
+  fingerprint, including `execution_timeout_seconds` — the certified
+  Planner inference timeout, H.4.1)
 
 Existing `planner-qualification-evidence-v1` documents remain readable
 and verifiable under the v1 semantics that produced them
-(`runtime-config-spec-v1`). They are never rewritten, migrated, or
-reinterpreted as v2. Holding a v1 blob does not grant a v2 identity.
+(`runtime-config-spec-v1`). Existing `planner-qualification-evidence-v2`
+documents (H.2/H.3-era, before H.4.1) remain readable and verifiable
+under the FROZEN `role-evaluation-spec-v1` semantics that produced
+them — a dedicated historical verifier in this module reproduces that
+exact fingerprint computation, entirely separate from `workers.
+role_qualification.fingerprint_role_evaluation()`, which accepts only
+the CURRENT `role-evaluation-spec-v2` and must never be widened to
+accept v1 again. Neither v1 nor v2 documents are ever rewritten,
+migrated, or reinterpreted as the current version. Holding an older
+blob never grants current identity/eligibility.
 
 The document never grants authority itself. Holding a blob of kind
 `planner_qualification_evidence` does not certify anyone, does not
@@ -49,7 +58,9 @@ Persisted (canonical JSON, content-addressed, internal, non-exportable):
 - effective context tokens, temperature, output-token budget,
   tool-choice enforcement
 - per-instance qualification class, instance outcome, attempt count,
-  correction usage, and each attempt's bounded `AttemptProvenance`
+  correction usage, each attempt's bounded `AttemptProvenance`, and the
+  bounded `QualificationExpectation` (booleans/counts only) that
+  instance was checked against, if any
 - NATIVE vs NORMALIZED transport per attempt
 - whether full-input preservation was verified for that attempt
 - request / task / repository-context / schema fingerprints
@@ -90,6 +101,7 @@ from code_slayer.audit.canonical import canonical_json
 from code_slayer.planning.qualification import (
     AttemptProvenance,
     QualificationAttemptResult,
+    QualificationExpectation,
     QualificationOutcome,
 )
 from code_slayer.store.content_store import BlobTooLargeError, ContentStore
@@ -101,12 +113,26 @@ from code_slayer.workers.security_baseline import (
     canonical_runtime_identity_spec,
     fingerprint_runtime_config,
     fingerprint_runtime_identity,
+    require_sha256_hex,
 )
 
 QUALIFICATION_EVIDENCE_SPEC_VERSION_V1 = "planner-qualification-evidence-v1"
-QUALIFICATION_EVIDENCE_SPEC_VERSION = "planner-qualification-evidence-v2"
+# H.4.1: the historical outer-document version whose nested
+# `role_evaluation_spec` always carries the now-frozen
+# `role-evaluation-spec-v1` shape -- see `_fingerprint_role_evaluation_
+# v1_historical()` below. Frozen, never produced by new documents again.
+QUALIFICATION_EVIDENCE_SPEC_VERSION_V2 = "planner-qualification-evidence-v2"
+# H.4.1: new documents -- nested `role_evaluation_spec` now carries the
+# CURRENT `role-evaluation-spec-v2` shape (adds `execution_timeout_
+# seconds`, the certified Planner inference timeout).
+QUALIFICATION_EVIDENCE_SPEC_VERSION = "planner-qualification-evidence-v3"
 QUALIFICATION_EVIDENCE_KIND = "planner_qualification_evidence"
 MAX_QUALIFICATION_EVIDENCE_BYTES = 256 * 1024
+
+# H.4.1: the FROZEN pre-H.4.1 role-evaluation-spec shape, reproduced only
+# for verifying an authentic historical `planner-qualification-evidence-
+# v2` document's `role_evaluation_spec` -- never the current identity.
+_HISTORICAL_ROLE_EVALUATION_SPEC_VERSION_V1 = "role-evaluation-spec-v1"
 
 # Structural denylist: the document builder never emits these keys, and
 # persist refuses a document that contains them so a later edit cannot
@@ -258,14 +284,68 @@ def verify_runtime_identity_fingerprint(spec: dict, expected_fingerprint: str) -
 
 
 def verify_role_evaluation_fingerprint(spec: dict, expected_fingerprint: str) -> str:
-    """Recompute the role/evaluation fingerprint from `spec` and
-    require it to equal `expected_fingerprint`."""
+    """Recompute the CURRENT role/evaluation fingerprint from `spec`
+    (role-evaluation-spec-v2, H.4.1) and require it to equal
+    `expected_fingerprint`. Used only for the current
+    (`planner-qualification-evidence-v3`) document shape -- a historical
+    `planner-qualification-evidence-v2` document's role_evaluation_spec
+    must instead go through `_verify_historical_role_evaluation_
+    fingerprint_v1()` below, since `fingerprint_role_evaluation()`
+    itself intentionally refuses anything but the current spec
+    version."""
     if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     try:
         recomputed = fingerprint_role_evaluation(spec)
     except (TypeError, ValueError) as exc:
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch") from exc
+    if recomputed != expected_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    return recomputed
+
+
+def _fingerprint_role_evaluation_v1_historical(spec: dict) -> str:
+    """FROZEN reproduction of the pre-H.4.1 `role-evaluation-spec-v1`
+    fingerprint semantics -- exactly what the OLD `fingerprint_role_
+    evaluation()` did before H.4.1's v2 bump: require `spec["spec_
+    version"] == "role-evaluation-spec-v1"`, then SHA-256 the full
+    `canonical_json(spec)`, with no per-key shape validation of its own
+    (the old code never had any either -- `canonical_role_evaluation_
+    spec()`'s caller-side validation was the only gate, and this
+    function's job is only to re-verify an already-persisted document's
+    fingerprint, not to re-validate how it was built). Used ONLY to
+    re-verify an authentic, already-persisted `planner-qualification-
+    evidence-v2` document's own `role_evaluation_spec` -- forensic
+    verification only.
+
+    This function never constructs a `RoleEvaluationIdentity`, is never
+    called from anywhere in the production routing/certification/
+    eligibility path, and successfully re-verifying against it never
+    makes an old certificate eligible under CURRENT (`role-evaluation-
+    spec-v2`) authority -- that authority is decided exclusively by
+    `workers.role_qualification.fingerprint_role_evaluation()`, which
+    this function neither calls nor duplicates the acceptance of."""
+    if not isinstance(spec, dict):
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    if spec.get("spec_version") != _HISTORICAL_ROLE_EVALUATION_SPEC_VERSION_V1:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    digest = hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
+    try:
+        return require_sha256_hex("role_evaluation_fingerprint", digest)
+    except (TypeError, ValueError) as exc:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch") from exc
+
+
+def _verify_historical_role_evaluation_fingerprint_v1(
+    spec: dict, expected_fingerprint: str,
+) -> str:
+    """Recompute the FROZEN v1 role/evaluation fingerprint from `spec`
+    and require it to equal `expected_fingerprint`. Only ever called
+    from `_verify_v2_document()` below, on an already-persisted document
+    -- never used to accept, build, or persist a NEW document."""
+    if not isinstance(expected_fingerprint, str) or not expected_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    recomputed = _fingerprint_role_evaluation_v1_historical(spec)
     if recomputed != expected_fingerprint:
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     return recomputed
@@ -322,6 +402,25 @@ def _provenance_to_dict(attempt: AttemptProvenance) -> dict:
         "temperature": attempt.temperature,
         "runtime_config_fingerprint": attempt.runtime_config_fingerprint,
         "runtime_identity_fingerprint": attempt.runtime_identity_fingerprint,
+        # H.4.1: the Planner INFERENCE request timeout this attempt's
+        # adapter was actually constructed with -- durable proof of
+        # which timeout an individual qualification attempt used.
+        "planner_timeout_seconds": attempt.planner_timeout_seconds,
+    }
+
+
+def _expectation_to_dict(expectation: QualificationExpectation) -> dict:
+    """Allowlisted bounded fields only -- booleans/counts, never free
+    text -- mirrors `_provenance_to_dict()`'s own discipline."""
+    return {
+        "require_affected_files": expectation.require_affected_files,
+        "min_affected_files": expectation.min_affected_files,
+        "require_planned_changes": expectation.require_planned_changes,
+        "min_planned_changes": expectation.min_planned_changes,
+        "require_requirements": expectation.require_requirements,
+        "min_requirements": expectation.min_requirements,
+        "require_verification_steps": expectation.require_verification_steps,
+        "require_evidence_grounding": expectation.require_evidence_grounding,
     }
 
 
@@ -335,6 +434,9 @@ def _instance_to_dict(result: QualificationAttemptResult) -> dict:
         ),
         "attempt_outcomes": [attempt.outcome.value for attempt in result.attempts],
         "provenance": [_provenance_to_dict(p) for p in result.provenance],
+        "expectation": (
+            _expectation_to_dict(result.expectation) if result.expectation is not None else None
+        ),
     }
 
 
@@ -348,7 +450,7 @@ def build_planner_qualification_evidence_document(
     policy_version: str,
     classification: str,
 ) -> dict:
-    """Pure. Builds the canonical v2 document; does not write anything.
+    """Pure. Builds the canonical v3 document; does not write anything.
     Fingerprint mismatch fails closed before a caller can persist."""
     if not isinstance(results, tuple) or not results:
         raise QualificationEvidenceError("empty_qualification_evidence")
@@ -376,6 +478,14 @@ def build_planner_qualification_evidence_document(
                 "tool_choice_enforcement",
             ):
                 raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+            # H.4.1 (Blocker 2): every attempt must have used EXACTLY the
+            # certified Planner inference timeout -- missing (`None`) or
+            # mismatched both fail closed, before any persistence, the
+            # same evidence-integrity discipline as the two checks above.
+            if attempt.planner_timeout_seconds != role_evaluation_spec.get(
+                "execution_timeout_seconds",
+            ):
+                raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
 
     total_attempts = sum(result.attempt_count for result in results)
     correction_used = any(
@@ -400,6 +510,13 @@ def build_planner_qualification_evidence_document(
         "temperature": runtime_identity_spec["temperature"],
         "output_token_budget": role_evaluation_spec["output_token_budget"],
         "tool_choice_enforcement": role_evaluation_spec["tool_choice_enforcement"],
+        # H.4.1: the certified Planner inference timeout, exposed at the
+        # top level exactly like output_token_budget/tool_choice_
+        # enforcement above -- bounded, non-secret provenance. The
+        # canonical role_evaluation_spec (`execution_timeout_seconds`,
+        # the role-generic field name) remains the actual fingerprint
+        # authority; this is a convenience copy, not a second identity.
+        "planner_timeout_seconds": role_evaluation_spec["execution_timeout_seconds"],
         "final_classification": classification,
         "instance_count": len(results),
         "attempt_count": total_attempts,
@@ -433,6 +550,70 @@ def _verify_v2_document(
     expected_runtime_identity_fingerprint: str,
     expected_role_evaluation_fingerprint: str,
 ) -> dict:
+    """FROZEN historical path for an authentic `planner-qualification-
+    evidence-v2` document (H.2/H.3-era, before H.4.1) -- its own
+    `role_evaluation_spec` always carries the now-historical
+    `role-evaluation-spec-v1` shape, re-verified via
+    `_verify_historical_role_evaluation_fingerprint_v1()`, NEVER the
+    current `verify_role_evaluation_fingerprint()` (which accepts only
+    `role-evaluation-spec-v2` and would otherwise refuse every existing
+    v2 document outright). This function is never used to build, accept,
+    or persist a NEW document -- see `build_planner_qualification_
+    evidence_document()`, which only ever emits the current version."""
+    identity_spec = document.get("runtime_identity_spec")
+    claimed_identity = document.get("runtime_identity_fingerprint")
+    evaluation_spec = document.get("role_evaluation_spec")
+    claimed_evaluation = document.get("role_evaluation_fingerprint")
+    if (
+        not isinstance(identity_spec, dict)
+        or not isinstance(claimed_identity, str)
+        or not isinstance(evaluation_spec, dict)
+        or not isinstance(claimed_evaluation, str)
+    ):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    recomputed_identity = verify_runtime_identity_fingerprint(identity_spec, claimed_identity)
+    if recomputed_identity != expected_runtime_identity_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    if claimed_identity != expected_runtime_identity_fingerprint:
+        raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
+    recomputed_evaluation = _verify_historical_role_evaluation_fingerprint_v1(
+        evaluation_spec,
+        claimed_evaluation,
+    )
+    if recomputed_evaluation != expected_role_evaluation_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    if claimed_evaluation != expected_role_evaluation_fingerprint:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+    if evaluation_spec.get("runtime_identity_fingerprint") != claimed_identity:
+        raise QualificationEvidenceError("role_evaluation_runtime_identity_mismatch")
+    return document
+
+
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _verify_v3_document(
+    document: dict,
+    *,
+    expected_runtime_identity_fingerprint: str,
+    expected_role_evaluation_fingerprint: str,
+) -> dict:
+    """Current document path (`planner-qualification-evidence-v3`,
+    H.4.1) -- its `role_evaluation_spec` carries the CURRENT
+    `role-evaluation-spec-v2` shape (including `execution_timeout_
+    seconds`), verified via the CURRENT `verify_role_evaluation_
+    fingerprint()`. Additionally re-verifies, from the persisted bytes
+    themselves (tamper detection, not merely the build-time check in
+    `build_planner_qualification_evidence_document()`), that the
+    top-level `planner_timeout_seconds` copy and every attempt's own
+    persisted `planner_timeout_seconds` still agree with the canonical
+    spec's `execution_timeout_seconds` -- and that at least one real
+    attempt actually exists to prove it: `instances` must be a non-empty
+    list, and every instance's own `provenance` must be a non-empty
+    list, so a document with `instances: []` (or a provenance-less
+    instance) can never vacuously satisfy the timeout proof by having no
+    attempts to check at all."""
     identity_spec = document.get("runtime_identity_spec")
     claimed_identity = document.get("runtime_identity_fingerprint")
     evaluation_spec = document.get("role_evaluation_spec")
@@ -459,6 +640,33 @@ def _verify_v2_document(
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     if evaluation_spec.get("runtime_identity_fingerprint") != claimed_identity:
         raise QualificationEvidenceError("role_evaluation_runtime_identity_mismatch")
+
+    expected_timeout = evaluation_spec.get("execution_timeout_seconds")
+    if not _is_positive_number(expected_timeout):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    top_level_timeout = document.get("planner_timeout_seconds")
+    if not _is_positive_number(top_level_timeout):
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    if top_level_timeout != expected_timeout:
+        raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
+
+    instances = document.get("instances")
+    if not isinstance(instances, list) or not instances:
+        raise QualificationEvidenceError("malformed_qualification_evidence")
+    for instance in instances:
+        if not isinstance(instance, dict):
+            raise QualificationEvidenceError("malformed_qualification_evidence")
+        provenance = instance.get("provenance")
+        if not isinstance(provenance, list) or not provenance:
+            raise QualificationEvidenceError("malformed_qualification_evidence")
+        for attempt in provenance:
+            if not isinstance(attempt, dict):
+                raise QualificationEvidenceError("malformed_qualification_evidence")
+            attempt_timeout = attempt.get("planner_timeout_seconds")
+            if not _is_positive_number(attempt_timeout):
+                raise QualificationEvidenceError("malformed_qualification_evidence")
+            if attempt_timeout != expected_timeout:
+                raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
     return document
 
 
@@ -486,13 +694,19 @@ def _verify_document_bytes(
             document,
             expected_runtime_config_fingerprint=expected_runtime_config_fingerprint,
         )
-    if spec_version != QUALIFICATION_EVIDENCE_SPEC_VERSION:
-        raise QualificationEvidenceError("unsupported_qualification_evidence_spec")
     if not isinstance(expected_runtime_identity_fingerprint, str):
         raise QualificationEvidenceError("runtime_identity_fingerprint_mismatch")
     if not isinstance(expected_role_evaluation_fingerprint, str):
         raise QualificationEvidenceError("role_evaluation_fingerprint_mismatch")
-    return _verify_v2_document(
+    if spec_version == QUALIFICATION_EVIDENCE_SPEC_VERSION_V2:
+        return _verify_v2_document(
+            document,
+            expected_runtime_identity_fingerprint=expected_runtime_identity_fingerprint,
+            expected_role_evaluation_fingerprint=expected_role_evaluation_fingerprint,
+        )
+    if spec_version != QUALIFICATION_EVIDENCE_SPEC_VERSION:
+        raise QualificationEvidenceError("unsupported_qualification_evidence_spec")
+    return _verify_v3_document(
         document,
         expected_runtime_identity_fingerprint=expected_runtime_identity_fingerprint,
         expected_role_evaluation_fingerprint=expected_role_evaluation_fingerprint,
@@ -506,11 +720,12 @@ def persist_planner_qualification_evidence(
     expected_runtime_identity_fingerprint: str,
     expected_role_evaluation_fingerprint: str,
 ) -> str:
-    """Write the canonical v2 document as an internal, non-exportable
+    """Write the canonical v3 document as an internal, non-exportable
     content-addressed blob and return its content hash. Re-reads and
     re-verifies both fingerprints from the persisted specs before
-    returning. Never grants a certificate. v1 documents cannot be
-    persisted through this path — historical evidence stays immutable."""
+    returning. Never grants a certificate. Neither v1 nor v2 documents
+    can be persisted through this path — historical evidence stays
+    immutable; only the current version is ever freshly written."""
     if not isinstance(store, ContentStore):
         raise QualificationEvidenceError("missing_durable_qualification_evidence")
     if document.get("spec_version") != QUALIFICATION_EVIDENCE_SPEC_VERSION:
@@ -560,7 +775,11 @@ def read_planner_qualification_evidence(
     mismatch, or (when supplied) fingerprint mismatch. Survives process
     restart because it only reads `content_blobs` plus the blob file.
     v1 documents verify against `expected_runtime_config_fingerprint`;
-    v2 documents verify against both new fingerprints."""
+    v2 documents verify against both new fingerprints using the FROZEN
+    historical `role-evaluation-spec-v1` semantics (`_verify_v2_
+    document()`); v3 documents verify against both using the CURRENT
+    `role-evaluation-spec-v2` semantics, including the Planner timeout
+    (`_verify_v3_document()`)."""
     if not isinstance(content_hash, str) or not content_hash.strip():
         raise QualificationEvidenceError("missing_durable_qualification_evidence")
     store = ContentStore(conn, blobs_dir)

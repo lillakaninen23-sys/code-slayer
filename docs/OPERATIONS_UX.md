@@ -1,12 +1,15 @@
 # Operations UX
 
 **Status:** authoritative governance specification (Governance Foundation,
-slice G1) — a **target specification for a future operational surface**.
-**No `cslr` CLI, `cslr doctor`, updater, or storage/AI-server/model
-management commands exist yet.** The current, real CLI is `codeslayer`
-(`src/code_slayer/cli/main.py`: `codeslayer inspect`, `codeslayer serve`)
-and is **not renamed by this document** — see
-[Current vs. future](#0-current-vs-future).
+slice G1) — a **target specification for a future operational surface**,
+with a **first implemented slice as of service-web-admin-v1**.
+The current CLI remains `codeslayer` (`src/code_slayer/cli/main.py`) and
+is also invoked as `./cslr` / the `cslr` entry point — this document
+does **not** rename the Python package. Implemented today:
+`inspect`, `serve`, `install-service`, `status`, `start`, `stop`,
+`restart`. **Not implemented:** `cslr doctor`, NAS/storage management,
+LAN AI-server discovery, model download/install, backup/restore.
+See [Current vs. future](#0-current-vs-future).
 **Relationship to other documents:** [`docs/PRODUCT_PRINCIPLES.md`](PRODUCT_PRINCIPLES.md)
 states *why* (simple by default, powerful underneath); this document states
 the concrete *target* CLI/operational surface those principles point to.
@@ -23,12 +26,34 @@ system described there before they do anything (§4).
 
 ## 0. Current vs. future
 
-Every command name and subsystem in this document is a **required future
-target**, not a current feature. Nothing here renames, deprecates, or
-wraps the existing `codeslayer` CLI in this slice. When a future slice
-actually builds `cslr`, it MUST satisfy the requirements below; until
-then, this document is a specification with no corresponding
-implementation, and must not be cited as if it were one.
+Every command name and subsystem in this document remains a **required
+future target** unless listed as implemented above. Nothing here
+deprecates the existing `codeslayer` Python entry point. `./cslr`
+is a checkout wrapper around the same CLI.
+
+Implemented in the service-web-admin-v1 baseline plus the reconciled
+Engineering Control Room frontend:
+
+- `./cslr install-service` — managed venv, user systemd unit,
+  enable+start, persistent XDG config, loopback bind 127.0.0.1:8765
+- `./cslr status|start|stop|restart`
+- one Control Room with Dashboard, Projects, Tasks, Models, Intelligence,
+  Planning, Privacy & Security, Audit, and Settings navigation
+- Runtime configuration and explicit live attestation under Models
+- Certification Center v1 under Privacy & Security
+- System/deployment and Tailscale Serve administration under Settings
+- fail-closed `Check for update` / optional fast-forward apply
+- read-only Dashboard control-plane summaries for deployment, runtime
+  configuration, certification projection, and remote access
+
+Dashboard summaries are deliberately observation-only. They use separate GET
+snapshots and do not live-attest a model, approve identity, start/preflight
+certification, restart/apply an update, or mutate Tailscale. Runtime,
+certification, deployment, and remote-access authority remain in their
+dedicated backend projections and explicit controls.
+
+Still specification-only: doctor, storage, LAN discovery, model
+catalog download, backup/restore, and the rest of §1.
 
 ## 1. Target CLI identity
 

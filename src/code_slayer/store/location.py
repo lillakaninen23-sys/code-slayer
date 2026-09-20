@@ -58,6 +58,44 @@ def tmp_dir(repo_id: str, worktree_id: str, *, override: str | Path | None = Non
     return worktree_state_dir(repo_id, worktree_id, override=override) / "tmp"
 
 
+def validation_certification_state_dir(
+    repo_id: str, worktree_id: str, *, override: str | Path | None = None,
+) -> Path:
+    """Isolated, non-production state for Certification Center v1.
+
+    Never the production worktree directory (`repos/<repo>/worktrees/<id>`).
+    Validation certificates and evidence live only here.
+    """
+    return state_root(override=override) / "validation-certification" / repo_id / worktree_id
+
+
+def validation_certification_db_path(
+    repo_id: str, worktree_id: str, *, override: str | Path | None = None,
+) -> Path:
+    return validation_certification_state_dir(
+        repo_id, worktree_id, override=override,
+    ) / "state.db"
+
+
+def validation_certification_blobs_dir(
+    repo_id: str, worktree_id: str, *, override: str | Path | None = None,
+) -> Path:
+    return validation_certification_state_dir(
+        repo_id, worktree_id, override=override,
+    ) / "blobs"
+
+
+def ensure_validation_certification_dirs(
+    repo_id: str, worktree_id: str, *, override: str | Path | None = None,
+) -> Path:
+    directory = validation_certification_state_dir(
+        repo_id, worktree_id, override=override,
+    )
+    (directory / "blobs").mkdir(parents=True, exist_ok=True)
+    (directory / "tmp").mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def ensure_dirs(
     repo_id: str, worktree_id: str, *, override: str | Path | None = None
 ) -> Path:

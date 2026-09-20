@@ -617,6 +617,73 @@ def test_worker_registrations_binding_registers_worker_at_startup(git_repo_with_
     assert len(execution_adapter.calls) == 1
 
 
+# -- H.3: restart/re-registration must never implicitly reactivate ----------
+
+
+def test_archived_worker_remains_archived_across_service_restart(git_repo_with_commit):
+    """Critical H.3 invariant, exercised through the REAL
+    `ApplicationService` construction path (not `WorkersRepo` directly):
+    a fresh `ApplicationService` -- the exact shape of a process restart
+    -- re-registers every `WorkerRegistration` in `__init__`. That
+    re-registration must never resurrect an archived worker."""
+    repo = git_repo_with_commit
+    bindings = RuntimeBindings(
+        worker_registrations=(
+            WorkerRegistration(worker_id=WORKER, kind="fake", network_class="local"),
+        ),
+    )
+    app1 = create_app(repo, bindings=bindings)
+    service1 = app1.extensions["codeslayer"]
+    with service1.runner() as runner:
+        archived = runner.archive_worker(WORKER)
+        assert archived.ok and archived.changed
+    service1.close()
+
+    # A brand-new ApplicationService against the same repo, same
+    # WorkerRegistration -- __init__ calls register_worker() again.
+    app2 = create_app(repo, bindings=bindings)
+    service2 = app2.extensions["codeslayer"]
+    try:
+        with service2.reads() as reads:
+            worker = reads.worker(WORKER)
+        assert worker.lifecycle_state == "ARCHIVED"
+
+        # The HTTP execution gate also still refuses post-restart.
+        client = app2.test_client()
+        response = start(client)
+        assert response.status_code == 409
+        assert response.json["error"]["code"] == "worker_archived"
+    finally:
+        service2.close()
+
+
+def test_archived_worker_remains_archived_across_explicit_config_reload(git_repo_with_commit):
+    """`refresh_persistent_workers()` (the explicit config-reload path,
+    e.g. after `save_persistent_config()`) must not reactivate an
+    archived worker either -- it calls the same idempotent `register()`
+    `__init__` does."""
+    repo = git_repo_with_commit
+    bindings = RuntimeBindings(
+        worker_registrations=(
+            WorkerRegistration(worker_id=WORKER, kind="fake", network_class="local"),
+        ),
+    )
+    app = create_app(repo, bindings=bindings)
+    service = app.extensions["codeslayer"]
+    try:
+        with service.runner() as runner:
+            archived = runner.archive_worker(WORKER)
+            assert archived.ok and archived.changed
+
+        service.refresh_persistent_workers()
+
+        with service.reads() as reads:
+            worker = reads.worker(WORKER)
+        assert worker.lifecycle_state == "ARCHIVED"
+    finally:
+        service.close()
+
+
 def test_worker_registration_alone_grants_no_trust(git_repo_with_commit):
     """Declaring a worker via `worker_registrations` must never itself
     authorize a tool call: a freshly registered worker still starts
@@ -686,3 +753,36 @@ def test_unrelated_internal_error_is_still_masked_as_a_generic_500(setup):
     assert response.status_code == 500
     assert response.json["error"]["code"] == "application_error"
     assert "connection_refused" not in response.text
+
+
+# -- H.3: POST /api/runs refuses an archived worker before doing anything ----
+
+
+def test_post_runs_refuses_archived_worker_before_opening_the_runner(setup):
+    from code_slayer.workers.lifecycle import archive_worker
+
+    with_runner = LocalWorkerRunner(setup)
+    archived = archive_worker(with_runner._control_conn, worker_id=WORKER)
+    assert archived.ok and archived.changed
+    with_runner.close()
+
+    client, analyst, adapter = application(setup)
+    response = start(client)
+    assert response.status_code == 409
+    assert response.json["error"]["code"] == "worker_archived"
+    assert len(analyst.calls) == 0
+    assert adapter.calls == ()
+    assert client.get("/api/runs").json == {"runs": [], "next_offset": None}
+
+
+def test_post_runs_succeeds_again_after_reactivation(setup):
+    from code_slayer.workers.lifecycle import archive_worker, reactivate_worker
+
+    with_runner = LocalWorkerRunner(setup)
+    archive_worker(with_runner._control_conn, worker_id=WORKER)
+    reactivate_worker(with_runner._control_conn, worker_id=WORKER)
+    with_runner.close()
+
+    client, _analyst, _adapter = application(setup)
+    response = start(client)
+    assert response.status_code == 201

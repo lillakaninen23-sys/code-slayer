@@ -49,6 +49,7 @@ class BaselineSecurityCertificatesRepo:
         normalizer_version: int | None = None,
         runtime_config_fingerprint: str | None = None,
         runtime_identity_fingerprint: str | None = None,
+        promoted_from_validation_certificate_id: str | None = None,
     ) -> WorkerBaselineSecurityCertificate:
         if not self._conn.in_transaction:
             raise RuntimeError(
@@ -59,8 +60,9 @@ class BaselineSecurityCertificatesRepo:
             "(certificate_id, worker_id, baseline_version, model_tag, model_digest, "
             "endpoint, runtime_version, normalizer_id, normalizer_version, "
             "runtime_config_fingerprint, runtime_identity_fingerprint, outcome, "
-            "hard_disqualifiers_json, evidence_ref, reason, issued_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "hard_disqualifiers_json, evidence_ref, reason, issued_at, "
+            "promoted_from_validation_certificate_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 certificate_id,
                 worker_id,
@@ -78,6 +80,7 @@ class BaselineSecurityCertificatesRepo:
                 evidence_ref,
                 reason,
                 issued_at,
+                promoted_from_validation_certificate_id,
             ),
         )
         certificate = self.get(certificate_id)
@@ -104,6 +107,24 @@ class BaselineSecurityCertificatesRepo:
         ).fetchall()
         return [_row_to_certificate(row) for row in rows]
 
+    def get_by_promotion_provenance(
+        self, validation_certificate_id: str,
+    ) -> WorkerBaselineSecurityCertificate | None:
+        """The certificate (if any) whose `promoted_from_validation_
+        certificate_id` equals `validation_certificate_id` exactly —
+        the lookup `code_slayer.security.production_promotion` uses for
+        promotion idempotency (schema v17's partial UNIQUE index
+        guarantees at most one such row can ever exist). Never matches
+        an ordinary, non-promoted certificate: that column is NULL on
+        every one of those, and NULL is never treated as a match for a
+        caller-supplied string here."""
+        row = self._conn.execute(
+            "SELECT * FROM worker_baseline_security_certificates "
+            "WHERE promoted_from_validation_certificate_id = ?",
+            (validation_certificate_id,),
+        ).fetchone()
+        return _row_to_certificate(row) if row is not None else None
+
 
 def _row_to_certificate(row: sqlite3.Row) -> WorkerBaselineSecurityCertificate:
     return WorkerBaselineSecurityCertificate(
@@ -123,4 +144,5 @@ def _row_to_certificate(row: sqlite3.Row) -> WorkerBaselineSecurityCertificate:
         normalizer_version=row["normalizer_version"],
         runtime_config_fingerprint=row["runtime_config_fingerprint"],
         runtime_identity_fingerprint=row["runtime_identity_fingerprint"],
+        promoted_from_validation_certificate_id=row["promoted_from_validation_certificate_id"],
     )

@@ -103,6 +103,11 @@ class Worker:
     available_after: str | None
     last_probe_at: str | None
     last_error: str | None
+    # H.3: administrative lifecycle (schema v18) -- separate from
+    # `availability_state` (runtime health/reachability). See
+    # `code_slayer.store.workers_repo.WorkerLifecycleState`.
+    lifecycle_state: str = "ACTIVE"
+    lifecycle_changed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,7 +182,14 @@ class WorkerBaselineSecurityCertificate:
     with no referenceable evidence. `hard_disqualifiers_json` is a JSON
     array of `code_slayer.workers.security_baseline.
     HardDisqualifierCategory` values, non-empty only when
-    `outcome == "HARD_DISQUALIFIED"`."""
+    `outcome == "HARD_DISQUALIFIED"`.
+
+    `promoted_from_validation_certificate_id` (schema v17) is `None` for
+    every ordinary certificate — it is set ONLY by `code_slayer.
+    security.production_promotion` when this row durably carries a
+    VALIDATION certificate forward into PRODUCTION, to that VALIDATION
+    row's own `certificate_id`. Never a client-supplied value; see that
+    module's own docstring."""
 
     certificate_id: str
     worker_id: str
@@ -195,6 +207,7 @@ class WorkerBaselineSecurityCertificate:
     normalizer_version: int | None = None
     runtime_config_fingerprint: str | None = None
     runtime_identity_fingerprint: str | None = None
+    promoted_from_validation_certificate_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -292,7 +305,27 @@ class PlanningJobRow:
     `EngineeringPlanRow` it points at via `plan_id` — see
     `store.migrations.0009_planning_jobs`'s module comment. Identity
     fields locked at creation; ownership/outcome fields evolve as the
-    job progresses."""
+    job progresses.
+
+    `worker_id` through `planner_policy_version` (schema v19, H.4) are
+    the durable Planner route binding this job was created with — see
+    `store.migrations.0019_planner_worker_routing`'s own module
+    comment. All eight are `None` only for a job created before schema
+    v19 (never rewritten to claim a binding it never had); every job
+    created at or after v19 has all eight populated, enforced both by
+    `store.planning_jobs_repo.PlanningJobsRepo.create_in_transaction()`
+    requiring them as mandatory parameters and by that migration's own
+    `planning_jobs_require_route_binding_on_insert` trigger. Locked at
+    creation exactly like every other identity field above — see that
+    migration's `planning_jobs_no_mutate_identity` trigger.
+
+    `planner_timeout_seconds` (schema v20, H.4.1) is a NINTH route-
+    binding field, added later — `None` for any job created before
+    schema v20 (a v19 job otherwise fully bound; never a value this job
+    was never actually queued with — see `store.migrations.
+    0020_planner_timeout_binding`), mandatory and immutable for every
+    job created at or after v20, same enforcement pattern as the
+    original eight."""
 
     job_id: str
     plan_id: str
@@ -311,6 +344,15 @@ class PlanningJobRow:
     failure_category: str | None
     failure_reason: str | None
     predecessor_job_id: str | None
+    worker_id: str | None = None
+    runtime_identity_fingerprint: str | None = None
+    role_evaluation_fingerprint: str | None = None
+    security_certificate_id: str | None = None
+    role_certificate_id: str | None = None
+    output_token_budget: int | None = None
+    tool_choice_enforcement: str | None = None
+    planner_policy_version: str | None = None
+    planner_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -443,3 +485,68 @@ class RepositoryIntelligenceSnapshotRow:
     snapshot_content_hash: str
     file_count: int
     inventory_truncated: bool
+
+
+@dataclass(frozen=True)
+class CertificationRunRow:
+    """One durable Certification Center job (schema v16). Distinct from
+    a Baseline Security certificate: a run may finish INCOMPLETE with
+    no certificate. Identity fields are immutable; lifecycle fields
+    evolve until a terminal state."""
+
+    run_id: str
+    worker_id: str
+    kind: str
+    environment: str
+    state: str
+    reason: str | None
+    preflight_json: str
+    expected_runtime_identity_fingerprint: str | None
+    model_tag: str | None
+    model_digest: str | None
+    ollama_root: str | None
+    certificate_id: str | None
+    evidence_ref: str | None
+    hard_disqualifiers_json: str
+    created_at: str
+    updated_at: str
+    started_at: str | None
+    finished_at: str | None
+    attempt: int
+    owner_pid: int | None
+    owner_pid_started_at: str | None
+    owner_generation: int
+
+
+@dataclass(frozen=True)
+class CodingJobRow:
+    """One durable Autonomous Engineering Loop job record
+    (`store.migrations.0021_coding_jobs`) -- `code_slayer.coding.
+    jobs_repo.CodingJobsRepo`'s own row shape. Mirrors `PlanningJobRow`'s
+    "identity locked at creation, lifecycle/outcome fields evolve" split;
+    see that migration's module comment for why rich per-attempt evidence
+    (review/security findings, tool calls, repair reasoning) lives in
+    `audit_events` (addressable via `task_id`) rather than duplicated
+    here. `state` is `code_slayer.coding.pipeline_types.CodingJobState`'s
+    own string vocabulary."""
+
+    job_id: str
+    plan_id: str
+    repo_id: str
+    primary_worktree_id: str
+    created_at: str
+    updated_at: str
+    original_prompt_hash: str
+    base_revision: str
+    max_repair_attempts: int
+    state: str
+    execution_worktree_id: str | None
+    job_worktree_path: str | None
+    task_id: str | None
+    repair_attempts: int
+    review_verdict: str | None
+    review_evidence_ref: str | None
+    security_verdict: str | None
+    security_evidence_ref: str | None
+    final_reason: str | None
+    finished_at: str | None

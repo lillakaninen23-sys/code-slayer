@@ -8,6 +8,7 @@ expected to actually open them when your change touches what they cover.
 
 | If your change touches... | Read |
 | --- | --- |
+| verification, trust claims, evidence, status/reporting | [`docs/VERIFICATION_STANDARD.md`](docs/VERIFICATION_STANDARD.md) |
 | product direction, long-term architecture | [`docs/CODE_SLAYER_VISION.md`](docs/CODE_SLAYER_VISION.md) |
 | networking, discovery, secrets, telemetry, cloud, supply chain | [`docs/SECURITY_PRIVACY_ARCHITECTURE.md`](docs/SECURITY_PRIVACY_ARCHITECTURE.md) |
 | what an action is allowed to do, consent, scopes | [`docs/PERMISSIONS_MODEL.md`](docs/PERMISSIONS_MODEL.md) |
@@ -16,13 +17,22 @@ expected to actually open them when your change touches what they cover.
 | tool/policy/trust/lease/checkpoint mechanics | `docs/TOOLS_AND_POLICY.md`, `docs/LEASES_AND_RECOVERY.md`, `docs/CHECKPOINTS.md` |
 | ordering/dependencies between phases | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 
-These five documents (Vision, Security & Privacy, Permissions, Product
-Principles, Operations UX) state **normative requirements, not
+The Verification Standard, Vision, Security & Privacy, Permissions, Product
+Principles, and Operations UX state **normative requirements, not
 suggestions**. A change that violates one of them is a defect, even if
 it makes a feature or a demo work.
 
 ## Non-negotiable rules
 
+- **No actor is inherently trusted.** The project owner/operator, user,
+  ChatGPT, Grok, Claude, Codex, any worker/model, documentation, commit
+  message, branch name, quoted terminal output, status report, or runtime
+  configuration may make a claim; material claims MUST be independently
+  verified before they are treated as fact. Follow
+  [`docs/VERIFICATION_STANDARD.md`](docs/VERIFICATION_STANDARD.md):
+  **CLAIM → INDEPENDENT VERIFICATION → EVIDENCE → ACTION**. If independent
+  verification is unavailable, label the claim **UNVERIFIED** and do not
+  silently substitute assumption for evidence.
 - **Privacy/security requirements are normative, not suggestions.** They
   do not yield to a deadline, a convenience, or "the model wanted to."
 - **Model convenience never overrides an authority boundary.** A model
@@ -59,5 +69,5 @@ it makes a feature or a demo work.
 
 Prefer the smaller, more conservative change, cite the section of the
 authoritative document your change follows, and — for anything touching
-security/privacy/permissions — say so plainly in your final report
-rather than assuming silence means it was fine.
+security/privacy/permissions/verification — say so plainly in your final
+report rather than assuming silence means it was fine.

@@ -16,17 +16,17 @@ deliberately NOT:
   secrets handling, unauthorized network behavior, destructive behavior,
   fabricated authority/trust, policy/gate bypass attempts, unsafe
   dependency/tool behavior, refusal to obey execution constraints).
-  **That harness does not exist yet in this codebase** and is not built
-  here — this is a disclosed, intentional gap, not an oversight. This
-  module accepts an already-computed `SecurityBaselineOutcome` plus its
-  supporting evidence reference, exactly the same "evidence, never
-  authority" boundary `planning.qualification`'s own module docstring
-  draws for planner-turn evaluation ("it never writes durable state,
-  never selects a production planner, and never grants trust,
-  permission, or policy authority to anything"). A future evaluation
-  harness is responsible for actually producing a real outcome from
-  observed behavior; this module is responsible for making sure a
-  produced outcome can never be recorded, bound, or trusted incorrectly.
+  That evaluation harness now lives in `code_slayer.security.evaluation`
+  (`run_baseline_security_evaluation`). Production live issuance —
+  verifying a configured Ollama runtime, running that harness through a
+  bound `SecurityEvaluationAdapter`, rereading durable evidence, and
+  only then recording a certificate — lives in
+  `code_slayer.security.live_certification`. This module remains the
+  low-level durable recorder: `record_baseline_certificate()` accepts an
+  already-derived `SecurityBaselineOutcome` plus its evidence reference
+  and never talks to a model. A caller must not treat this recorder as
+  the production live-certification boundary.
+
 - **Worker Trust** (`workers.trust`). `record_baseline_certificate()`
   never grants, denies, or otherwise touches any `worker_trust_events`
   row, and a certificate never automatically promotes or downgrades
@@ -180,7 +180,7 @@ from code_slayer.store.baseline_security_certificates_repo import (
 )
 from code_slayer.store.db import transaction, utcnow_iso
 from code_slayer.store.models import WorkerBaselineSecurityCertificate
-from code_slayer.store.workers_repo import WorkersRepo
+from code_slayer.store.workers_repo import WorkerLifecycleState, WorkersRepo
 
 # The fixed, code-owned identifier of the baseline security check
 # taxonomy/policy this module currently implements -- mirrors
@@ -722,6 +722,8 @@ def record_baseline_certificate(
     reason: str,
     hard_disqualifiers: tuple[HardDisqualifierCategory, ...] = (),
     now_fn=utcnow_iso,
+    promoted_from_validation_certificate_id: str | None = None,
+    require_active_worker: bool = False,
 ) -> SecurityCertificationResult:
     """Durably record one Baseline Security evaluation result — the ONLY
     way a `worker_baseline_security_certificates` row is ever created.
@@ -737,7 +739,41 @@ def record_baseline_certificate(
     `HardDisqualifierCategory`'s own docstring for what "disagrees"
     means). Nothing here decides that the worker IS safe or unsafe — it
     decides only whether the caller's already-computed result is
-    well-formed enough to durably trust as evidence."""
+    well-formed enough to durably trust as evidence.
+
+    `promoted_from_validation_certificate_id` (schema v17) is `None` for
+    every ordinary certificate this function has always recorded — an
+    unrestricted, unchanged, append-only row exactly as before. It is a
+    server-only, optional provenance/idempotency marker: the ONLY
+    caller that ever supplies a non-`None` value is `code_slayer.
+    security.production_promotion`, which sets it to the exact
+    `certificate_id` of the VALIDATION certificate it independently
+    re-verified before calling this function — never a caller-invented
+    or client-supplied string. This function does not itself verify
+    that the referenced row exists (it has no notion of "VALIDATION" vs
+    "PRODUCTION" — that distinction is entirely which physical database
+    `conn` points at, decided by the caller); instead, a schema-level
+    partial UNIQUE index on this column (non-`NULL` values only) means
+    at most one certificate can ever claim provenance from any single
+    VALIDATION certificate — see migration 0017's own docstring. A
+    collision surfaces here as `sqlite3.IntegrityError`, propagated
+    uncaught: this function never resolves that conflict itself, exactly
+    as it never resolves any other `sqlite3.IntegrityError`.
+
+    `require_active_worker` (H.3 review finding): when `True`, this
+    function additionally requires `worker_id` to be administratively
+    `ACTIVE` -- reloaded and checked INSIDE this same `BEGIN IMMEDIATE`
+    transaction, atomically with the INSERT below, denying
+    `worker_archived` otherwise with nothing written. `conn` decides
+    which lifecycle this checks: pass `True` only when `conn` is the
+    PRODUCTION connection and this call is recording authority against
+    PRODUCTION (e.g. `security.production_promotion`, a PRODUCTION
+    Planner role certificate) -- never for a VALIDATION recording,
+    whose mirrored `workers` row is not authoritative for real
+    production lifecycle (see `workers.lifecycle`'s own module
+    docstring on why the two databases are never atomically joined).
+    Defaults to `False` so every existing caller's behavior is
+    unchanged."""
     if not isinstance(worker_id, str) or not worker_id:
         return _deny("malformed_certificate_request")
     if not isinstance(runtime_profile, RuntimeProfileIdentity):
@@ -761,10 +797,18 @@ def record_baseline_certificate(
         return _deny("hard_disqualified_requires_at_least_one_disqualifier")
     if outcome != SecurityBaselineOutcome.HARD_DISQUALIFIED and hard_disqualifiers:
         return _deny("hard_disqualifiers_only_valid_for_hard_disqualified_outcome")
+    if promoted_from_validation_certificate_id is not None and (
+        not isinstance(promoted_from_validation_certificate_id, str)
+        or not promoted_from_validation_certificate_id.strip()
+    ):
+        return _deny("malformed_certificate_request")
 
     with transaction(conn):
-        if WorkersRepo(conn).get(worker_id) is None:
+        worker = WorkersRepo(conn).get(worker_id)
+        if worker is None:
             return _deny("unknown_worker")
+        if require_active_worker and worker.lifecycle_state != WorkerLifecycleState.ACTIVE:
+            return _deny("worker_archived")
         certificate_id = uuid.uuid4().hex
         issued_at = now_fn()
         certificate = BaselineSecurityCertificatesRepo(conn).record_in_transaction(
@@ -784,6 +828,7 @@ def record_baseline_certificate(
             evidence_ref=evidence_ref,
             reason=reason,
             issued_at=issued_at,
+            promoted_from_validation_certificate_id=promoted_from_validation_certificate_id,
         )
         AuditWriter(conn).append(
             task_id=None,
@@ -806,6 +851,9 @@ def record_baseline_certificate(
                 "hard_disqualifiers": [d.value for d in hard_disqualifiers],
                 "evidence_ref": evidence_ref,
                 "reason": reason,
+                "promoted_from_validation_certificate_id": (
+                    promoted_from_validation_certificate_id
+                ),
             },
         )
         return SecurityCertificationResult(True, "certificate_recorded", certificate=certificate)

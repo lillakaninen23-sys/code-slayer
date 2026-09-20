@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -75,19 +76,36 @@ class ContentStore:
 
         path = self._path_for(content_hash)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(path.name + ".tmp")
+        # A per-call-unique temp name: two concurrent writers computing the
+        # SAME content_hash (identical bytes) must never share one tmp
+        # file. A shared name lets one writer's `replace()` consume the
+        # file out from under the other, which then fails with
+        # `FileNotFoundError` on its own `replace()` -- a real race, not
+        # hypothetical, under genuinely concurrent identical-content
+        # writes (e.g. two racing callers promoting the same evidence).
+        tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp_path.write_bytes(data)
         tmp_path.replace(path)  # atomic rename within the same filesystem
         path.chmod(0o444)  # read-only: an extra, verifiable immutability signal
 
         created_at = utcnow_iso()
-        self._conn.execute(
-            "INSERT INTO content_blobs "
-            "(content_hash, media_type, source_kind, byte_size, truncated, "
-            " exportable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (content_hash, media_type, source_kind, len(data), int(truncated),
-             1 if exportable else 0, created_at),
-        )
+        try:
+            self._conn.execute(
+                "INSERT INTO content_blobs "
+                "(content_hash, media_type, source_kind, byte_size, truncated, "
+                " exportable, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (content_hash, media_type, source_kind, len(data), int(truncated),
+                 1 if exportable else 0, created_at),
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent writer (`content_hash` is the PRIMARY KEY) won
+            # the race between our own `get_meta()` check above and this
+            # INSERT. Same bytes, same hash, same safe no-op the
+            # docstring already promises -- resolve to whatever that
+            # writer committed rather than raising.
+            meta = self.get_meta(content_hash)
+            assert meta is not None
+            return meta
         meta = self.get_meta(content_hash)
         assert meta is not None
         return meta

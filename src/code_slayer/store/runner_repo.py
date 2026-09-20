@@ -93,6 +93,47 @@ class RunnerRepo:
             raise KeyError(run_id)
         return _row_to_run(row)
 
+    def list_for_worker(self, worker_id: str, *, limit: int = 200) -> list[RunnerRun]:
+        """Every run for `worker_id`, most recent first, capped at
+        `limit`. Read-only; a worker's own run-history page. NEVER used
+        as active-work AUTHORITY (an old blocking run could be hidden
+        behind more than `limit` newer historical rows) -- see
+        `has_status_for_worker_in_transaction()` for the dedicated,
+        uncapped query `workers.lifecycle`'s active-work check (H.3)
+        actually uses."""
+        rows = self._conn.execute(
+            "SELECT * FROM runner_runs WHERE worker_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (worker_id, limit),
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
+    def has_status_for_worker_in_transaction(
+        self, worker_id: str, *, statuses: frozenset[str] | tuple[str, ...],
+    ) -> bool:
+        """`True` if ANY `runner_runs` row for `worker_id` currently has
+        a status in `statuses` -- a dedicated existence query, never
+        capped by `list_for_worker()`'s own history-page `LIMIT`, so an
+        old blocking run can never be hidden behind more than `limit`
+        newer historical rows (H.3 review finding). Requires an open
+        write transaction -- this method's only real caller
+        (`workers.lifecycle.archive_worker()`) always calls it from
+        inside an already-open `BEGIN IMMEDIATE` transaction, where it
+        must see the exact same consistent snapshot as the lifecycle
+        write that follows, joined into the same atomic commit."""
+        if not self._conn.in_transaction:
+            raise RuntimeError(
+                "has_status_for_worker_in_transaction requires an open write transaction"
+            )
+        statuses = tuple(statuses)
+        placeholders = ",".join("?" for _ in statuses)
+        row = self._conn.execute(
+            f"SELECT 1 FROM runner_runs WHERE worker_id = ? "
+            f"AND status IN ({placeholders}) LIMIT 1",
+            (worker_id, *statuses),
+        ).fetchone()
+        return row is not None
+
     def get_or_none(self, run_id: str) -> RunnerRun | None:
         try:
             return self.get(run_id)

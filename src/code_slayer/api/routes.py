@@ -27,15 +27,42 @@ def service():
 
 
 def body(fields, required=()):
+    data = json_object({name: str for name in fields}, required=required)
+    for key, value in data.items():
+        if len(value) > fields[key]:
+            raise APIError("invalid_input", "A field is empty, invalid, or too long.")
+    return data
+
+
+def json_object(spec, required=()):
+    """Closed-set JSON object. Values are typed; unknown keys fail closed."""
     if not request.is_json:
         raise APIError("json_required", "Send an application/json object.", 415)
     data = request.get_json()
-    if not isinstance(data, dict) or set(data) - set(fields) or set(required) - set(data):
+    if not isinstance(data, dict) or set(data) - set(spec) or set(required) - set(data):
         raise APIError("invalid_fields", "Request has missing or unsupported fields.")
+    parsed = {}
     for key, value in data.items():
-        if not isinstance(value, str) or not value.strip() or len(value) > fields[key]:
-            raise APIError("invalid_input", "A field is empty, invalid, or too long.")
-    return data
+        expected = spec[key]
+        if expected is str:
+            if not isinstance(value, str) or not value.strip() or len(value) > 65536:
+                raise APIError("invalid_input", "A field is empty, invalid, or too long.")
+            parsed[key] = value
+        elif expected is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise APIError("invalid_input", "A field is empty, invalid, or too long.")
+            parsed[key] = value
+        elif expected is float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise APIError("invalid_input", "A field is empty, invalid, or too long.")
+            parsed[key] = float(value)
+        elif expected is bool:
+            if not isinstance(value, bool):
+                raise APIError("invalid_input", "A field is empty, invalid, or too long.")
+            parsed[key] = value
+        else:
+            raise APIError("invalid_fields", "Request has missing or unsupported fields.")
+    return parsed
 
 
 def page_args():
@@ -73,7 +100,13 @@ def health():
             "actions": {
                 "start": service().bindings.analyst_factory is not None,
                 "execution_configured": service().bindings.adapter_factory is not None,
-                "planning_configured": service().bindings.planner_factory is not None,
+                # H.4: reflects whether the NEW worker-bound Planner
+                # construction path is configured, never the legacy
+                # zero-argument `planner_factory` -- a historical worker
+                # existing in the DB never makes this True by itself
+                # (configuration and eligibility are separate; see
+                # `planning.routing`'s own module docstring).
+                "planning_configured": service().bindings.planner_factory_for_worker is not None,
             },
             "configuration_status": "ready"
             if service().bindings.analyst_factory
@@ -354,3 +387,220 @@ def permission_grants():
 def permission_grant_revoke(grant_id):
     body({})
     return jsonify(service().revoke_permission_grant(grant_id))
+
+
+# -- Certification Center v1 -------------------------------------------------
+#
+# Browser is a control surface only. These routes never accept an
+# outcome, evidence_ref, adapter, fingerprint, digest, or
+# hard-disqualifier list. Preflight is GET-in-spirit but POST because it
+# writes a durable preflight run; it never infers. Starting
+# certification is a separate POST. Polling is GET-only.
+
+
+@api.get("/certification/workers")
+def certification_workers():
+    return jsonify(service().list_certification_workers())
+
+
+@api.get("/certification/workers/<worker_id>")
+def certification_worker(worker_id):
+    return jsonify(service().get_certification_worker(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/baseline/preflight")
+def certification_preflight(worker_id):
+    body({})
+    return jsonify(service().certification_preflight(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/baseline/runs")
+def certification_start(worker_id):
+    body({})
+    result = service().start_baseline_certification(worker_id)
+    response = jsonify(result)
+    response.status_code = 202
+    response.headers["Location"] = "/api/certification/runs/" + result["run_id"]
+    return response
+
+
+@api.post("/certification/workers/<worker_id>/baseline/promote")
+def certification_promote(worker_id):
+    # H.1: promotion of an already-recorded VALIDATION PASS certificate
+    # into PRODUCTION. The body must be exactly `{}` -- no client-
+    # supplied outcome, evidence_ref, certificate_id, digest, or
+    # fingerprint; those are server-owned config plus re-verified live
+    # state. `worker_id` names WHICH already-registered worker to
+    # promote, exactly like every other Certification Center route.
+    body({})
+    return jsonify(service().promote_baseline_certification(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/planner/preflight")
+def certification_planner_preflight(worker_id):
+    # H.2: live Planner role certification preflight. `{ }` only --
+    # never a client-supplied outcome, digest, fingerprint, or
+    # role-policy identity.
+    body({})
+    return jsonify(service().certification_planner_preflight(worker_id))
+
+
+@api.post("/certification/workers/<worker_id>/planner/runs")
+def certification_planner_start(worker_id):
+    # H.2: starts a durable Planner qualification run. A PASS records a
+    # PRODUCTION `worker_role_certificates` row directly -- there is no
+    # separate promote step for a role certificate (see `security.
+    # live_planner_certification`'s own docstring). Closing the browser
+    # does not cancel the run.
+    body({})
+    result = service().start_planner_certification(worker_id)
+    response = jsonify(result)
+    response.status_code = 202
+    response.headers["Location"] = "/api/certification/runs/" + result["run_id"]
+    return response
+
+
+@api.get("/certification/runs/<run_id>")
+def certification_run(run_id):
+    return jsonify(service().get_certification_run(run_id))
+
+
+@api.get("/certification/runs/<run_id>/evidence")
+def certification_evidence(run_id):
+    return jsonify(service().get_certification_evidence(run_id))
+
+
+@api.get("/certification/workers/<worker_id>/history")
+def certification_history(worker_id):
+    return jsonify(service().get_certification_history(worker_id))
+
+
+# -- System / runtime administration -----------------------------------------
+#
+# Browser maps only to these fixed server-owned operations. There is no
+# arbitrary shell, no client-supplied digest/fingerprint/outcome/adapter,
+# and no LAN discovery. Ollama origins are operator-entered (connect, not
+# discover). Tailscale uses the local CLI. Update check fetches the
+# already-configured git origin.
+
+
+def admin():
+    return service().admin()
+
+
+@api.get("/system")
+def system_status():
+    return jsonify(admin().system_status())
+
+
+@api.post("/system/restart")
+def system_restart():
+    json_object({})
+    return jsonify(admin().restart())
+
+
+@api.post("/system/update/check")
+def system_update_check():
+    json_object({})
+    return jsonify(admin().update_check())
+
+
+@api.post("/system/update/apply")
+def system_update_apply():
+    json_object({})
+    return jsonify(admin().update_apply())
+
+
+@api.get("/runtime")
+def runtime_overview():
+    return jsonify(admin().runtime_overview(probe=False))
+
+
+@api.post("/runtime/attest")
+def runtime_attest():
+    json_object({})
+    return jsonify(admin().runtime_overview(probe=True))
+
+
+@api.post("/runtime/ollama-servers")
+def runtime_add_ollama_server():
+    data = json_object({"id": str, "origin": str}, ("id", "origin"))
+    return jsonify(admin().add_ollama_server(data["id"], data["origin"]))
+
+
+@api.post("/runtime/ollama-servers/<server_id>/test")
+def runtime_test_ollama_server(server_id):
+    json_object({})
+    return jsonify(admin().test_ollama_server(server_id))
+
+
+@api.post("/runtime/workers")
+def runtime_register_worker():
+    # H.4.1: output_token_budget/tool_choice_enforcement/planner_policy_version/
+    # planner_timeout_seconds are the same server-owned role/execution fields
+    # WorkerRuntimeConfig already persists -- optional here exactly like the
+    # other config fields below; omitted on an update means "preserve the
+    # worker's existing persisted value", never "reset to a dataclass
+    # default" (see AdminFacade.register_worker()). Never accepts
+    # digest/runtime-identity/certificate/outcome/evidence fields -- those
+    # remain out of this closed set entirely.
+    data = json_object(
+        {
+            "worker_id": str,
+            "ollama_server_id": str,
+            "model_tag": str,
+            "kind": str,
+            "network_class": str,
+            "effective_context_tokens": int,
+            "temperature": float,
+            "normalizer_id": str,
+            "normalizer_version": int,
+            "output_token_budget": int,
+            "tool_choice_enforcement": str,
+            "planner_policy_version": str,
+            "planner_timeout_seconds": float,
+        },
+        ("worker_id", "ollama_server_id", "model_tag"),
+    )
+    return jsonify(admin().register_worker(data))
+
+
+@api.post("/runtime/workers/<worker_id>/approve")
+def runtime_approve_worker(worker_id):
+    json_object({})
+    return jsonify(admin().approve_worker_identity(worker_id, allow_replace=False))
+
+
+@api.post("/runtime/workers/<worker_id>/approve-new-identity")
+def runtime_approve_new_identity(worker_id):
+    json_object({})
+    return jsonify(admin().approve_worker_identity(worker_id, allow_replace=True))
+
+
+@api.post("/runtime/workers/<worker_id>/archive")
+def runtime_archive_worker(worker_id):
+    json_object({})
+    return jsonify(admin().archive_worker(worker_id))
+
+
+@api.post("/runtime/workers/<worker_id>/reactivate")
+def runtime_reactivate_worker(worker_id):
+    json_object({})
+    return jsonify(admin().reactivate_worker(worker_id))
+
+
+@api.get("/tailscale")
+def tailscale_status():
+    return jsonify(admin().tailscale_view())
+
+
+@api.post("/tailscale/enable")
+def tailscale_enable():
+    json_object({})
+    return jsonify(admin().tailscale_set(True))
+
+
+@api.post("/tailscale/disable")
+def tailscale_disable():
+    json_object({})
+    return jsonify(admin().tailscale_set(False))

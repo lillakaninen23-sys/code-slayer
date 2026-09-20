@@ -1,0 +1,11 @@
+{
+  "name": "Code Slayer — Engineering Control Room",
+  "short_name": "CSLR",
+  "version": "0.1.0",
+  "integrated": true,
+  "static_only": true,
+  "provider_specific": false,
+  "backend_required": true,
+  "api_version": 1,
+  "start_url": "/"
+}

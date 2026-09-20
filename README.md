@@ -10,6 +10,7 @@ The full design is recorded in **Code Slayer v0.1 Foundation Plan,
 Revision 2.1** (owner-approved). This repository implements it
 phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 
+- [Verification Standard](docs/VERIFICATION_STANDARD.md) — normative no-inherent-trust rule: CLAIM → VERIFY → EVIDENCE → ACTION.
 - [Vision](docs/CODE_SLAYER_VISION.md) — long-term product/engineering direction.
 - [Security & Privacy Architecture](docs/SECURITY_PRIVACY_ARCHITECTURE.md) — normative security/privacy invariants.
 - [Permissions Model](docs/PERMISSIONS_MODEL.md) — the scoped permission vocabulary those invariants are expressed through.
@@ -18,6 +19,30 @@ phase by phase; see `adr/` for the design decisions Phase 1 depends on.
 Existing package/service names (`codeslayer`, `code_slayer`) are unchanged
 by the CSLR brand — see [`AGENTS.md`](AGENTS.md) for the rules every future
 change to this project must follow.
+
+## Local service
+
+From this checkout, first-time install:
+
+```bash
+./cslr install-service
+```
+
+systemd --user starts CSLR on boot and binds `http://127.0.0.1:8765`.
+The current Engineering Control Room preserves the existing Projects, Tasks,
+Models, Intelligence, Planning, Privacy & Security, Audit, and Settings views.
+Runtime configuration lives under Models; Certification Center lives under
+Privacy & Security; System/deployment and Tailscale Serve live under Settings.
+The Dashboard adds read-only summaries from the same backend GET projections
+without live-attesting runtime, starting certification, or mutating admin state.
+
+Ordinary administration (Ollama origins, runtime identity, Certification
+Center, Tailscale Serve, updates) is in the WebUI. The terminal is for
+install and emergency `./cslr status|start|stop|restart` only. Persistent
+config is `~/.config/codeslayer/config.toml`, not this repository.
+Remote access is optional Tailscale Serve of localhost — never a
+`0.0.0.0` bind. See [`docs/WEBUI_API.md`](docs/WEBUI_API.md) and
+[`docs/OPERATIONS_UX.md`](docs/OPERATIONS_UX.md).
 
 ## Status: Phase 7 / Local Worker Runtime — VERIFIED / ACCEPTED
 
@@ -95,6 +120,38 @@ All state used by tests lives under a temporary directory — nothing in
 this repository's own test suite ever touches a real user's
 `~/.local/share/codeslayer`, and no test ever runs against a real,
 non-temporary Git repository.
+
+### Running tests without hogging the machine
+
+The full suite is CPU/IO-heavy enough to make an interactive desktop
+(including gaming) sluggish while it runs. Two equivalent paths exist:
+
+```sh
+pytest -q                    # normal, full speed
+./scripts/test-background    # same tests, low-impact/background
+```
+
+`scripts/test-background` runs the identical suite
+(`.venv/bin/python -m pytest -q`) under `systemd-run --user --scope`
+with reduced CPU/IO priority and a memory ceiling, so it deliberately
+runs *slower* in exchange for staying out of the way of interactive use.
+It never parallelizes the suite (no `pytest-xdist`) — same tests, same
+order, just lower priority and resource-capped. CI and the normal
+`pytest -q` path are unaffected either way.
+
+Defaults are machine-independent: CPU is capped at a fixed `200%`
+(~2 cores) regardless of how many logical CPUs the machine has, and the
+memory ceiling is derived from *this* machine's own physical RAM at
+launch time (never swap, never another machine's specs). All of it can
+be overridden:
+
+```sh
+CSLR_TEST_CPU_QUOTA=150% ./scripts/test-background
+
+CSLR_TEST_MEMORY_HIGH=4G \
+CSLR_TEST_MEMORY_MAX=6G \
+./scripts/test-background
+```
 
 ## Package layout
 
