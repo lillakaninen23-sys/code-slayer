@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from code_slayer.audit.events import EventType
@@ -56,6 +56,7 @@ from code_slayer.coding.pipeline_types import (
     verify_candidate_identity,
 )
 from code_slayer.coding.reviewer import ReviewerTurnError, run_reviewer_turn
+from code_slayer.coding.routing import EngineeringRoleRouter, RoleRoutingError
 from code_slayer.coding.security_gate import SecurityTurnError, run_security_turn
 from code_slayer.coding.tool_loop import CODER_TOOLS, ToolLoopBounds, run_coder_turn
 from code_slayer.coding.workspace import WorkspacePreflightError, prepare_coder_workspace
@@ -81,6 +82,7 @@ from code_slayer.store.models import EngineeringPlanRow
 from code_slayer.store.task_repo import TaskRepo
 from code_slayer.tools import file_tools as files
 from code_slayer.workers.protocol import WorkerAdapter
+from code_slayer.workers.role_qualification import ProductionRole
 
 DEFAULT_MAX_REPAIR_ATTEMPTS = 2
 
@@ -166,12 +168,13 @@ def _set_state(
             )
 
 
-def run_coding_job(
+def _run_coding_job(
     primary_repo_path: Path | str, *,
     control_conn: sqlite3.Connection, control_blobs_dir: Path | str,
     plan: EngineeringPlanRow, original_prompt: str, allowed_scope: tuple[str, ...],
     coder_adapter: WorkerAdapter, reviewer_adapter: WorkerAdapter,
-    security_adapter: WorkerAdapter, config: CodingJobConfig | None = None,
+    security_adapter: WorkerAdapter, repairer_adapter: WorkerAdapter, role_routes=None,
+    config: CodingJobConfig | None = None,
 ) -> CodingJobResult:
     """Run one complete coding job end to end, as far as it can safely
     and honestly go, up to `CodingJobState.READY_FOR_HUMAN_MERGE`.
@@ -189,6 +192,13 @@ def run_coding_job(
     job_id = uuid.uuid4().hex
     now = utcnow_iso()
     original_prompt_hash = files.digest(original_prompt.encode("utf-8"))
+    if role_routes is not None:
+        with transaction(control_conn):
+            _job_event(control_conn, job_id, EventType.WORKER_STARTED, {
+                "mode": "production", "role_bindings": {
+                    role.value: adapter.provenance() for role, adapter in role_routes.items()
+                },
+            })
 
     try:
         validated_plan = validate_planner_handoff(control_conn, control_blobs_dir, plan)
@@ -423,15 +433,16 @@ def run_coding_job(
                     paths=coder_input.paths, context=coder_input.context,
                     worktree=coder_input.worktree, permissions=coder_input.permissions,
                     tool_schema=coder_input.tool_schema,
-                    runtime_profile=coder_input.runtime_profile,
+                    runtime_profile=_repair_profile(coder_input.runtime_profile, role_routes),
                     prior_repair=CoderPriorRepairEvidence(
                         attempt_number=repair_attempts, reason_code=decision.reason_code,
-                        detail=f"{decision.detail} | review: {review.summary}",
+                        detail=f"{decision.detail} | review: {review.summary} | findings: "
+                        + repr([(f.path, f.severity, f.description) for f in review.findings]),
                     ),
                 )
                 LeaseManager(exec_conn).renew(lease)
                 repair_outcome = run_coder_turn(
-                    exec_conn, coder_adapter, task_id=job_id, coder_input=repair_input,
+                    exec_conn, repairer_adapter, task_id=job_id, coder_input=repair_input,
                     lease=lease, blobs_dir=handle.blobs_dir, bounds=config.coder_bounds,
                 )
                 _job_event(control_conn, job_id, EventType.REPAIR_FINISHED, {
@@ -601,6 +612,15 @@ def run_coding_job(
         # BLOCKED usage for every other environment/policy-shaped failure
         # (workspace preflight, lease unavailable, unauthorized mutation).
         LeaseManager(exec_conn).renew(lease)
+        if role_routes is not None:
+            try:
+                for adapter in role_routes.values():
+                    adapter.router.revalidate(adapter.target, adapter.binding)
+            except RoleRoutingError as exc:
+                _set_state(control_conn, job_id, CodingJobState.BLOCKED,
+                           reason=exc.reason, finished_at=utcnow_iso())
+                return CodingJobResult(job_id, CodingJobState.BLOCKED, exc.reason,
+                                       task_id=job_id, job_worktree_path=str(handle.path))
         checkpoint_result = advance_ready_for_checkpoint(
             exec_conn, job_id, lease, blobs_dir=handle.blobs_dir, tmp_dir=handle.tmp_dir,
         )
@@ -711,3 +731,44 @@ def _best_effort_fail_task(
             LeaseManager(exec_conn).release_in_transaction(lease)
     except StateMachineError:
         LeaseManager(exec_conn).release(lease)
+
+
+def run_coding_job(
+    primary_repo_path: Path | str, *,
+    control_conn: sqlite3.Connection, control_blobs_dir: Path | str,
+    plan: EngineeringPlanRow, original_prompt: str, allowed_scope: tuple[str, ...],
+    config_loader, config: CodingJobConfig | None = None,
+) -> CodingJobResult:
+    """Production entry: resolve all four certified roles before any workspace work.
+
+    config_loader loads current server-owned CSLRConfig. No arbitrary adapters,
+    claimed worker identities, certificate IDs, or bypass flags are accepted.
+    """
+    router = EngineeringRoleRouter(control_conn, control_blobs_dir, config_loader)
+    try:
+        roles = router.resolve_pipeline()
+    except RoleRoutingError as exc:
+        return CodingJobResult(uuid.uuid4().hex, CodingJobState.BLOCKED, exc.reason)
+    coder = roles[ProductionRole.CODER]
+    profile = coder.target.profile
+    job_config = replace(config or CodingJobConfig(), worker_id=coder.binding.worker_id,
+                         model_tag=profile.model_tag, runtime_version=profile.runtime_version)
+    return _run_coding_job(
+        primary_repo_path, control_conn=control_conn, control_blobs_dir=control_blobs_dir,
+        plan=plan, original_prompt=original_prompt, allowed_scope=allowed_scope,
+        coder_adapter=coder, reviewer_adapter=roles[ProductionRole.REVIEWER],
+        repairer_adapter=roles[ProductionRole.REPAIRER],
+        security_adapter=roles[ProductionRole.SECURITY], config=job_config, role_routes=roles,
+    )
+
+
+def _repair_profile(coder_profile, role_routes):
+    if role_routes is None:
+        return replace(coder_profile, role="repairer")
+    target = role_routes[ProductionRole.REPAIRER].target
+    return CoderRuntimeProfileIdentity(
+        role="repairer", model_tag=target.profile.model_tag,
+        runtime_version=target.profile.runtime_version,
+        context_window_tokens=target.profile.effective_context_tokens,
+        output_token_budget=target.evaluation.output_token_budget,
+    )

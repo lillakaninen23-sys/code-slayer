@@ -23,8 +23,9 @@ from pathlib import Path
 
 import pytest
 
-from code_slayer.coding.pipeline import CodingJobConfig, run_coding_job
+from code_slayer.coding.pipeline import CodingJobConfig
 from code_slayer.coding.pipeline_types import CodingJobState
+from code_slayer.coding.testing import run_coding_job_for_testing as run_coding_job
 from code_slayer.planning.models import (
     AffectedFile,
     AffectedFileAction,

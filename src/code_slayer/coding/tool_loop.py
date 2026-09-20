@@ -140,7 +140,8 @@ def _render_base_prompt(coder_input: CoderInput) -> str:
     original_prompt`'s own documented contract)."""
     plan = coder_input.validated_plan.content
     lines = [
-        "You are the Coder role in an autonomous, code-owned engineering "
+        f"You are the {coder_input.runtime_profile.role} role in an autonomous, "
+        "code-owned engineering "
         "pipeline. You may only act through the tool calls offered this "
         "turn -- nothing else you say has any authority.",
         "",
@@ -304,7 +305,8 @@ def run_coder_turn(
             joined = "\n".join(transcript)[-_MAX_TRANSCRIPT_CHARS:]
             prompt = f"{base_prompt}\n\n=== THIS TURN'S TOOL-CALL TRANSCRIPT SO FAR ===\n{joined}"
         request = WorkerRequest(
-            task_id=task_id, role="coder", original_prompt=prompt, allowed_tools=CODER_TOOLS,
+            task_id=task_id, role=coder_input.runtime_profile.role,
+            original_prompt=prompt, allowed_tools=CODER_TOOLS,
             prior_tool_result=prior_result, tool_requirement=ToolRequirement.OPTIONAL,
             max_output_tokens=coder_input.runtime_profile.output_token_budget,
         )
