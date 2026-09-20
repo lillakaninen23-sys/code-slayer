@@ -69,15 +69,21 @@ second host-path read). Oversized or non-UTF-8 reads omit `expected_hash` so the
 cannot authorize `write_file`/`apply_patch`. Unauthorized reads still return a
 status-only summary with no content or hash.
 
+The production OpenAI-compatible adapter offers explicit JSON tool schemas for
+the same Coder/Repairer contract (`read_file`, `create_file`, `write_file`,
+`apply_patch`), locked to `coding.tool_loop._build_tool_request()`. Unknown,
+`run_command`, and `checkpoint_create` tools remain omitted. Offering a schema
+is not a capability grant: ToolExecutor and PolicyEngine still authorize every
+mutation.
+
 
 ## Validation and review handoff
 
 Observed branch: `role-certification-v1`. Approved parent:
-`5df0f731572ef20a48b5572275c2125207490edf`. Reviewed feature HEAD before the
-first blocker-fix pass: `3670256`. Subsequent reviewed tree: `a227c6e`.
-This pass is the narrow read-integrity fix only: `expected_hash` is
-write-authorizing only when the complete original bytes were represented
-losslessly to the model.
+`5df0f731572ef20a48b5572275c2125207490edf`. Reviewed feature HEAD before this
+transport-schema pass: `cf72c12`. This pass is the narrow production-adapter
+fix only: explicit `create_file`/`write_file`/`apply_patch` JSON schemas on
+the OpenAI-compatible adapter, matching `_build_tool_request()`.
 
 Files:
 
@@ -99,9 +105,9 @@ Files:
 Final focused validation before the first blocker-fix pass: **554 passed**, no
 failures or skips (528 + 26). Previous blocker-fix pass: documented Role
 Certification selection **573 passed**; post-rebase coding/role subset **212
-passed**. This read-integrity pass: documented Role Certification selection
-**578 passed**; coding/role subset **217 passed** (212 plus the new truncated/lossy
-read-hash tests).
+passed**. Read-integrity pass: Role Certification selection **578 passed**;
+coding/role subset **217 passed**. This transport-schema pass: Role Certification
+selection **579 passed**; coding/role subset **218 passed**.
 The first sandboxed broad run had 432 passes and 96 setup errors because temporary
 localhost HTTP sockets were prohibited. The same 528-test selection passed with
 socket access; no live model/server was contacted. The additional 26 tests cover

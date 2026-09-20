@@ -15,6 +15,7 @@ from dataclasses import fields
 
 import pytest
 
+from code_slayer.coding.tool_loop import CODER_TOOLS, ToolLoopContractError, _build_tool_request
 from code_slayer.tools.registry import CAPABILITIES
 from code_slayer.workers.openai_compatible_adapter import (
     _TOOL_SCHEMAS,
@@ -306,15 +307,31 @@ def test_ambient_proxy_env_vars_are_never_consulted(server, monkeypatch):
     assert response.text == "direct connection worked"
 
 
-# --- 12. no mutating tool schema exists, at all ------------------------------
+# --- 12. Coder mutation schemas, unknown tools still omitted ----------------
 
-def test_no_mutating_capability_has_a_tool_schema():
+_HASH64 = "a" * 64
+
+
+def _tool_call_message(name: str, arguments: dict) -> dict:
+    return {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "id": "1", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }],
+    }
+
+
+def test_no_unreviewed_mutating_capability_has_a_tool_schema():
+    """Coder mutation tools are reviewed and offered; shell/checkpoint are not."""
+    reviewed_mutations = {"create_file", "write_file", "apply_patch"}
     for name in _TOOL_SCHEMAS:
         if name not in CAPABILITIES:
-            # Not every `_TOOL_SCHEMAS` entry is a real ToolExecutor
-            # capability at all -- see the next test.
             continue
-        assert not CAPABILITIES[name].mutation
+        if CAPABILITIES[name].mutation:
+            assert name in reviewed_mutations
+    assert "run_command" not in _TOOL_SCHEMAS
+    assert "checkpoint_create" not in _TOOL_SCHEMAS
 
 
 def test_structured_output_only_schemas_are_not_registered_capabilities():
@@ -331,12 +348,128 @@ def test_structured_output_only_schemas_are_not_registered_capabilities():
     assert "emit_engineering_plan" not in CAPABILITIES
 
 
-def test_tool_schemas_for_only_translates_known_read_only_capabilities(server):
+def test_tool_schemas_for_retains_reviewed_mutation_tools_and_omits_unknown(server):
     _script, base_url = server
     adapter = OpenAICompatibleAdapter(_config(base_url))
-    schemas = adapter._tool_schemas_for(("read_file", "write_file", "made_up_tool"))
+    schemas = adapter._tool_schemas_for(
+        ("read_file", "write_file", "made_up_tool", "run_command", "checkpoint_create"),
+    )
     names = {schema["function"]["name"] for schema in schemas}
-    assert names == {"read_file"}  # write_file and the invented name are silently omitted
+    assert names == {"read_file", "write_file"}
+    assert "made_up_tool" not in names
+    assert "run_command" not in names
+    assert "checkpoint_create" not in names
+
+
+def test_coder_tools_expose_exactly_the_four_reviewed_schemas(server):
+    _script, base_url = server
+    adapter = OpenAICompatibleAdapter(_config(base_url))
+    names = [schema["function"]["name"] for schema in adapter._tool_schemas_for(CODER_TOOLS)]
+    assert names == list(CODER_TOOLS)
+    for name in CODER_TOOLS:
+        params = _TOOL_SCHEMAS[name]["function"]["parameters"]
+        assert params["additionalProperties"] is False
+
+
+def test_create_file_tool_call_parses_and_survives_coder_contract(server):
+    script, base_url = server
+    arguments = {"path": "docs/HELLO.md", "content": "hello world\n"}
+    _respond(script, _tool_call_message("create_file", arguments))
+    request = _request(allowed_tools=CODER_TOOLS)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call.tool == "create_file"
+    assert response.tool_call.params == arguments
+    validated = validate_response(request, response)
+    assert validated.outcome == ValidationOutcome.VALID_TOOL_CALL
+    built = _build_tool_request(response.tool_call.tool, response.tool_call.params)
+    assert built.tool == "create_file"
+    assert built.path == "docs/HELLO.md"
+    assert built.content == b"hello world\n"
+
+
+def test_write_file_tool_call_with_expected_hash_parses(server):
+    script, base_url = server
+    arguments = {"path": "docs/HELLO.md", "content": "hello\n", "expected_hash": _HASH64}
+    _respond(script, _tool_call_message("write_file", arguments))
+    request = _request(allowed_tools=CODER_TOOLS)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call.tool == "write_file"
+    assert response.tool_call.params == arguments
+    validated = validate_response(request, response)
+    assert validated.outcome == ValidationOutcome.VALID_TOOL_CALL
+    built = _build_tool_request(response.tool_call.tool, response.tool_call.params)
+    assert built.tool == "write_file"
+    assert built.expected_hash == _HASH64
+    assert built.content == b"hello\n"
+
+
+def test_apply_patch_tool_call_parses_production_hunk_contract(server):
+    script, base_url = server
+    arguments = {
+        "path": "a.py",
+        "expected_hash": _HASH64,
+        "hunks": [{"offset": 0, "before": "old", "after": "new"}],
+    }
+    _respond(script, _tool_call_message("apply_patch", arguments))
+    request = _request(allowed_tools=CODER_TOOLS)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call.tool == "apply_patch"
+    assert response.tool_call.params == arguments
+    validated = validate_response(request, response)
+    assert validated.outcome == ValidationOutcome.VALID_TOOL_CALL
+    built = _build_tool_request(response.tool_call.tool, response.tool_call.params)
+    assert built.tool == "apply_patch"
+    assert built.expected_hash == _HASH64
+    assert len(built.hunks) == 1
+    assert built.hunks[0].offset == 0
+    assert built.hunks[0].before == b"old"
+    assert built.hunks[0].after == b"new"
+
+
+def test_create_file_extra_fields_fail_closed_at_coder_contract(server):
+    script, base_url = server
+    arguments = {"path": "a.py", "content": "x", "extra": "nope"}
+    _respond(script, _tool_call_message("create_file", arguments))
+    request = _request(allowed_tools=CODER_TOOLS)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert response.tool_call.params["extra"] == "nope"
+    with pytest.raises(ToolLoopContractError, match="unexpected_params"):
+        _build_tool_request(response.tool_call.tool, response.tool_call.params)
+
+
+def test_write_file_malformed_arguments_fail_closed(server):
+    script, base_url = server
+    _respond(script, {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "function": {"name": "write_file", "arguments": "{not json"},
+        }],
+    })
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=CODER_TOOLS),
+    )
+    assert response.kind == WorkerResponseKind.MALFORMED
+    assert response.error == "tool_call_arguments_not_valid_json"
+
+
+def test_apply_patch_extra_hunk_fields_fail_closed_at_coder_contract(server):
+    script, base_url = server
+    arguments = {
+        "path": "a.py",
+        "expected_hash": _HASH64,
+        "hunks": [{"offset": 0, "before": "old", "after": "new", "extra": True}],
+    }
+    _respond(script, _tool_call_message("apply_patch", arguments))
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(
+        _request(allowed_tools=CODER_TOOLS),
+    )
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    with pytest.raises(ToolLoopContractError, match="malformed_hunk"):
+        _build_tool_request(response.tool_call.tool, response.tool_call.params)
 
 
 # --- Phase 8.2b: emit_engineering_plan schema, offered only when allowed ----

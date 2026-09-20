@@ -17,8 +17,10 @@ checkout remaining completely untouched throughout.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,10 @@ from code_slayer.store.content_store import ContentStore
 from code_slayer.store.db import connect, transaction, utcnow_iso
 from code_slayer.store.planning_repo import PlanningRepo
 from code_slayer.tools import file_tools as files
+from code_slayer.workers.openai_compatible_adapter import (
+    OpenAICompatibleAdapter,
+    OpenAICompatibleConfig,
+)
 from code_slayer.workers.protocol import (
     WorkerAdapterError,
     WorkerResponse,
@@ -691,6 +697,82 @@ def test_invalid_utf8_read_omits_write_authorizing_hash(db_conn, tmp_path, ready
     assert "expected_hash" not in data
     assert data["reason"] == "read_not_utf8"
     assert "content" not in data
+
+
+def test_openai_compatible_create_file_reaches_guarded_mutation(db_conn, tmp_path, ready_repo):
+    """Production OpenAI-compatible transport must offer mutation schemas
+    and execute a valid create_file through ToolExecutor/PolicyEngine."""
+    captured = []
+    bodies = [
+        json.dumps({
+            "choices": [{
+                "message": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{
+                        "id": "1", "type": "function",
+                        "function": {
+                            "name": "create_file",
+                            "arguments": json.dumps({
+                                "path": "docs/HELLO.md", "content": "hello world\n",
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }).encode(),
+        json.dumps({
+            "choices": [{
+                "message": {"role": "assistant", "content": json.dumps(_CODER_FINAL_REPORT)},
+            }],
+        }).encode(),
+    ]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            captured.append(self.rfile.read(length))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(bodies.pop(0) if bodies else b"{}")
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True,
+    )
+    thread.start()
+    try:
+        transport = OpenAICompatibleAdapter(OpenAICompatibleConfig(
+            base_url=f"http://127.0.0.1:{httpd.server_port}/v1",
+            model="test-model", timeout=5.0,
+        ))
+        scripted = ScriptedAdapter({
+            "reviewer": [_text(_REVIEWER_PASS)],
+            "security": [_text(_SECURITY_PASS)],
+        })
+
+        class Routed:
+            def infer(self, request):
+                if request.role == "coder":
+                    return transport.infer(request)
+                return scripted.infer(request)
+
+        result = _happy_job(db_conn, tmp_path, ready_repo, Routed())
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    assert result.final_state == CodingJobState.READY_FOR_HUMAN_MERGE, result.reason
+    assert Path(result.job_worktree_path, "docs", "HELLO.md").read_text() == "hello world\n"
+    first = json.loads(captured[0])
+    offered = [tool["function"]["name"] for tool in first["tools"]]
+    assert offered == ["read_file", "create_file", "write_file", "apply_patch"]
+    assert "run_command" not in offered
+    assert "checkpoint_create" not in offered
 
 
 def _happy_job(db_conn, tmp_path, ready_repo, adapter):
