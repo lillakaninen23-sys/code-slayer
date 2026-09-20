@@ -255,7 +255,7 @@ def _build_tool_request(tool: str, params: object) -> ToolRequest:
         extra = set(params) - {"path", "content"}
         if extra:
             raise ToolLoopContractError("unexpected_params")
-        content = params.get("content", "")
+        content = params.get("content")
         if not isinstance(content, str):
             raise ToolLoopContractError("content_must_be_text")
         return ToolRequest(tool="create_file", path=path, content=content.encode("utf-8"))

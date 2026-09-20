@@ -388,6 +388,20 @@ def test_create_file_tool_call_parses_and_survives_coder_contract(server):
     assert built.content == b"hello world\n"
 
 
+def test_create_file_missing_content_fails_closed_at_coder_contract(server):
+    script, base_url = server
+    arguments = {"path": "docs/HELLO.md"}
+    _respond(script, _tool_call_message("create_file", arguments))
+    request = _request(allowed_tools=CODER_TOOLS)
+    response = OpenAICompatibleAdapter(_config(base_url)).infer(request)
+    assert response.kind == WorkerResponseKind.TOOL_CALL
+    assert "content" not in response.tool_call.params
+    validated = validate_response(request, response)
+    assert validated.outcome == ValidationOutcome.VALID_TOOL_CALL
+    with pytest.raises(ToolLoopContractError, match="content_must_be_text"):
+        _build_tool_request(response.tool_call.tool, response.tool_call.params)
+
+
 def test_write_file_tool_call_with_expected_hash_parses(server):
     script, base_url = server
     arguments = {"path": "docs/HELLO.md", "content": "hello\n", "expected_hash": _HASH64}

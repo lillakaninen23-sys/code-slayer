@@ -775,6 +775,20 @@ def test_openai_compatible_create_file_reaches_guarded_mutation(db_conn, tmp_pat
     assert "checkpoint_create" not in offered
 
 
+def test_create_file_missing_content_cannot_mutate(db_conn, tmp_path, ready_repo):
+    """create_file without content must fail closed before ToolExecutor."""
+    adapter = ScriptedAdapter({
+        "coder": [
+            _tool_call("create_file", {"path": "docs/HELLO.md"}),
+            _text(_CODER_FINAL_REPORT),
+        ],
+        "reviewer": [_text(_REVIEWER_PASS)],
+        "security": [_text(_SECURITY_PASS)],
+    })
+    result = _happy_job(db_conn, tmp_path, ready_repo, adapter)
+    assert not Path(result.job_worktree_path, "docs/HELLO.md").exists()
+
+
 def _happy_job(db_conn, tmp_path, ready_repo, adapter):
     info = identity.resolve(ready_repo)
     plan = _ready_plan(

@@ -54,6 +54,13 @@ def test_create_file_rejects_non_string_content():
         _build_tool_request("create_file", {"path": "a.py", "content": 123})
 
 
+def test_create_file_rejects_missing_content():
+    with pytest.raises(ToolLoopContractError, match="content_must_be_text"):
+        _build_tool_request("create_file", {"path": "a.py"})
+    with pytest.raises(ToolLoopContractError, match="content_must_be_text"):
+        _build_tool_request("create_file", {"path": "a.py", "content": None})
+
+
 def test_write_file_requires_expected_hash():
     with pytest.raises(ToolLoopContractError):
         _build_tool_request("write_file", {"path": "a.py", "content": "x"})
